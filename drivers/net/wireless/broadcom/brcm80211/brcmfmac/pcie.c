@@ -73,6 +73,7 @@ BRCMF_FW_CLM_DEF(4378B3, "brcmfmac4378b3-pcie");
 BRCMF_FW_CLM_DEF(4387C2, "brcmfmac4387c2-pcie");
 BRCMF_FW_CLM_DEF(4388B0, "brcmfmac4388b0-pcie");
 BRCMF_FW_CLM_DEF(4388C0, "brcmfmac4388c0-pcie");
+BRCMF_FW_CLM_DEF(4388C2, "brcmfmac4388c2-pcie");
 BRCMF_FW_CLM_DEF(54591, "brcmfmac54591-pcie");
 
 /* firmware config files */
@@ -115,7 +116,8 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_4378_CHIP_ID, 0xFFFFFFE0, 4378B3), /* revision ID 5 */
 	BRCMF_FW_ENTRY(BRCM_CC_4387_CHIP_ID, 0xFFFFFFFF, 4387C2), /* revision ID 7 */
 	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0x0000000F, 4388B0),
-	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0xFFFFFFF0, 4388C0), /* revision ID 4 */
+	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0x00000030, 4388C0), /* revision ID 4 */
+	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0xFFFFFFC0, 4388C2), /* revision ID 6 */
 };
 
 #define BRCMF_PCIE_FW_UP_TIMEOUT		5000 /* msec */
@@ -2827,6 +2829,20 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	brcmf_dbg(PCIE, "Enter %x:%x\n", pdev->vendor, pdev->device);
+
+	/*
+	 * J713's BCM4388 IOVA aperture starts above 1 TiB and the message-buffer
+	 * ABI carries full 64-bit host addresses, so do not retain PCI's
+	 * conservative 32-bit default DMA mask.
+	 */
+	if (pdev->device == BRCM_PCIE_4388_DEVICE_ID) {
+		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
+		if (ret) {
+			pci_err(pdev, "failed to enable 42-bit DMA: %d\n", ret);
+			return ret;
+		}
+		pci_info(pdev, "using 42-bit DMA addresses\n");
+	}
 
 	ret = -ENOMEM;
 	devinfo = kzalloc_obj(*devinfo);
