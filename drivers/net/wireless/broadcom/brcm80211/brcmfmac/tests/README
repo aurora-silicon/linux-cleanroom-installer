@@ -1,0 +1,33 @@
+Scan deadline regression tests
+==============================
+
+From the kernel source directory:
+
+  ./tools/testing/kunit/kunit.py run \
+    --kunitconfig=drivers/net/wireless/broadcom/brcm80211/brcmfmac/tests \
+    'brcmfmac-scan-timeout*'
+
+These hardware-independent tests cover the 10-second floor, the 97-channel
+passive-scan regression (24,280 ms budget), active requests with potentially
+passive channels, the 60-second ceiling, overflow and all-band fallback.
+They do not simulate firmware completion, timer cancellation or association.
+
+The regular v1-v4 request builders use -1 dwell values; the timeout uses the
+120 ms passive default programmed by brcmf_dongle_scantime(). They currently
+do not implement cfg80211 request duration overrides. The extra per-channel
+dwell and one-second allowance are a conservative watchdog policy, not a
+measured upper bound on every firmware implementation. P2P retains its
+existing timeout because it overrides the regular scan's dwell policy.
+
+Internal PNO follow-up scans call brcmf_do_escan() directly and do not arm the
+foreground timeout timer. This change intentionally leaves that lifecycle,
+foreground completion/abort cleanup and scan-parameter version negotiation
+unchanged. Every foreground request computes a fresh deadline before starting
+firmware work; no request pointer is retained by the deadline helper.
+
+Hardware acceptance still requires the identical full passive request to
+complete with fresh results, full/single-channel active and passive scans,
+explicit abort followed by retry, and ordinary all-band supplicant scanning.
+Keep independent network access while isolating the supplicant. A larger iw
+userspace timeout does not change the kernel deadline. Check scan events, not
+only cached BSS entries. Test association and traffic separately.
