@@ -37,6 +37,7 @@
 
 #define APPLE_PMGR_PS_SET_TIMEOUT 100
 #define APPLE_PMGR_RESET_TIME 1
+#define APPLE_PMGR_T8132_RESET_TIME 10
 
 struct apple_pmgr_ps {
 	struct device *dev;
@@ -48,6 +49,10 @@ struct apple_pmgr_ps {
 	bool force_disable;
 	bool force_reset;
 	bool externally_clocked;
+	bool no_auto_enable;
+	bool inherited_on;
+	bool needs_reset_idle_wait;
+	u32 reset_time_us;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -145,11 +150,22 @@ static bool apple_pmgr_ps_is_active(struct apple_pmgr_ps *ps)
 
 static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 {
-	return apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
+	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
+
+	if (ps->inherited_on)
+		return 0;
+
+	return apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE,
+				 !ps->no_auto_enable);
 }
 
 static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 {
+	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
+
+	if (ps->inherited_on)
+		return 0;
+
 	return apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
 }
 
@@ -157,6 +173,8 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
+	int ret;
+	u32 reg;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
@@ -168,6 +186,18 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 	/* Quiesce device before asserting reset */
 	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE,
 			   APPLE_PMGR_DEV_DISABLE);
+	if (ps->needs_reset_idle_wait) {
+		ret = regmap_read_poll_timeout_atomic(ps->regmap, ps->offset,
+						      reg, !(reg & APPLE_PMGR_BUSY),
+						      1, APPLE_PMGR_PS_SET_TIMEOUT);
+		if (ret) {
+			dev_err(ps->dev,
+				"reset quiesce timed out offset=%#x reg=%#x\n",
+				ps->offset, reg);
+			spin_unlock_irqrestore(&ps->genpd.slock, flags);
+			return ret;
+		}
+	}
 	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET,
 			   APPLE_PMGR_RESET);
 
@@ -180,6 +210,10 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
+
+	/* Split assert/deassert callers must also meet the T8132 pulse width. */
+	if (ps->reset_time_us == APPLE_PMGR_T8132_RESET_TIME)
+		usleep_range(ps->reset_time_us, 2 * ps->reset_time_us);
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
@@ -198,13 +232,15 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 
 static int apple_pmgr_reset_reset(struct reset_controller_dev *rcdev, unsigned long id)
 {
+	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	int ret;
 
 	ret = apple_pmgr_reset_assert(rcdev, id);
 	if (ret)
 		return ret;
 
-	usleep_range(APPLE_PMGR_RESET_TIME, 2 * APPLE_PMGR_RESET_TIME);
+	if (ps->reset_time_us != APPLE_PMGR_T8132_RESET_TIME)
+		usleep_range(APPLE_PMGR_RESET_TIME, 2 * APPLE_PMGR_RESET_TIME);
 
 	return apple_pmgr_reset_deassert(rcdev, id);
 }
@@ -241,7 +277,29 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	struct of_phandle_iterator it;
 	int ret;
 	const char *name;
-	bool active;
+	bool active, t8132;
+	u32 offset;
+
+	/*
+	 * AURORA_TODO:
+	 * The complete T8132 power-state table is not validated yet. Accessing
+	 * unrelated entries can raise an asynchronous SError on J713, so expose
+	 * only the domains exercised by the inherited storage/PCIe handoff.
+	 */
+	t8132 = of_device_is_compatible(node,
+					"apple,t8132-pmgr-pwrstate");
+	if (t8132 &&
+	    (of_property_read_u32(node, "reg", &offset) ||
+	     (offset != 0x188 && offset != 0x190 &&
+	      offset != 0x278 && /* fpwm1 */
+	      offset != 0x2d8 && /* uart_p */
+	      offset != 0x3d8 && /* uart0 */
+	      offset != 0x488 && offset != 0x490 &&
+	      offset != 0x530 && offset != 0x538 &&
+	      offset != 0x540 && offset != 0x548 &&
+	      offset != 0x4000 && offset != 0x4008 &&
+	      offset != 0x4010 && offset != 0x4018)))
+		return -ENODEV;
 
 	regmap = syscon_node_to_regmap(node->parent);
 	if (IS_ERR(regmap))
@@ -253,6 +311,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	ps->dev = dev;
 	ps->regmap = regmap;
+	ps->reset_time_us = t8132 ? APPLE_PMGR_T8132_RESET_TIME :
+		APPLE_PMGR_RESET_TIME;
+	ps->needs_reset_idle_wait = t8132;
+	/* m1n1 leaves automatic power gating disabled on T8132 domains. */
+	ps->no_auto_enable = t8132;
+	ps->inherited_on = of_property_read_bool(node, "apple,inherited-on");
 
 	ret = of_property_read_string(node, "label", &name);
 	if (ret < 0) {
@@ -272,8 +336,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->genpd.power_off = apple_pmgr_ps_power_off;
 
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
-	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
-		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
+	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE && !ps->inherited_on)
+		regmap_update_bits(regmap, ps->offset,
+				   APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
 				   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
 
 	if (of_property_read_bool(node, "apple,force-disable"))
@@ -286,7 +351,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		ps->externally_clocked = true;
 
 	active = apple_pmgr_ps_is_active(ps);
-	if (of_property_read_bool(node, "apple,always-on")) {
+	if (ps->inherited_on) {
+		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
+		if (!active)
+			dev_warn(dev, "inherited-on domain %s is not on at boot\n",
+				 name);
+	} else if (of_property_read_bool(node, "apple,always-on")) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		if (!active) {
 			dev_warn(dev, "always-on domain %s is not on at boot\n", name);
@@ -298,7 +368,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	/* Turn on auto-PM if the domain is already on */
-	if (active)
+	if (active && !ps->no_auto_enable)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   APPLE_PMGR_AUTO_ENABLE);
 
