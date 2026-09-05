@@ -41,6 +41,7 @@ struct apple_rtkit {
 	struct apple_mbox *mbox;
 
 	struct completion epmap_completion;
+	struct completion coreanalytics_completion;
 	struct completion iop_pwr_ack_completion;
 	struct completion ap_pwr_ack_completion;
 
@@ -55,6 +56,7 @@ struct apple_rtkit {
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
 	struct apple_rtkit_shmem ioreport_buffer;
+	struct apple_rtkit_shmem coreanalytics_buffer;
 	struct apple_rtkit_shmem crashlog_buffer;
 	struct apple_rtkit_shmem oslog_buffer;
 
