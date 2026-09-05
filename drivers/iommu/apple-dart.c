@@ -2502,9 +2502,11 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 	}
 
-	dart->irq = platform_get_irq(pdev, 0);
-	if (dart->irq < 0)
-		return -ENODEV;
+	dart->irq = platform_get_irq_optional(pdev, 0);
+	if (dart->irq == -ENXIO)
+		dart->irq = -1;
+	else if (dart->irq < 0)
+		return dart->irq;
 
 	ret = devm_clk_bulk_get_all(dev, &dart->clks);
 	if (ret < 0)
@@ -2749,10 +2751,12 @@ params_done:
 	if (dart->locked)
 		apple_dart_drain_stale_exceptions(dart);
 
-	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
-			  "apple-dart fault handler", dart);
-	if (ret)
-		goto err_clk_disable;
+	if (dart->irq >= 0) {
+		ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
+				  "apple-dart fault handler", dart);
+		if (ret)
+			goto err_clk_disable;
+	}
 
 	ret = iommu_device_sysfs_add(&dart->iommu, dev, NULL, "apple-dart.%s",
 				     dev_name(&pdev->dev));
@@ -2776,7 +2780,8 @@ params_done:
 err_sysfs_remove:
 	iommu_device_sysfs_remove(&dart->iommu);
 err_free_irq:
-	free_irq(dart->irq, dart);
+	if (dart->irq >= 0)
+		free_irq(dart->irq, dart);
 err_clk_disable:
 	pm_runtime_put(dev);
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
@@ -2894,7 +2899,8 @@ static void apple_dart_remove(struct platform_device *pdev)
 	if (!dart->locked && !READ_ONCE(dart->commands_gated))
 		apple_dart_hw_reset(dart);
 
-	free_irq(dart->irq, dart);
+	if (dart->irq >= 0)
+		free_irq(dart->irq, dart);
 
 	iommu_device_unregister(&dart->iommu);
 	iommu_device_sysfs_remove(&dart->iommu);
@@ -3082,6 +3088,7 @@ static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
+	{ .compatible = "apple,t8132-dart", .data = &apple_dart_hw_t8110 },
 	{ .compatible = "apple,t6000-dart", .data = &apple_dart_hw_t6000 },
 	{},
 };
