@@ -52,6 +52,7 @@ struct apple_pmgr_ps {
 	bool system_sleep;
 	bool no_auto_enable;
 	bool inherited_on;
+	bool preserve_display;
 	bool needs_reset_idle_wait;
 	u32 reset_time_us;
 };
@@ -135,11 +136,14 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	return ret;
 }
 
-static bool apple_pmgr_ps_is_active(struct apple_pmgr_ps *ps)
+static int apple_pmgr_ps_is_active(struct apple_pmgr_ps *ps)
 {
 	u32 reg = 0;
+	int ret;
 
-	regmap_read(ps->regmap, ps->offset, &reg);
+	ret = regmap_read(ps->regmap, ps->offset, &reg);
+	if (ret)
+		return ret;
 	/*
 	 * We consider domains as active if they are actually on, or if they have auto-PM
 	 * enabled and the intended target is on.
@@ -221,6 +225,9 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 	int ret;
 	u32 reg;
 
+	if (ps->preserve_display)
+		return -EPERM;
+
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
@@ -255,6 +262,9 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
+
+	if (ps->preserve_display)
+		return -EPERM;
 
 	/* Split assert/deassert callers must also meet the T8132 pulse width. */
 	if (ps->reset_time_us == APPLE_PMGR_T8132_RESET_TIME)
@@ -322,7 +332,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	struct of_phandle_iterator it;
 	int ret;
 	const char *name;
-	bool active, t8132;
+	bool active, t8132, preserve_display = false;
+	struct resource pmgr_resource;
 	u32 offset;
 
 	/*
@@ -333,7 +344,17 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 */
 	t8132 = of_device_is_compatible(node,
 					"apple,t8132-pmgr-pwrstate");
-	if (t8132 &&
+	if (t8132 && !of_property_read_u32(node, "reg", &offset) &&
+	    (offset == 0x240 || offset == 0x248 || offset == 0x10000) &&
+	    of_machine_is_compatible("apple,j713") &&
+	    !of_address_to_resource(node->parent, 0, &pmgr_resource) &&
+	    pmgr_resource.start == 0x380700000ULL) {
+		/* DCP remains firmware-owned. Only expose an inherited live vote. */
+		if (!of_property_read_bool(node, "apple,inherited-on"))
+			return -ENODEV;
+		preserve_display = true;
+	}
+	if (t8132 && !preserve_display &&
 	    (of_property_read_u32(node, "reg", &offset) ||
 	     (offset != 0x188 && offset != 0x190 &&
 	      offset != 0x278 && /* fpwm1 */
@@ -363,6 +384,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	/* m1n1 leaves automatic power gating disabled on T8132 domains. */
 	ps->no_auto_enable = t8132;
 	ps->inherited_on = of_property_read_bool(node, "apple,inherited-on");
+	ps->preserve_display = preserve_display;
 
 	ret = of_property_read_string(node, "label", &name);
 	if (ret < 0) {
@@ -396,7 +418,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "apple,externally-clocked"))
 		ps->externally_clocked = true;
 
-	active = apple_pmgr_ps_is_active(ps);
+	ret = apple_pmgr_ps_is_active(ps);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "cannot read power state\n");
+	active = ret;
+	if (preserve_display && !active)
+		return dev_err_probe(dev, -ENODEV,
+				     "display domain is not inherited active\n");
 	if (ps->inherited_on) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		if (!active)
