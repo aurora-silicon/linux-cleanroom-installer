@@ -77,6 +77,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_rtkit_helper *helper;
+	u32 inherited;
 	int ret;
 
 	/* 44 bits for addresses in standard RTKit requests */
@@ -102,6 +103,24 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, PTR_ERR(helper->sram_base),
 					"Failed to map SRAM region");
 	}
+	/* The loader may transfer an already booted helper and its buffers. */
+	if (of_find_property(dev->of_node,
+			     "linux-enablement-mac,rtkit-inherited", NULL)) {
+		ret = of_property_read_u32(dev->of_node,
+					  "linux-enablement-mac,rtkit-inherited",
+					  &inherited);
+		if (ret || inherited > 1)
+			return dev_err_probe(dev, -EINVAL,
+					     "Invalid inherited helper state\n");
+		if (inherited) {
+			if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
+			      APPLE_ASC_CPU_CONTROL_RUN))
+				return dev_err_probe(dev, -ENODEV,
+						     "Inherited helper is stopped\n");
+			dev_info(dev, "Keeping bootloader-owned helper firmware running\n");
+			return 0;
+		}
+	}
 
 	helper->rtk =
 		devm_apple_rtkit_init(dev, helper, NULL, 0, &apple_rtkit_helper_ops);
@@ -126,6 +145,9 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 static void apple_rtkit_helper_remove(struct platform_device *pdev)
 {
 	struct apple_rtkit_helper *helper = platform_get_drvdata(pdev);
+	/* No RTKit session was created for a retained bootloader helper. */
+	if (!helper->rtk)
+		return;
 
 	if (apple_rtkit_is_running(helper->rtk))
 		apple_rtkit_quiesce(helper->rtk);
