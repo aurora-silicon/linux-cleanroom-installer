@@ -95,6 +95,7 @@ struct macsmc_gpio {
 	smc_key base_key;
 
 	bool j700_pcio;
+	bool inherited_mtp;
 	DECLARE_BITMAP(j700_pcio_level, MAX_GPIO);
 };
 
@@ -102,7 +103,7 @@ static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
 					  unsigned int offset)
 {
 	return smcgp->j700_pcio &&
-		(offset == MACSMC_J700_AFE_RESET_GPIO ||
+		((offset == MACSMC_J700_AFE_RESET_GPIO && !smcgp->inherited_mtp) ||
 		 offset == MACSMC_J700_RADIO_REG_ON_GPIO);
 }
 
@@ -269,7 +270,8 @@ static int macsmc_gpio_init_valid_mask(struct gpio_chip *gc,
 
 	bitmap_zero(valid_mask, ngpios);
 	if (smcgp->j700_pcio) {
-		set_bit(MACSMC_J700_AFE_RESET_GPIO, valid_mask);
+		if (!smcgp->inherited_mtp)
+			set_bit(MACSMC_J700_AFE_RESET_GPIO, valid_mask);
 		set_bit(MACSMC_J700_RADIO_REG_ON_GPIO, valid_mask);
 	}
 
@@ -317,6 +319,21 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
 	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
+
+	if (smcgp->j700_pcio) {
+		struct device_node *hid, *helper;
+		u32 inherited = 0;
+
+		hid = of_find_compatible_node(NULL, NULL, "apple,t8140-dockchannel-hid");
+		helper = of_parse_phandle(hid, "apple,helper-cpu", 0);
+		of_node_put(hid);
+		if (helper) {
+			of_property_read_u32(helper, "linux-enablement-mac,rtkit-inherited",
+					     &inherited);
+			of_node_put(helper);
+		}
+		smcgp->inherited_mtp = inherited == 1;
+	}
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
 	if (smcgp->first_index < 0)
