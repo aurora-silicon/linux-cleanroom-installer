@@ -318,6 +318,7 @@ struct apple_pcie {
 	bool			tunnel_cold_init;
 	unsigned long		tunnel_ready_at;
 	struct notifier_block	tunnel_pci_nb;
+	bool			retained_radio;
 	bool			bus_stopped;
 	bool			reset_on_resume;
 	bool			link_kept;
@@ -1678,6 +1679,10 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		/* U-Boot may already have brought up a conventional root port. */
 		link_stat = apple_pcie_port_readl(port, PORT_LINKSTS);
 		if (!(link_stat & PORT_LINKSTS_UP)) {
+			if (pcie->retained_radio) {
+				ret = -ENOLINK;
+				goto err_teardown;
+			}
 			ret = apple_pcie_setup_link(pcie, port, np);
 			if (ret)
 				goto err_teardown;
@@ -1701,11 +1706,17 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (ret)
 		goto err_teardown;
 
-	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
+	/* Firmware-owned function mappings cannot be reset during adoption. */
 	for (i = 0; i < pcie->hw->max_rid2sid; i++) {
-		if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
-			break;
-		apple_pcie_rid2sid_write(port, i, 0);
+		if (pcie->retained_radio) {
+			if (apple_pcie_port_readl(port, port_rid2sid_offset(port, i)) &
+			    PORT_RID2SID_VALID)
+				__set_bit(i, port->sid_map);
+		} else {
+			if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
+				break;
+			apple_pcie_rid2sid_write(port, i, 0);
+		}
 	}
 
 	dev_dbg(pcie->dev, "%pOF: %d RID/SID mapping entries\n", np, i);
@@ -1925,6 +1936,10 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	if (port->pcie->hw->sid_indexed_rid2sid) {
 		if (sid >= port->sid_map_sz)
 			idx = -EINVAL;
+		else if (pcie->retained_radio &&
+			 apple_pcie_port_readl(port, port_rid2sid_offset(port, sid)) ==
+			 (PORT_RID2SID_VALID | (sid << PORT_RID2SID_SID_SHIFT) | rid))
+			idx = sid;
 		else if (test_and_set_bit(sid, port->sid_map))
 			idx = -EBUSY;
 		else
@@ -2019,6 +2034,12 @@ static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
 	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	struct apple_pcie_port *port;
 
+	if (pcie->retained_radio) {
+		/* The old loader owns function 1; expose only the Wi-Fi function. */
+		if (bus->number > cfg->busr.start + 1 || devfn)
+			return NULL;
+		return pci_ecam_map_bus(bus, devfn, where);
+	}
 	if (!pcie->hw->root_bus_only)
 		return pci_ecam_map_bus(bus, devfn, where);
 
@@ -2546,7 +2567,10 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		}
 	}
 
-	/* Only a host that the board links to a bootstrap engine opens bus 1. */
+	/*
+	 * Only a host that the board links to a bootstrap engine opens bus 1.
+	 * This also leaves the retained J700 radio port (no apple,piodma) alone.
+	 */
 	if (hw->root_bus_only && apple_piodma_bootstrap_enabled() &&
 	    of_property_present(dev->of_node, "apple,piodma")) {
 		ret = apple_piodma_bootstrap_get(dev, &piodma_supplier);
@@ -2561,6 +2585,10 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
 	pcie->hw = hw;
+	pcie->retained_radio = hw == &t8140_hw &&
+		of_machine_is_compatible("apple,j700") &&
+		of_property_read_bool(dev->of_node, "apple,firmware-initialized") &&
+		!of_property_present(dev->of_node, "apple,piodma");
 	pcie->piodma_supplier = piodma_supplier;
 	/* Only this retained-DMA radio hierarchy forbids user reset/removal. */
 	if (piodma_supplier) {
@@ -2572,7 +2600,9 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		bridge->native_dpc = false;
 		dev_info_once(dev, "Neo radio host: native AER/DPC recovery disabled for retained-DMA bootstrap\n");
 	}
-	if (hw->root_bus_only && !piodma_supplier)
+	if (pcie->retained_radio)
+		dev_info(dev, "Retaining bootloader Wi-Fi function and SID mappings\n");
+	else if (hw->root_bus_only && !piodma_supplier)
 		dev_info(dev, "root-port probe only; downstream config is blocked\n");
 	pcie->base = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(pcie->base))

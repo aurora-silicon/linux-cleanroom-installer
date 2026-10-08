@@ -185,6 +185,7 @@ struct dockchannel_hid {
 	struct dockchannel *dc;
 	struct device_link *helper_link;
 	bool stopping;
+	bool inherited_mtp;
 
 	/* Held from probe on when the multi-touch interface uses power method 2 */
 	struct gpio_desc *afe_reset;
@@ -605,6 +606,18 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		/* Send firmware to the device */
 		dev_info(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
+		/* Retained MTP must see AFE reset throughout firmware upload. */
+		if (iface->dchid->inherited_mtp &&
+		    iface->power_method == DCHID_POWER_METHOD_2) {
+			if (iface->firmware_managed_reset) {
+				ret = -EINVAL;
+				goto err;
+			}
+			ret = gpiod_set_value_cansleep(iface->dchid->afe_reset, 1);
+			if (ret < 0)
+				goto err;
+			fsleep(50 * USEC_PER_MSEC);
+		}
 		ret = dchid_send_firmware(iface, fw, size);
 		if (ret < 0) {
 			dev_err(iface->dchid->dev, "Failed to send %s firmwareS", iface->name);
@@ -614,9 +627,12 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		/* After loading firmware, multi-touch needs a reset */
 		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
 		if (iface->power_method == DCHID_POWER_METHOD_2) {
-			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
-			if (ret < 0)
-				goto err;
+			/* The retained session is already off while reset is asserted. */
+			if (!iface->dchid->inherited_mtp) {
+				ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
+				if (ret < 0)
+					goto err;
+			}
 			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_ON);
 			if (ret < 0)
 				goto err;
@@ -1258,6 +1274,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	struct device_node *child, *helper;
 	struct platform_device *helper_pdev;
 	struct property *prop;
+	u32 inherited = 0;
 	int ret;
 
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
@@ -1349,6 +1366,8 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
+	of_property_read_u32(helper, "linux-enablement-mac,rtkit-inherited", &inherited);
+	dchid->inherited_mtp = of_machine_is_compatible("apple,j700") && inherited == 1;
 	helper_pdev = of_find_device_by_node(helper);
 	of_node_put(helper);
 	if (!helper_pdev) {
