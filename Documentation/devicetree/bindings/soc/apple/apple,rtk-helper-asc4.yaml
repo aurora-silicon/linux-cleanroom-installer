@@ -59,6 +59,15 @@ properties:
   iommus:
     maxItems: 1
 
+  linux-enablement-mac,rtkit-inherited:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description: |
+      Boot-time ownership flag from the retained Neo bootloader. One means
+      that the helper firmware is running with its shared buffers reserved
+      by the loader. Linux must keep that session intact and must not boot,
+      wake or quiesce it again. Zero follows the ordinary Linux-owned path.
+
   '#helper-cells':
     const: 0
     description:
