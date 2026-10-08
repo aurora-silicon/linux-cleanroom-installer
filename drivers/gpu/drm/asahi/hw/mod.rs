@@ -15,6 +15,7 @@ pub(crate) mod t600x;
 pub(crate) mod t602x;
 pub(crate) mod t8103;
 pub(crate) mod t8112;
+pub(crate) mod t8140;
 
 /// GPU generation enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -22,6 +23,7 @@ pub(crate) mod t8112;
 pub(crate) enum GpuGen {
     G13 = 13,
     G14 = 14,
+    G17 = 17,
 }
 
 /// GPU variant enumeration. Note: Part of the UABI.
@@ -209,6 +211,8 @@ pub(crate) struct HwConfig {
 
     /// Base clock used used for timekeeping.
     pub(crate) base_clock_hz: u32,
+    /// Input address bits translated by each UAT page table root on this SoC.
+    pub(crate) uat_ias: u32,
     /// Output address space for the UAT on this SoC.
     pub(crate) uat_oas: u32,
     /// Number of dies on this SoC.
@@ -544,14 +548,13 @@ impl PwrConfig {
             return Err(EINVAL);
         }
 
-        let pz_count = pz_data.len() / 3;
         let mut power_zones = KVec::new();
-        for i in (0..pz_count).step_by(3) {
+        for zone in pz_data.chunks_exact(3) {
             power_zones.push(
                 PowerZone {
-                    target: pz_data[i],
-                    target_offset: pz_data[i + 1],
-                    filter_tc: pz_data[i + 2],
+                    target: zone[0],
+                    target_offset: zone[1],
+                    filter_tc: zone[2],
                 },
                 GFP_KERNEL,
             )?;

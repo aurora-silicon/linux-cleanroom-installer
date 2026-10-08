@@ -11,6 +11,8 @@
 use core::arch::asm;
 use core::cmp::min;
 
+use kernel::page::PAGE_SIZE;
+
 use crate::debug::*;
 use crate::mmu;
 
@@ -80,7 +82,8 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     let start_pg = va >> mmu::UAT_PGBIT;
     let end_pg = (va + len + mmu::UAT_PGMSK) >> mmu::UAT_PGBIT;
 
-    let mut val: u64 = ((asid as u64) << 48) | (2 << 46) | (start_pg as u64 & 0x1fffffffff);
+    const BADDR_MASK: u64 = (1 << 37) - 1;
+    let mut val: u64 = ((asid as u64) << 48) | (2 << 46) | (start_pg as u64 & BADDR_MASK);
     let pages = end_pg - start_pg;
 
     // Guess? It's possible that the page count is in terms of 4K pages
@@ -122,6 +125,10 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
             );
         }
         base -= 32;
+        // Each full operation covers 32 units of 2 << bits GPU granules.
+        // Advance only the base-address field, preserving the ASID and scale.
+        let next = (val & BADDR_MASK) + (32u64 << (bits + 1));
+        val = (val & !BADDR_MASK) | (next & BADDR_MASK);
     }
 
     // SAFETY: tlbi is always safe by definition
@@ -130,6 +137,66 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
             ".arch armv8.4-a",
             "tlbi rvae1os, {x}",
             x = in(reg) val | ((base - 1) << 39)
+        );
+    }
+}
+
+/// Range length from which [`tlbi_range_or_asid`] invalidates the whole ASID.
+const TLBI_RANGE_MAX: usize = 0x200_0000;
+/// Range length from which [`tlbi_range_or_asid`] counts in 1 MiB units (scale 1) instead of
+/// 32 KiB units (scale 0).
+const TLBI_RANGE_SCALE1_MIN: usize = 0x10_0000;
+/// Translation granule field value for 16 KiB pages.
+const TLBI_TG_16K: u64 = 2;
+/// Width of the base address field of a range TLBI operand.
+const TLBI_RANGE_BADDR_MASK: u64 = (1 << 38) - 1;
+
+/// Invalidate a range of pages for a given ASID with a single range operation.
+///
+/// Unlike [`tlbi_range`], which issues as many range operations as needed, this invalidates
+/// ranges that do not fit one operation (and ranges starting at VA 0) by ASID. Single pages use a
+/// page operation, at the CPU page size.
+#[inline(always)]
+pub(crate) fn tlbi_range_or_asid(asid: Asid, va: usize, len: usize) {
+    if debug_enabled(DebugFlags::ConservativeTlbi) {
+        tlbi_all();
+        sync();
+        return;
+    }
+
+    if len == 0 {
+        return;
+    }
+
+    if va == 0 || len >= TLBI_RANGE_MAX {
+        tlbi_asid(asid);
+        return;
+    }
+    if len <= PAGE_SIZE {
+        tlbi_page(asid, va);
+        return;
+    }
+
+    // The range covers (NUM + 1) << (5 * SCALE + 1) granules of 16 KiB.
+    let (scale, unit_shift) = if len >= TLBI_RANGE_SCALE1_MIN {
+        (1u64, 20)
+    } else {
+        (0u64, 15)
+    };
+    let num = ((len - 1) >> unit_shift) as u64;
+
+    let val = ((asid as u64) << 48)
+        | (TLBI_TG_16K << 46)
+        | (scale << 44)
+        | (num << 39)
+        | (((va >> mmu::UAT_PGBIT) as u64) & TLBI_RANGE_BADDR_MASK);
+
+    // SAFETY: tlbi is always safe by definition
+    unsafe {
+        asm!(
+            ".arch armv8.4-a",
+            "tlbi rvae1os, {x}",
+            x = in(reg) val
         );
     }
 }

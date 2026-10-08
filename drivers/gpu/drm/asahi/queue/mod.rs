@@ -26,7 +26,10 @@ use crate::debug::*;
 use crate::driver::{AsahiDevRef, AsahiDevice};
 use crate::file::MAX_COMMANDS_PER_SUBMISSION;
 use crate::fw::types::*;
-use crate::gpu::GpuManager;
+use crate::gpu::{
+    Gpu,
+    GpuManager, //
+};
 use crate::inner_weak_ptr;
 use crate::microseq;
 use crate::module_parameters;
@@ -193,7 +196,11 @@ pub(crate) struct QueueJob {
     fence: UserFence<JobFence::ver>,
     notifier: Arc<GpuObject<fw::event::Notifier::ver>>,
     notification_count: u32,
-    did_run: bool,
+    id: u64,
+}
+
+pub(crate) struct QueueTimeout {
+    dev: AsahiDevRef,
     id: u64,
 }
 
@@ -241,7 +248,14 @@ impl QueueJob::ver {
 
 #[versions(AGX)]
 impl sched::JobImpl for QueueJob::ver {
-    fn prepare(job: &mut sched::Job<Self>) -> Option<Fence> {
+    type TimeoutData = QueueTimeout;
+    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
+
+    fn timeout_data(&self) -> QueueTimeout {
+        QueueTimeout { dev: self.dev.clone(), id: self.id }
+    }
+
+    fn prepare(job: &mut Self) -> Option<Fence> {
         mod_dev_dbg!(job.dev, "QueueJob {}: Checking runnability\n", job.id);
 
         if let Some(sj) = job.sj_vtx.as_ref() {
@@ -278,7 +292,7 @@ impl sched::JobImpl for QueueJob::ver {
     }
 
     #[allow(unused_assignments)]
-    fn run(job: &mut sched::Job<Self>) -> Result<Option<dma_fence::Fence>> {
+    fn run(job: &mut Self) -> Result<Option<dma_fence::Fence>> {
         mod_dev_dbg!(job.dev, "QueueJob {}: Running Job\n", job.id);
 
         // We can only increase the notifier threshold here, now that we are
@@ -325,10 +339,6 @@ impl sched::JobImpl for QueueJob::ver {
         // are "invisible" to the firmware. Incrementing the notifier threshold
         // earlier than this violates that which leads to circles like the
         // above. Deferring the increment to submit solves the race.
-        job.notifier.threshold.with(|raw, _inner| {
-            raw.increase(job.notification_count);
-        });
-
         let gpu = match (*job.dev)
             .gpu
             .clone()
@@ -378,6 +388,13 @@ impl sched::JobImpl for QueueJob::ver {
             }
         }
 
+        // Prepared submissions still hold their workqueue locks and have not
+        // published cpu_wptr. Only count them after every fallible submit()
+        // succeeded, before the first run_job exposes commands to firmware.
+        job.notifier.threshold.with(|raw, _inner| {
+            raw.increase(job.notification_count);
+        });
+
         // Now we fully commit to running the job
         mod_dev_dbg!(job.dev, "QueueJob {}: Run fragment\n", job.id);
         frag_sub.map(|a| gpu.run_job(a)).transpose()?;
@@ -395,22 +412,20 @@ impl sched::JobImpl for QueueJob::ver {
         mod_dev_dbg!(job.dev, "QueueJob {}: Drop fragment job\n", job.id);
         core::mem::drop(frag_job);
 
-        job.did_run = true;
-
         Ok(Some(Fence::from_fence(&job.fence)))
     }
 
-    fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+    fn timed_out(job: &mut QueueTimeout, _finished: bool) -> sched::Status {
         // FIXME: Handle timeouts properly
         dev_err!(
             job.dev.as_ref(),
-            "QueueJob {}: Job timed out on the DRM scheduler, things will probably break (ran: {})\n",
-            job.id, job.did_run
+            "QueueJob {}: Job timed out on the DRM scheduler, things will probably break\n",
+            job.id
         );
         sched::Status::NoDevice
     }
 
-    fn cancel(job: &mut sched::Job<Self>) {
+    fn cancel(job: &mut Self) {
         dev_info!(
             job.dev.as_ref(),
             "QueueJob {}: Job canceled on DRM scheduler teardown\n",
@@ -435,6 +450,7 @@ impl Queue::ver {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &AsahiDevice,
+        gpu: &dyn GpuManager,
         vm: mmu::Vm,
         alloc: &mut gpu::KernelAllocators,
         ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
@@ -479,8 +495,7 @@ impl Queue::ver {
             sched::Scheduler::new(dev.as_ref(), 1, WQ_SIZE, 0, 100000, c_str!("asahi_sched"))?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 
-        let buffer =
-            buffer::Buffer::ver::new(&*(*dev).gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
+        let buffer = buffer::Buffer::ver::new(gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
 
         let mut ret = Queue::ver {
             dev: dev.into(),
@@ -702,11 +717,11 @@ impl Queue for Queue::ver {
 
             match header.cmd_type as u32 {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
-                    last_compute = nr_commands;
+                    last_render = nr_commands;
                     nr_render += 1;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
-                    last_render = nr_commands;
+                    last_compute = nr_commands;
                     nr_compute += 1;
                 }
                 _ => {}
@@ -740,7 +755,6 @@ impl Queue for Queue::ver {
                 // notification count for the job.
                 notification_count: (2 * nr_render) + nr_compute,
 
-                did_run: false,
                 id,
             },
         )?;

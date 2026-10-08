@@ -45,16 +45,31 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Gem;
 pub(crate) struct AsahiObject {
     /// ID for debug
     id: u64,
+    /// Object size retained for live-object accounting.
+    size: usize,
     /// Object creation flags.
     flags: u32,
     /// Whether this object can be exported.
     exportable: bool,
     /// Whether this is a kernel-created object.
     kernel: bool,
+    /// Driver aliases outside the user GPUVA tree; they pin the backing.
+    kernel_mappings: AtomicU64,
 }
 
 /// Type alias for the shmem GEM object type for this driver.
 pub(crate) type Object = shmem::Object<AsahiObject>;
+
+/// VM-private BOs share their assigned VM's reservation object. Validate this
+/// before acquiring mapping state; generic GPUVM accepts external shareable BOs.
+pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
+    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
+        && vm.is_extobj(gem)
+    {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
 
 unsafe impl Send for AsahiObject {}
 unsafe impl Sync for AsahiObject {}
@@ -122,11 +137,7 @@ impl ObjectRef {
         if obj_range.end > self.gem.size() {
             return Err(EINVAL);
         }
-        if self.gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
-            && vm.is_extobj(&*self.gem)
-        {
-            return Err(EINVAL);
-        }
+        validate_vm_binding(&self.gem, vm)?;
         vm.map_in_range(&self.gem, obj_range, alignment, range, prot, guard)
     }
 
@@ -140,11 +151,7 @@ impl ObjectRef {
         prot: mmu::Prot,
         guard: bool,
     ) -> Result<crate::mmu::KernelMapping> {
-        if self.gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0
-            && vm.is_extobj(&*self.gem)
-        {
-            return Err(EINVAL);
-        }
+        validate_vm_binding(&self.gem, vm)?;
 
         vm.map_at(addr, self.gem.size(), self.gem.clone(), prot, guard)
     }
@@ -158,11 +165,24 @@ pub(crate) struct AsahiObjConfig {
 
 /// Create a new kernel-owned GEM object.
 pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_mapped(dev, size, false)
+}
+
+/// Create a new kernel-owned GEM object whose kernel mapping is write-combined.
+///
+/// Used for memory that a non-coherent agent reads as soon as the host has stored to it and
+/// issued a barrier, without cache maintenance.
+pub(crate) fn new_kernel_object_wc(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_mapped(dev, size, true)
+}
+
+fn new_kernel_object_mapped(dev: &AsahiDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
         align(size, mmu::UAT_PGSZ),
         shmem::ObjectConfig::<AsahiObject> {
-            map_wc: false,
+            reclaimable_cpu_mappings: false,
+            map_wc,
             parent_resv_obj: None,
         },
         AsahiObjConfig {
@@ -182,6 +202,7 @@ pub(crate) fn new_object(
     size: usize,
     flags: u32,
     parent_object: Option<&shmem::Object<AsahiObject>>,
+    reclaim_cpu: bool,
 ) -> Result<ARef<Object>> {
     if (flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0) != parent_object.is_some()
     {
@@ -192,6 +213,7 @@ pub(crate) fn new_object(
         dev,
         align(size, mmu::UAT_PGSZ),
         shmem::ObjectConfig::<AsahiObject> {
+            reclaimable_cpu_mappings: parent_object.is_some() && reclaim_cpu,
             map_wc: flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_WRITEBACK == 0,
             parent_resv_obj: parent_object,
         },
@@ -214,14 +236,16 @@ impl DriverObject for AsahiObject {
     const HAS_EXPORT: bool = true;
 
     /// Callback to create the inner data of a GEM object
-    fn new(_dev: &AsahiDevice, _size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
+    fn new(_dev: &AsahiDevice, size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
         let id = GEM_ID.fetch_add(1, Ordering::Relaxed);
         mod_pr_debug!("AsahiObject::new id={}\n", id);
         try_pin_init!(AsahiObject {
             id,
+            size,
             flags: args.flags,
             exportable: args.exportable,
             kernel: args.kernel,
+            kernel_mappings: AtomicU64::new(0),
         })
     }
 
@@ -245,4 +269,47 @@ impl DriverObject for AsahiObject {
 
         obj.prime_export(flags)
     }
+}
+
+/// A driver-created alias of a GEM object, possibly in a root the user GPUVA
+/// tree does not describe. It keeps the object out of idle reclaim.
+pub(crate) struct KernelMappingPin {
+    object: ARef<Object>,
+}
+
+impl KernelMappingPin {
+    pub(crate) fn new(object: &Object) -> Self {
+        object.kernel_mappings.fetch_add(1, Ordering::AcqRel);
+        Self {
+            object: object.into(),
+        }
+    }
+}
+
+impl core::ops::Deref for KernelMappingPin {
+    type Target = Object;
+    fn deref(&self) -> &Object {
+        &self.object
+    }
+}
+
+impl Drop for KernelMappingPin {
+    fn drop(&mut self) {
+        self.object.kernel_mappings.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl AsahiObject {
+    pub(crate) fn idle_reclaim_candidate(&self) -> bool {
+        !self.kernel && !self.exportable && self.kernel_mappings.load(Ordering::Acquire) == 0
+    }
+}
+
+/// Purge advice for a VM-private, non-exportable object. Returns whether the
+/// contents are retained (0 once purged).
+pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
+    if gem.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE == 0 || gem.exportable {
+        return Err(EINVAL);
+    }
+    Ok(u32::from(gem.madvise(i32::from(dontneed))))
 }
