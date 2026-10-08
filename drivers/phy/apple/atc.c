@@ -3075,6 +3075,10 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	if (atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF)
 		target_mode = APPLE_ATCPHY_MODE_USB2;
 
+	dev_dbg(atcphy->dev, "Type-C %lu: PHY %u->%u host=%u fixed=%u ss=%u swap=%u\n",
+		state->mode, atcphy->mode, target_mode, atcphy->host_active,
+		atcphy->fixed_usb2, atcphy->ss_tunables, atcphy->swap_lanes);
+
 	if (atcphy->mode == target_mode)
 		return 0;
 

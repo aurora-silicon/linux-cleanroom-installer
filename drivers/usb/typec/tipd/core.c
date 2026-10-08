@@ -1504,7 +1504,8 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 
 	cd321x->mux = fwnode_typec_mux_get(fwnode);
 	if (IS_ERR(cd321x->mux)) {
-		ret = PTR_ERR(cd321x->mux);
+		ret = dev_err_probe(tps->dev, PTR_ERR(cd321x->mux),
+				    "Failed to get Type-C mode mux\n");
 		goto err_unregister_altmodes;
 	}
 
@@ -2077,7 +2078,8 @@ int tipd_init(struct tps6598x *tps)
 
 	tps->role_sw = fwnode_usb_role_switch_get(fwnode);
 	if (IS_ERR(tps->role_sw)) {
-		ret = PTR_ERR(tps->role_sw);
+		ret = dev_err_probe(tps->dev, PTR_ERR(tps->role_sw),
+				    "Failed to get USB role switch\n");
 		goto err_fwnode_put;
 	}
 

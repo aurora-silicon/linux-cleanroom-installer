@@ -37,3 +37,5 @@ apple-mcc-y := mcc.o
 obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
 obj-$(CONFIG_APPLE_SART_APIF) += apple-sart-apif.o
+# The retained J700 bootstrap may contain muxes absent from this kernel.
+obj-$(CONFIG_OF_DYNAMIC) += j700-boot-handoff.o
