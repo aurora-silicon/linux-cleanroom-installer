@@ -20,7 +20,9 @@ properties:
           - const: apple,t8103-nvme-ans2
       - const: apple,t8132-nvme-ans2
       - items:
-          - const: apple,t8140-nvme-ans2
+          - enum:
+              - apple,t8140-nvme-ans2
+              - apple,t8140-nvme-ans3
           - const: apple,t8132-nvme-ans2
       - items:
           - enum:
@@ -39,17 +41,24 @@ properties:
       - description: NVMMU registers, a separate region since T8132
 
   reg-names:
-    minItems: 2
-    items:
-      - const: nvme
-      - const: ans
-      - const: nvmmu
+    oneOf:
+      - minItems: 2
+        items:
+          - const: nvme
+          - const: ans
+          - const: nvmmu
+      - items:
+          - const: nvme
+          - const: nvmmu
+          - const: ans
 
   resets:
     maxItems: 1
     description:
       Reset of the ANS2 co-processor. On T8140 asserting it raises an
-      SError, so it cannot be used to restart the co-processor there.
+      SError under the newer live-session boot contract. The older Neo
+      loader's apple,t8140-nvme-ans3 contract stops ANS completely and
+      requires the reset/reinitialization path before booting its firmware.
 
   power-domains:
     # two domains for t8103, three for t6000, t6020 and t8140
@@ -117,6 +126,7 @@ allOf:
               - apple,t6000-nvme-ans2
               - apple,t6020-nvme-ans2
               - apple,t8140-nvme-ans2
+              - apple,t8140-nvme-ans3
     then:
       properties:
         power-domains:
