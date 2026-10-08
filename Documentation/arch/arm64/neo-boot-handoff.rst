@@ -66,3 +66,26 @@ allocation rejects overlaps, and the aliases stay owned until both ASCs are
 stopped. Other GPU configurations and shared RTKit ownership rules are unchanged.
 This is crash-buffer layout compatibility, not qualification of all firmware
 versions or of the renderer.
+
+USB host and SuperSpeed handoff
+------------------------------
+
+The retained bootstrap originally described two virtual USB2 role switches,
+but this kernel uses the native fixed-hub topology from its J700 board tree.
+The companion bootstrap must describe the VIA 2109:2122 USB2 hub, connect both
+Type-C high-speed endpoints to its downstream ports, and connect the rear
+connector's SuperSpeed PHY to controller port 1. Remove the old virtual role
+inputs and the ``maximum-speed = "high-speed"`` cap. Keep all device-specific
+PHY tunables, hardware resources and unrelated boot handoffs intact. The front
+connector remains USB2-only; the rear connector has the SuperSpeed lanes.
+
+The older bootstrap also publishes an external-only DCP under the internal
+``apple,t8140-dcp`` compatible with ``apple,connector-type = "USB-C"`` and
+child ``typec-routes`` mux providers. This kernel's T8140 DCP profile has no
+external transmitters and cannot register those legacy child providers.
+An early J700-only adapter marks just these child muxes unavailable in the
+in-memory device tree. Type-C can then acquire the actual PHY switches and
+probe instead of deferring forever. It neither provides external display
+support nor suppresses legitimate PHY-provider errors. The adapter does not
+modify the bootstrap on disk, so the Dirtyroom fallback retains its original
+display-route providers. Native cleanroom board descriptions are unaffected.
