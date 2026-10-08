@@ -301,6 +301,7 @@ impl rtkit::Operations for RoleOps {
     ) -> Result<CrashLog> {
         if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != data.crash_log.va || size > data.crash_log.size
         {
+            kernel::pr_warn!("G17 crash buffer mismatch: requested {:#x}/{:#x}, expected {:#x}/{:#x}\n", iova, size, data.crash_log.va, data.crash_log.size);
             return Err(EINVAL);
         }
         Ok(CrashLog {

@@ -363,8 +363,8 @@ reply:
 	return 0;
 
 error:
-	dev_err(rtk->dev, "RTKit: failed buffer request for 0x%zx bytes (%d)\n",
-		request.size, err);
+	dev_err(rtk->dev, "RTKit: failed buffer request for 0x%zx bytes at %pad (%d)\n",
+		request.size, &request.iova, err);
 	return err;
 }
 
