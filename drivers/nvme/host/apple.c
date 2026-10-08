@@ -210,6 +210,8 @@ struct apple_nvme {
 	spinlock_t event_lock;
 	bool reset_ready;
 	bool handoff_disabled;
+	/* Older Neo loaders stop ANS3 and require a full cold restart. */
+	bool legacy_handoff;
 	struct list_head quarantine_node;
 	resource_size_t controller_start;
 	bool quarantined;
@@ -329,7 +331,7 @@ static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
 {
 	u32 cc, csts;
 
-	if (!anv->hw->needs_ioq_registers ||
+	if (anv->legacy_handoff || !anv->hw->needs_ioq_registers ||
 	    !(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 	      APPLE_ANS_COPROC_CPU_CONTROL_RUN) ||
 	    readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) != APPLE_ANS_BOOT_STATUS_OK)
@@ -358,7 +360,7 @@ static int apple_nvme_read_handoff(struct apple_nvme *anv)
 				      &handoff);
 	if (ret == -EINVAL)
 		return 0;
-	if (ret || !anv->hw->needs_ioq_registers ||
+	if (ret || anv->legacy_handoff || !anv->hw->needs_ioq_registers ||
 	    strcmp(handoff, "nvme-disabled-v1"))
 		return -EINVAL;
 	anv->handoff_disabled = true;
@@ -1661,7 +1663,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 		APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
 
-		if (anv->hw->needs_ioq_registers) {
+		if (anv->hw->needs_ioq_registers && !anv->legacy_handoff) {
 			/*
 			 * Post-M4 ANS cannot be reset through PMGR: the reset
 			 * assert raises an SError. A previous boot stage that
@@ -1693,6 +1695,10 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 
 		ret = apple_rtkit_boot(anv->rtk);
+	} else if (anv->legacy_handoff) {
+		/* Never renegotiate or reset firmware owned by another stage. */
+		dev_err(anv->dev, "legacy ANS3 handoff requires a stopped coprocessor\n");
+		ret = -EBUSY;
 	} else {
 		ret = apple_rtkit_wake(anv->rtk);
 	}
@@ -2275,6 +2281,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		ret = -ENODEV;
 		goto out_detach_genpd;
 	}
+	anv->legacy_handoff = of_device_is_compatible(dev->of_node,
+						     "apple,t8140-nvme-ans3");
 
 	ret = apple_nvme_attach_genpd(anv);
 	if (ret < 0) {
@@ -2676,6 +2684,7 @@ static const struct apple_nvme_hw apple_nvme_t8140_hw = {
 };
 
 static const struct of_device_id apple_nvme_of_match[] = {
+	{ .compatible = "apple,t8140-nvme-ans3", .data = &apple_nvme_t8140_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
