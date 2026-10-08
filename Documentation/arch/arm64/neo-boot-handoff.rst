@@ -45,3 +45,9 @@ or change their APF policy. Newer PIODMA experiments remain gated as before.
 These local adapters are implemented in the CLEANROOM source lane from the
 observed retained loader contract, with comparison against the working
 Dirtyroom integration. They do not certify independent cleanroom provenance.
+
+The inherited MTP reset GPIO uses the SMC gP13 pin API, rather than the pcIO
+function API used by newer cold-start profiles. Select that existing generic
+GPIO implementation only for an explicitly inherited J700 MTP helper; radio
+power still uses its pcIO command. Build 3 reached the greeter and joined Wi-Fi,
+but the inappropriate pcIO AFE reset left multi-touch waiting for readiness.
