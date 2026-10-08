@@ -24,3 +24,24 @@ which Linux never created an RTKit endpoint owner.
 
 These adapters address the observed SSD boot timeout and MTP wake timeout.
 They do not qualify DCP, GPU, camera, suspend or NVRAM on the combined kernel.
+
+The retained MTP session also needs its SID0 identity mapping kept intact.
+The adapter admits only J700's explicit retained-bypass property at the MTP
+DART, validates bypass and an empty translation root, keeps the provider
+powered, and selects identity DMA for its clients without rewriting the APF
+policy. Multi-touch AFE reset stays asserted during firmware upload; the
+retained session then receives the power-on handshake without a second off
+request after upload. Other machines and firmware-managed reset keep their
+existing sequences.
+
+The qualified older radio handoff has firmware-initialized PCIe without a
+PIODMA supplier. On J700 only, retain its RID/SID mappings, require an already
+up link, and expose bus 1 function 0. Function 1 remains firmware-owned and
+hidden. Adopt an existing RID mapping only if it exactly matches the requested
+SID and RID. The DART adapter admits only the radio address, 19-stream geometry,
+Linux-owned SID1 and firmware SID16/18 mask; it does not reset unrelated streams
+or change their APF policy. Newer PIODMA experiments remain gated as before.
+
+These local adapters are implemented in the CLEANROOM source lane from the
+observed retained loader contract, with comparison against the working
+Dirtyroom integration. They do not certify independent cleanroom provenance.
