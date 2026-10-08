@@ -25,3 +25,6 @@ obj-$(CONFIG_APPLE_AOP) += aop.o
 obj-$(CONFIG_APPLE_SEP) += sep.o
 
 obj-$(CONFIG_APPLE_PMP) += pmp.o
+
+# The retained J700 bootstrap may contain muxes absent from this kernel.
+obj-$(CONFIG_OF_DYNAMIC) += j700-boot-handoff.o
