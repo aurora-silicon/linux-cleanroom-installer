@@ -51,3 +51,18 @@ function API used by newer cold-start profiles. Select that existing generic
 GPIO implementation only for an explicitly inherited J700 MTP helper; radio
 power still uses its pcIO command. Build 3 reached the greeter and joined Wi-Fi,
 but the inappropriate pcIO AFE reset left multi-touch waiting for readiness.
+
+GPU crash-log layout compatibility
+----------------------------------
+
+The retained 26.6.2 firmware requests primary/secondary crash buffers at
+0x10001e28000 and 0x10001f5c000 (32 KiB each). The cleanroom profile originally
+mapped 0x01e1c000 and 0x01f50000 in the lower UAT root. Masking the firmware
+address tag still leaves a 48 KiB mismatch, so RTKit correctly refused them.
+The T8140 configuration now maps each backing at both exact known layouts
+before firmware starts and accepts either address, with the existing size
+bounds. No arbitrary firmware-requested address is mapped. Existing VM
+allocation rejects overlaps, and the aliases stay owned until both ASCs are
+stopped. Other GPU configurations and shared RTKit ownership rules are unchanged.
+This is crash-buffer layout compatibility, not qualification of all firmware
+versions or of the renderer.

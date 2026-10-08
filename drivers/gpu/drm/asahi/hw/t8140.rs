@@ -36,6 +36,10 @@ pub(crate) const CONFIG: Config = Config {
             size: 0x8000,
         },
     ],
+    // The retained Neo 26.6.2 firmware asks for crash logs 48 KiB above
+    // the newer layout. Share backing at those exact qualified addresses;
+    // RTKit still rejects every other address and oversized request.
+    crash_buffer_aliases: Some([0x01e2_8000, 0x01f5_c000]),
     // Read by the firmware through the kernel lower root, whose top-level entries it only
     // samples when it starts.
     pm_metrics: FixedBuffer {

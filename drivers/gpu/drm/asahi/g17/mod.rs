@@ -141,6 +141,8 @@ pub(crate) struct Config {
     pub(crate) secondary_root_offset: u64,
     /// Crash log buffer of each [`Role`].
     pub(crate) crash_buffers: [FixedBuffer; 2],
+    /// Additional qualified firmware addresses backed by the same crash-log memory.
+    pub(crate) crash_buffer_aliases: Option<[u64; 2]>,
     /// Parameter buffer page metrics shared with the firmware.
     pub(crate) pm_metrics: FixedBuffer,
 }
@@ -214,6 +216,7 @@ struct RoleState {
     role: Role,
     shared: Arc<Shared>,
     crash_log: FixedBuffer,
+    crash_log_alias: Option<u64>,
     crash_map: shmem::VMap<AsahiObject, u8>,
     crashed: AtomicBool,
     #[pin]
@@ -293,7 +296,9 @@ impl rtkit::Operations for RoleOps {
         iova: usize,
         size: usize,
     ) -> Result<CrashLog> {
-        if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != data.crash_log.va || size > data.crash_log.size
+        let address = (iova as u64) & RTKIT_BUFFER_ADDR_MASK;
+        if (address != data.crash_log.va && Some(address) != data.crash_log_alias)
+            || size > data.crash_log.size
         {
             kernel::pr_warn!("G17 crash buffer mismatch: requested {:#x}/{:#x}, expected {:#x}/{:#x}\n", iova, size, data.crash_log.va, data.crash_log.size);
             return Err(EINVAL);
@@ -313,6 +318,7 @@ struct Coprocessor {
     running: bool,
     rtkit: rtkit::RtKit<RoleOps>,
     state: Arc<RoleState>,
+    _crash_alias: Option<mmu::KernelMapping>,
     _crash_buffer: KernelObject,
 }
 
@@ -337,6 +343,17 @@ impl Coprocessor {
             CpuMap::WriteCombined,
         )?;
         crash_buffer.bytes_mut().fill(CRASH_BUFFER_FILL[index]);
+        // Both qualified firmware layouts must be mapped before either ASC starts.
+        // Reject collisions through the existing exact-address VM allocator.
+        let alias_address = cfg.crash_buffer_aliases.map(|addresses| addresses[index]);
+        let crash_alias = match alias_address {
+            Some(address) => Some(crash_buffer.map_alias(
+                uat.kernel_lower_vm(),
+                address,
+                mmu::PROT_FW_SHARED_RW,
+            )?),
+            None => None,
+        };
 
         let crash_map = crash_buffer.kernel_map()?;
         let state = Arc::pin_init(
@@ -347,6 +364,7 @@ impl Coprocessor {
                     va: buffer.va,
                     size: buffer.size,
                 },
+                crash_log_alias: alias_address,
                 crash_map,
                 crashed: AtomicBool::new(false),
                 ack <- Opaque::ffi_init(|ptr| {
@@ -363,6 +381,7 @@ impl Coprocessor {
             running: false,
             rtkit: Self::receiver(dev, index, &state)?,
             state,
+            _crash_alias: crash_alias,
             _crash_buffer: crash_buffer,
         })
     }
