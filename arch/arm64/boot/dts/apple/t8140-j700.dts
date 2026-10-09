@@ -50,9 +50,17 @@
 			compatible = "apple,simple-framebuffer", "simple-framebuffer";
 			reg = <0 0 0 0>; /* To be filled by loader */
 			power-domains = <&ps_disp_cpu>;
+			panel = <&fb_panel>;
 			/* Format properties will be added by loader */
 			status = "disabled";
 		};
+	};
+
+	/* Physical geometry for the firmware framebuffer's DPI reporting. */
+	fb_panel: panel {
+		width-mm = <279>;
+		height-mm = <175>;
+		status = "disabled";
 	};
 
 	reserved-memory {
