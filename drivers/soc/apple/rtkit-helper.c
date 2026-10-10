@@ -77,7 +77,9 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_rtkit_helper *helper;
+	struct property *prop;
 	u32 inherited;
+	int len;
 	int ret;
 
 	/* 44 bits for addresses in standard RTKit requests */
@@ -103,15 +105,24 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, PTR_ERR(helper->sram_base),
 					"Failed to map SRAM region");
 	}
-	/* The loader may transfer an already booted helper and its buffers. */
-	if (of_find_property(dev->of_node,
-			     "linux-enablement-mac,rtkit-inherited", NULL)) {
-		ret = of_property_read_u32(dev->of_node,
-					  "linux-enablement-mac,rtkit-inherited",
-					  &inherited);
-		if (ret || inherited > 1)
-			return dev_err_probe(dev, -EINVAL,
-					     "Invalid inherited helper state\n");
+	/*
+	 * The loader may transfer an already booted helper and its buffers.
+	 * U-Boot marks the J713 MTP with an empty property (the input
+	 * contract); the Neo loader writes 0 or 1.
+	 */
+	prop = of_find_property(dev->of_node,
+				"linux-enablement-mac,rtkit-inherited", &len);
+	if (prop) {
+		if (len == 0) {
+			inherited = 1;
+		} else {
+			ret = of_property_read_u32(dev->of_node,
+						  "linux-enablement-mac,rtkit-inherited",
+						  &inherited);
+			if (ret || inherited > 1)
+				return dev_err_probe(dev, -EINVAL,
+						     "Invalid inherited helper state\n");
+		}
 		if (inherited) {
 			if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
 			      APPLE_ASC_CPU_CONTROL_RUN))
