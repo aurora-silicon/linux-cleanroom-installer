@@ -1,0 +1,39 @@
+config TYPEC_TPS6598X_CORE
+	tristate
+	select USB_ROLE_SWITCH
+	select POWER_SUPPLY
+	select USB_COMMON if DEBUG_FS
+
+config TYPEC_TPS6598X
+	tristate "TI TPS6598x USB Power Delivery controller driver"
+	depends on I2C
+	select REGMAP_I2C
+	select TYPEC_TPS6598X_CORE
+	help
+	  Say Y or M here if your system has TI TPS65982 or TPS65983 USB Power
+	  Delivery controller.
+
+	  If you choose to build this driver as a dynamically linked module, the
+	  module will be called tps6598x.ko.
+
+config TYPEC_SN201202X
+	tristate "TI SN201202x USB Power Delivery controller support"
+	depends on SPMI
+	select TYPEC_TPS6598X_CORE
+	help
+	  Say Y here to enable support for SN201202x, a TPS6598x variant
+	  that uses SPMI as a host bus, and is found on Apple devices starting
+	  from the M3 series.
+
+	  If you choose to build this driver as a dynamically linked module, the
+	  module will be called sn201202x.ko.
+
+config TYPEC_TIPD_KUNIT_TEST
+	tristate "KUnit tests for CD321x resume state" if !KUNIT_ALL_TESTS
+	depends on KUNIT && TYPEC_TPS6598X_CORE
+	default KUNIT_ALL_TESTS
+	help
+	  Test suspend gating, fresh cable-state revalidation, bounded retries
+	  and removal during resume. The tests exercise the state transitions
+	  shared with the driver, including aborted and repeated sleep cycles.
+	  These tests run without accessing a physical Type-C controller.
