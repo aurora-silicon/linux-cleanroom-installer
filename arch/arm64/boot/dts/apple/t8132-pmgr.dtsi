@@ -802,6 +802,7 @@
 		#reset-cells = <0>;
 		label = "apcie_st";
 		power-domains = <&ps_ans>;
+		apple,inherited-on;
 	};
 
 	ps_apcie_sys_st: power-controller@548 {
@@ -811,6 +812,7 @@
 		#reset-cells = <0>;
 		label = "apcie_sys_st";
 		power-domains = <&ps_ans>, <&ps_apcie_st>;
+		apple,inherited-on;
 	};
 
 	ps_apcie_phy_sw: power-controller@550 {
