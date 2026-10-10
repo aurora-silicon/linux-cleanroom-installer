@@ -2,4 +2,3 @@
 
 obj-y += isp/
 obj-y += avd/
-obj-y += ave/
