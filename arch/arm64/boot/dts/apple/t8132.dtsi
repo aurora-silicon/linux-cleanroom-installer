@@ -8,6 +8,7 @@
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,t8132", "apple,arm-platform";
@@ -64,6 +65,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&donan_e_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -73,6 +76,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&donan_e_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e2: cpu@2 {
@@ -82,6 +87,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&donan_e_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -91,6 +98,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&donan_e_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e4: cpu@4 {
@@ -100,6 +109,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&donan_e_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e5: cpu@5 {
@@ -109,6 +120,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_0>;
+			operating-points-v2 = <&donan_e_opp>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -118,6 +131,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			operating-points-v2 = <&donan_p_opp>;
+			performance-domains = <&cpufreq_p>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -127,6 +142,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			operating-points-v2 = <&donan_p_opp>;
+			performance-domains = <&cpufreq_p>;
 		};
 
 		cpu_p2: cpu@10102 {
@@ -136,6 +153,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			operating-points-v2 = <&donan_p_opp>;
+			performance-domains = <&cpufreq_p>;
 		};
 
 		cpu_p3: cpu@10103 {
@@ -145,6 +164,8 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>;
 			next-level-cache = <&l2_cache_1>;
+			operating-points-v2 = <&donan_p_opp>;
+			performance-domains = <&cpufreq_p>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -159,6 +180,132 @@
 			cache-level = <2>;
 			cache-unified;
 			cache-size = <0x1000000>;
+		};
+	};
+
+	donan_e_opp: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-900000000 {
+			opp-hz = /bits/ 64 <900000000>;
+			opp-level = <1>;
+		};
+		opp-1080000000 {
+			opp-hz = /bits/ 64 <1080000000>;
+			opp-level = <2>;
+		};
+		opp-1476000000 {
+			opp-hz = /bits/ 64 <1476000000>;
+			opp-level = <3>;
+		};
+		opp-1860000000 {
+			opp-hz = /bits/ 64 <1860000000>;
+			opp-level = <4>;
+		};
+		opp-2172000000 {
+			opp-hz = /bits/ 64 <2172000000>;
+			opp-level = <5>;
+		};
+		opp-2496000000 {
+			opp-hz = /bits/ 64 <2496000000>;
+			opp-level = <6>;
+		};
+		opp-2808000000 {
+			opp-hz = /bits/ 64 <2808000000>;
+			opp-level = <7>;
+		};
+		opp-2892000000 {
+			opp-hz = /bits/ 64 <2892000000>;
+			opp-level = <8>;
+		};
+	};
+
+	donan_p_opp: opp-table-1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-912000000 {
+			opp-hz = /bits/ 64 <912000000>;
+			opp-level = <1>;
+		};
+		opp-1260000000 {
+			opp-hz = /bits/ 64 <1260000000>;
+			opp-level = <2>;
+		};
+		opp-1512000000 {
+			opp-hz = /bits/ 64 <1512000000>;
+			opp-level = <3>;
+		};
+		opp-1800000000 {
+			opp-hz = /bits/ 64 <1800000000>;
+			opp-level = <4>;
+		};
+		opp-2088000000 {
+			opp-hz = /bits/ 64 <2088000000>;
+			opp-level = <5>;
+		};
+		opp-2352000000 {
+			opp-hz = /bits/ 64 <2352000000>;
+			opp-level = <6>;
+		};
+		opp-2616000000 {
+			opp-hz = /bits/ 64 <2616000000>;
+			opp-level = <7>;
+		};
+		opp-2868000000 {
+			opp-hz = /bits/ 64 <2868000000>;
+			opp-level = <8>;
+		};
+		opp-3096000000 {
+			opp-hz = /bits/ 64 <3096000000>;
+			opp-level = <9>;
+		};
+		opp-3300000000 {
+			opp-hz = /bits/ 64 <3300000000>;
+			opp-level = <10>;
+		};
+		opp-3468000000 {
+			opp-hz = /bits/ 64 <3468000000>;
+			opp-level = <11>;
+		};
+		opp-3624000000 {
+			opp-hz = /bits/ 64 <3624000000>;
+			opp-level = <12>;
+		};
+		opp-3756000000 {
+			opp-hz = /bits/ 64 <3756000000>;
+			opp-level = <13>;
+		};
+		opp-3876000000 {
+			opp-hz = /bits/ 64 <3876000000>;
+			opp-level = <14>;
+		};
+		opp-3936000000 {
+			opp-hz = /bits/ 64 <3936000000>;
+			opp-level = <15>;
+		};
+		opp-3984000000 {
+			opp-hz = /bits/ 64 <3984000000>;
+			opp-level = <16>;
+		};
+		opp-4044000000 {
+			opp-hz = /bits/ 64 <4044000000>;
+			opp-level = <17>;
+		};
+		opp-4104000000 {
+			opp-hz = /bits/ 64 <4104000000>;
+			opp-level = <18>;
+		};
+		opp-4416000000 {
+			opp-hz = /bits/ 64 <4416000000>;
+			opp-level = <19>;
+			turbo-mode;
+		};
+		opp-4464000000 {
+			opp-hz = /bits/ 64 <4464000000>;
+			opp-level = <20>;
+			turbo-mode;
 		};
 	};
 
@@ -179,6 +326,13 @@
 		clock-output-names = "clkref";
 	};
 
+	qspi_clk: clock-qspi {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "qspi";
+	};
+
 	soc: soc {
 		compatible = "simple-bus";
 		#address-cells = <2>;
@@ -186,6 +340,72 @@
 
 		ranges;
 		nonposted-mmio;
+
+		qspi: spi@3ad118000 {
+			compatible = "apple,t8132-qspi";
+			/* ADT's overlapping P and C apertures form one resource. */
+			reg = <0x3 0xad118000 0 0x4800>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1060 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&qspi_clk>;
+			power-domains = <&ps_qspi>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		cpufreq_e: performance-controller@210e20000 {
+			compatible = "apple,t8132-cluster-cpufreq", "apple,cluster-cpufreq";
+			reg = <0x2 0x10e20000 0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+
+		cpufreq_p: performance-controller@211e20000 {
+			compatible = "apple,t8132-cluster-cpufreq", "apple,cluster-cpufreq";
+			reg = <0x2 0x11e20000 0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+
+		/*
+		 * The ANS register addresses and interrupts are populated from the
+		 * live Apple device tree by m1n1.  Keeping these aliases stable lets
+		 * the same SoC description work across T8132 machines.
+		 */
+		ans_mbox: mbox@0 {
+			compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x0 0x0 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 2 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 3 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 4 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_ans>;
+		};
+
+		sart: iommu@10000 {
+			compatible = "apple,t8132-sart", "apple,t6000-sart";
+			reg = <0x0 0x10000 0x0 0x10000>;
+			power-domains = <&ps_ans>;
+		};
+
+		nvme: nvme@40000 {
+			compatible = "apple,t8132-nvme-ans2",
+				     "apple,t8103-nvme-ans2";
+			reg = <0x0 0x40000 0x0 0x40000>,
+			      <0x0 0x80000 0x0 0x40000>,
+			      <0x0 0xc0000 0x0 0x4000>;
+			reg-names = "nvme", "nvmmu", "ans";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 5 IRQ_TYPE_LEVEL_HIGH>;
+			mboxes = <&ans_mbox>;
+			apple,sart = <&sart>;
+			power-domains = <&ps_ans>, <&ps_apcie_sys_st>;
+			power-domain-names = "ans", "apcie0";
+			resets = <&ps_ans>;
+		};
 
 		pmgr: power-management@380700000 {
 			compatible = "apple,t8132-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
@@ -231,6 +451,44 @@
 			clocks = <&clkref>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 507 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		nub_spmi: spmi@0 {
+			compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+			reg = <0x0 0x0 0x0 0x1000>; /* To be filled by loader */
+			#address-cells = <2>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		smc: smc@38c600000 {
+			compatible = "apple,t8132-smc", "apple,t8103-smc";
+			reg = <0x3 0x8c600000 0x0 0x4000>,
+			      <0x3 0x8de00000 0x0 0x100000>;
+			reg-names = "smc", "sram";
+			mboxes = <&smc_mbox>;
+			status = "disabled";
+
+			smc_gpio: gpio {
+				compatible = "apple,smc-gpio";
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+		};
+
+		smc_mbox: mbox@38c608000 {
+			compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x8c608000 0x0 0x4000>;
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 561 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 562 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 563 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 564 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
 		};
 
 		pinctrl_nub: pinctrl@3881f0000 {
@@ -295,6 +553,75 @@
 			             <AIC_IRQ 427 IRQ_TYPE_LEVEL_HIGH>,
 			             <AIC_IRQ 428 IRQ_TYPE_LEVEL_HIGH>,
 			             <AIC_IRQ 429 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		mtp: mtp@394600000 {
+			compatible = "apple,t8132-mtp", "apple,t8132-rtk-helper-asc4",
+				     "apple,mtp", "apple,rtk-helper-asc4";
+			reg = <0x3 0x94600000 0x0 0x4000>,
+			      <0x3 0x94c00000 0x0 0x100000>;
+			reg-names = "asc", "sram";
+			mboxes = <&mtp_mbox>;
+			iommus = <&mtp_dart 1>;
+			#helper-cells = <0>;
+			status = "disabled";
+		};
+
+		mtp_mbox: mbox@394608000 {
+			compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x94608000 0x0 0x4000>;
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1113 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 1114 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 1115 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 1116 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		mtp_dart: iommu@394800000 {
+			compatible = "apple,t8110-dart";
+			reg = <0x3 0x94800000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1091 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		mtp_dockchannel: fifo@394b14000 {
+			compatible = "apple,t8132-dockchannel", "apple,dockchannel";
+			reg = <0x3 0x94b14000 0x0 0x1000>;
+			reg-names = "irq";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1093 IRQ_TYPE_LEVEL_HIGH>;
+
+			ranges = <0 0x3 0x94b28000 0x10000>;
+			nonposted-mmio;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			status = "disabled";
+
+			mtp_hid: input@0 {
+				compatible = "apple,dockchannel-hid";
+				reg = <0x0000 0x1000>,
+				      <0x4000 0x1000>,
+				      <0x8000 0x1000>,
+				      <0xc000 0x1000>;
+				reg-names = "rmt-config", "rmt-data", "config", "data";
+				iommus = <&mtp_dart 1>;
+				interrupt-parent = <&mtp_dockchannel>;
+				interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+					     <3 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-names = "tx", "rx";
+				apple,fifo-size = <0x800>;
+				apple,helper-cpu = <&mtp>;
+			};
 		};
 
 		pinctrl_ap: pinctrl@39a000000 {
