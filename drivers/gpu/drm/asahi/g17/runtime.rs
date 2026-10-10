@@ -176,30 +176,42 @@ impl Registry {
         queue.bind_owner(owner, context.clone())
     }
 
-    /// Publishes releases for the oldest idle retained pools beyond `cap`, at
-    /// most four per pass. Returns the number published.
+    /// Delay before retrying pools a turn could not release.
+    const POOL_RETRY_NS: u64 = 100_000_000;
+    /// Publishes releases for the oldest idle retained pools beyond `cap` and
+    /// for every pool released at least `expiry` before `now`, at most four
+    /// per pass. Returns the number published and the delay until the next
+    /// retained pool expires or a retry is due.
     pub(super) fn vacate_idle_pools(
         &mut self,
         init: &super::initdata::InitData,
         cap: usize,
-    ) -> Result<usize> {
+        now: u64,
+        expiry: u64,
+    ) -> Result<(usize, Option<u64>)> {
         // Count first: event turns are frequent and the steady state has no excess.
-        let forced = self
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .filter(|queue| queue.vacate_candidate() && queue.needs_fresh_backing())
-            .count();
-        let count = self
+        let mut forced = 0;
+        let mut count = 0;
+        let mut next = None::<u64>;
+        for queue in self
             .compute
             .iter()
             .flatten()
             .filter_map(|entry| entry.queue.as_deref())
             .filter(|queue| queue.vacate_candidate())
-            .count();
+        {
+            count += 1;
+            let released = queue.released_at();
+            let age = now.saturating_sub(released);
+            if queue.needs_fresh_backing() || (released != 0 && age >= expiry) {
+                forced += 1;
+            } else if released != 0 {
+                let left = expiry - age;
+                next = Some(next.map_or(left, |next| next.min(left)));
+            }
+        }
         if count <= cap && forced == 0 {
-            return Ok(0);
+            return Ok((0, next));
         }
         let mut candidates: KVec<(u64, u8)> = KVec::with_capacity(count, GFP_KERNEL)?;
         for queue in self
@@ -213,6 +225,7 @@ impl Registry {
             let key = if queue.needs_fresh_backing() { 0 } else { queue.released_at() };
             candidates.push((key, queue.qid()), GFP_KERNEL)?;
         }
+        // Recycled and expired pools are the oldest keys and sort first.
         candidates.sort_unstable();
         let excess = candidates.len().saturating_sub(cap).max(forced);
         let mut published = 0;
@@ -230,7 +243,11 @@ impl Registry {
             }
             published += 1;
         }
-        Ok(published)
+        if published < excess {
+            // Beyond this turn's bound, or not yet releasable: retry soon.
+            next = Some(next.map_or(Self::POOL_RETRY_NS, |next| next.min(Self::POOL_RETRY_NS)));
+        }
+        Ok((published, next))
     }
 
     /// Frees the backing of every pool whose release the firmware consumed.
@@ -656,6 +673,8 @@ pub(super) struct DeferredBatch {
     vacated: KVVec<super::queue::compute::Vacated>,
     /// Backing of render pools vacated for evicted idle clients.
     render: KVVec<super::freelist::RenderBacking>,
+    /// Tiler-heap extensions removed from idle heaps, with their aliases.
+    tvb: KVVec<super::buffer::TvbRelease>,
 }
 impl DeferredBatch {
     const DEPTH: usize = if crate::hw::t8140::queues::RENDER_DEPTH as usize
@@ -676,14 +695,17 @@ impl DeferredBatch {
         Self::with_capacity(2 * Self::DEPTH, 0)
     }
     fn with_capacity(capacity: usize, detached: usize) -> Result<Self> {
+        let render_slots = if detached != 0 {
+            crate::hw::t8140::queues::RENDER_SLOTS
+        } else {
+            0
+        };
         Ok(Self {
             values: KVVec::with_capacity(capacity, GFP_KERNEL)?,
             bindings: KVVec::with_capacity(detached, GFP_KERNEL)?,
             vacated: KVVec::with_capacity(detached, GFP_KERNEL)?,
-            render: KVVec::with_capacity(
-                if detached != 0 { crate::hw::t8140::queues::RENDER_SLOTS } else { 0 },
-                GFP_KERNEL,
-            )?,
+            render: KVVec::with_capacity(render_slots, GFP_KERNEL)?,
+            tvb: KVVec::with_capacity(render_slots, GFP_KERNEL)?,
         })
     }
     /// Keeps the detached owner's unmapping and VM teardown out of the device
@@ -700,6 +722,14 @@ impl DeferredBatch {
     pub(super) fn defer_render_backing(&mut self, backing: super::freelist::RenderBacking) {
         if let Err(backing) = self.render.push_within_capacity(backing) {
             drop(backing);
+        }
+    }
+    pub(super) fn tvb_room(&self) -> bool {
+        self.tvb.len() < self.tvb.capacity()
+    }
+    pub(super) fn defer_tvb(&mut self, release: super::buffer::TvbRelease) {
+        if let Err(release) = self.tvb.push_within_capacity(release) {
+            drop(release);
         }
     }
     pub(super) fn defer_vacated(&mut self, vacated: super::queue::compute::Vacated) {
@@ -752,6 +782,9 @@ impl DeferredBatch {
         }
         for backing in self.render.drain_all() {
             drop(backing);
+        }
+        for release in self.tvb.drain_all() {
+            drop(release);
         }
     }
 }
@@ -1145,16 +1178,24 @@ impl super::Shared {
 /// Idle retained compute queues that keep their USC pool populated; older idle
 /// pools give their backing back.
 const COMPUTE_WARM_CAP: usize = 4;
+/// A retained pool idle this long gives its backing back regardless of the
+/// cap: a burst of short-lived clients still finds warm pools, but the pools
+/// of clients that are gone do not stay resident. The macOS driver frees a
+/// client's USC pools with the client and has an idle shrink; ten seconds
+/// matches its idle parameter-buffer shrink.
+const COMPUTE_WARM_EXPIRY_NS: u64 = 10_000_000_000;
 
 impl super::Firmware {
     /// Event-worker service step: witness consumed pool releases, then release the
     /// oldest idle retained pools beyond the warm cap.
     /// Detached owner bindings and vacated pool backing go to `deferred`, which
     /// the worker finishes after releasing the device mutex.
+    /// Returns the delay until a retained pool expires, for the worker's wake.
     pub(in crate::g17) fn service_compute_pools(
         &mut self,
         deferred: &mut DeferredBatch,
-    ) -> Result {
+        now: u64,
+    ) -> Result<Option<u64>> {
         for queue in self
             .queues
             .compute
@@ -1169,14 +1210,19 @@ impl super::Firmware {
         }
         self.queues.observe_pool_releases(&self.init, deferred)?;
         if self.render_control_backpressured() {
-            return Ok(());
+            return Ok(None);
         }
-        let published = self.queues.vacate_idle_pools(&self.init, COMPUTE_WARM_CAP)?;
+        let (published, next) = self.queues.vacate_idle_pools(
+            &self.init,
+            COMPUTE_WARM_CAP,
+            now,
+            COMPUTE_WARM_EXPIRY_NS,
+        )?;
         if published != 0 {
             fence(Ordering::SeqCst);
             self.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
         }
-        Ok(())
+        Ok(next)
     }
 }
 
