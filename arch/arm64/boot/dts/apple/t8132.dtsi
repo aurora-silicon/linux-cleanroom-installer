@@ -750,6 +750,17 @@
 			status = "disabled";
 		};
 
+		/* DockChannel UART: the DebugUSB console (ADT /arm-io/dockchannel-uart). */
+		dockchannel_uart: serial@38812c000 {
+			compatible = "apple,dockchannel-uart";
+			reg = <0x3 0x8812c000 0x0 0x4000>,
+			      <0x3 0x88128000 0x0 0x4000>,
+			      <0x3 0x8810c000 0x0 0x4000>;
+			reg-names = "data", "config", "irq";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 496 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
 		serial0: serial@3ad200000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x3 0xad200000 0x0 0x1000>;
