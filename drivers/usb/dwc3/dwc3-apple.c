@@ -309,7 +309,9 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	 * Now that the core is initialized and already went through dwc3_core_soft_reset we can
 	 * configure some unknown Apple-specific settings and then bring up xhci or gadget mode.
 	 */
-	dwc3_apple_setup_cio(appledwc);
+	/* T8132 (M4) has no CIO/USB4 block behind its USB2-only controller. */
+	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
+		dwc3_apple_setup_cio(appledwc);
 
 	return 0;
 }
@@ -551,7 +553,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(appledwc->usb2_phy),
 				     "Failed to get the USB2 PHY\n");
 
-	appledwc->usb3_phy = devm_phy_get(dev, "usb3-phy");
+	/* T8132's controller has only a USB2 PHY; a NULL PHY is a no-op. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3"))
+		appledwc->usb3_phy = devm_phy_optional_get(dev, "usb3-phy");
+	else
+		appledwc->usb3_phy = devm_phy_get(dev, "usb3-phy");
 	if (IS_ERR(appledwc->usb3_phy))
 		return dev_err_probe(dev, PTR_ERR(appledwc->usb3_phy),
 				     "Failed to get the USB3 PHY\n");
@@ -626,6 +632,7 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id dwc3_apple_of_match[] = {
+	{ .compatible = "apple,t8132-dwc3" },
 	{ .compatible = "apple,t8103-dwc3" },
 	{}
 };
