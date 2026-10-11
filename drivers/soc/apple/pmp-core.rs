@@ -60,6 +60,7 @@ const OPC_SET_BUF: u64 = 0x30;
 const OPC_REGISTER_IOREG: u64 = 0x32;
 const OPC_SET_IOREG: u64 = 0x34;
 const OPC_UPDATE_IOREG_V2: u64 = 0x36;
+const OPC_CONFIRM_IOREG: u64 = 0x37;
 const OPC_ACK_MASK: u64 = 0x1;
 const OPC_SHIFT: u32 = 48;
 const MALLOC_SIZE_MASK: u64 = 0xFFFFFF;
@@ -622,6 +623,13 @@ impl PmpData {
             OPC_SET_IOREG if self.registry_v2 => self.change_ioreg_v2(msg as u16, true)?,
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
             OPC_UPDATE_IOREG_V2 if self.registry_v2 => self.change_ioreg_v2(msg as u16, false)?,
+            // Firmware waits for this confirmation before publishing reports.
+            // Do not echo the registry index/payload or add a generic ACK bit.
+            // Only the J713 path is qualified; other boards are unchanged.
+            // SAFETY: read-only board identity check.
+            OPC_UPDATE_IOREG_V2 if unsafe { bindings::apple_pmp_display_retained_board() } => {
+                OPC_CONFIRM_IOREG << OPC_SHIFT
+            }
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
