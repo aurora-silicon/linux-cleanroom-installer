@@ -53,6 +53,7 @@ struct apple_pmgr_ps {
 	bool inherited_on;
 	bool preserve_display;
 	bool needs_reset_idle_wait;
+	bool j713_gfx;
 	u32 reset_time_us;
 };
 
@@ -64,6 +65,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	int ret;
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	u32 reg, cur;
+	u32 timeout = ps->j713_gfx ? 10000 : APPLE_PMGR_PS_SET_TIMEOUT;
 
 	ret = regmap_read(ps->regmap, ps->offset, &reg);
 	if (ret < 0)
@@ -104,7 +106,10 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 
 	dev_dbg(ps->dev, "PS %s: pwrstate = 0x%x: 0x%x\n", genpd->name, pstate, reg);
 
-	regmap_write(ps->regmap, ps->offset, reg);
+	ret = regmap_write(ps->regmap, ps->offset, reg);
+	if (ret && ps->j713_gfx)
+		return ret;
+	cur = reg;
 
 	if (ps->externally_clocked && pstate == APPLE_PMGR_PS_ACTIVE) {
 		/*
@@ -119,7 +124,13 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		ret = regmap_read_poll_timeout_atomic(
 			ps->regmap, ps->offset, cur,
 			FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) == pstate, 1,
-			APPLE_PMGR_PS_SET_TIMEOUT);
+			timeout);
+	}
+	if (ps->j713_gfx) {
+		dev_info(ps->dev, "GFX target=%#x written=%#x actual=%#x error=%d\n",
+			 pstate, reg, cur, ret);
+		if (ret)
+			return ret; /* No automatic gating after a failed transition. */
 	}
 
 	if (ret < 0)
@@ -129,6 +140,8 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	if (auto_enable) {
 		/* Not all devices implement this; this is a no-op where not implemented. */
 		reg |= APPLE_PMGR_AUTO_ENABLE;
+		if (ps->j713_gfx)
+			return regmap_write(ps->regmap, ps->offset, reg);
 		regmap_write(ps->regmap, ps->offset, reg);
 	}
 
@@ -143,6 +156,9 @@ static int apple_pmgr_ps_is_active(struct apple_pmgr_ps *ps)
 	ret = regmap_read(ps->regmap, ps->offset, &reg);
 	if (ret)
 		return ret;
+	/* For J713 powered ASC admission, target/auto alone is not an ACK. */
+	if (ps->j713_gfx)
+		return FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) == APPLE_PMGR_PS_ACTIVE;
 	/*
 	 * We consider domains as active if they are actually on, or if they have auto-PM
 	 * enabled and the intended target is on.
@@ -287,7 +303,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	struct of_phandle_iterator it;
 	int ret;
 	const char *name;
-	bool active, t8132, preserve_display = false;
+	bool active, t8132, preserve_display = false, j713_gfx = false;
+	struct device_node *tvm;
 	struct resource pmgr_resource;
 	u32 offset;
 
@@ -299,6 +316,19 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 */
 	t8132 = of_device_is_compatible(node,
 					"apple,t8132-pmgr-pwrstate");
+	if (IS_ENABLED(CONFIG_APPLE_GFX_TVM) && t8132 &&
+	    of_machine_is_compatible("apple,j713") &&
+	    of_machine_is_compatible("apple,t8132") &&
+	    !of_property_read_u32(node, "reg", &offset) && offset == 0x250 &&
+	    !of_address_to_resource(node->parent, 0, &pmgr_resource) &&
+	    pmgr_resource.start == 0x380700000ULL &&
+	    !of_property_read_string(node, "label", &name) && !strcmp(name, "gfx")) {
+		tvm = of_parse_phandle(node, "power-domains", 0);
+		j713_gfx = tvm && of_device_is_compatible(tvm, "apple,t8132-gfx-tvm") &&
+			!of_address_to_resource(tvm, 0, &pmgr_resource) &&
+			pmgr_resource.start == 0x380760800ULL && resource_size(&pmgr_resource) == 4;
+		of_node_put(tvm);
+	}
 	if (t8132 && !of_property_read_u32(node, "reg", &offset) &&
 	    (offset == 0x240 || offset == 0x248 || offset == 0x10000) &&
 	    of_machine_is_compatible("apple,j713") &&
@@ -309,7 +339,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 			return -ENODEV;
 		preserve_display = true;
 	}
-	if (t8132 && !preserve_display &&
+	if (t8132 && !preserve_display && !j713_gfx &&
 	    (of_property_read_u32(node, "reg", &offset) ||
 	     (offset != 0x188 && offset != 0x190 &&
 	      offset != 0x278 && /* fpwm1 */
@@ -336,7 +366,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		APPLE_PMGR_RESET_TIME;
 	ps->needs_reset_idle_wait = t8132;
 	/* m1n1 leaves automatic power gating disabled on T8132 domains. */
-	ps->no_auto_enable = t8132;
+	ps->no_auto_enable = t8132 && !j713_gfx;
+	ps->j713_gfx = j713_gfx;
 	ps->inherited_on = of_property_read_bool(node, "apple,inherited-on");
 	ps->preserve_display = preserve_display;
 
