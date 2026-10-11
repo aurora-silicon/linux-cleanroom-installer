@@ -2655,6 +2655,13 @@ static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode
 
 	guard(mutex)(&atcphy->lock);
 
+	if (mode != PHY_MODE_USB_HOST && mode != PHY_MODE_USB_DEVICE)
+		return -EINVAL;
+
+	/* T8132 must latch the role before its USB2 PHY starts running. */
+	if (atcphy->hw->usb2_only)
+		atcphy_usb2_power_off(atcphy);
+
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
 		set32(atcphy->regs.usb2phy + USB2PHY_SIG,
@@ -2667,6 +2674,9 @@ static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	default:
 		return -EINVAL;
 	}
+
+	if (atcphy->hw->usb2_only && atcphy->mode == APPLE_ATCPHY_MODE_USB2)
+		atcphy_usb2_power_on(atcphy);
 
 	return 0;
 }
@@ -2985,6 +2995,10 @@ static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsign
 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
 
 	guard(mutex)(&atcphy->lock);
+
+	/* Reset assertion powers USB2 off without changing the mux mode. */
+	if (atcphy->hw->usb2_only && atcphy->mode == APPLE_ATCPHY_MODE_USB2)
+		atcphy_usb2_power_on(atcphy);
 
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
 		PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
