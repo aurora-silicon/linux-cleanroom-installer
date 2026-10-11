@@ -412,6 +412,7 @@ struct cd321x {
 struct sn201202x {
 	struct cd321x cd;
 	bool polled;
+	bool select_polled;
 	struct completion select_completion;
 	struct completion sleep_completion;
 	struct completion wake_completion;

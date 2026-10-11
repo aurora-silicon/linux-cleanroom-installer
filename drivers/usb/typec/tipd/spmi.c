@@ -25,7 +25,7 @@ static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 	if (err)
 		return err;
 
-	if (sn->polled) {
+	if (sn->polled || sn->select_polled) {
 		int poll_err;
 
 		poll_err = read_poll_timeout(spmi_register_read, err,
@@ -235,8 +235,15 @@ static int sn201202x_probe(struct spmi_device *device)
 		if (tps->irq < 0)
 			return tps->irq;
 		irq_select = of_irq_get_byname(device->dev.of_node, "select");
-		if (irq_select < 0)
+		/* The T8132 controller has no select notification; poll for it. */
+		if (irq_select == -EINVAL || irq_select == -ENODATA) {
+			if (!of_device_is_compatible(device->dev.of_node,
+						     "apple,t8132-sn201202x"))
+				return irq_select;
+			sn->select_polled = true;
+		} else if (irq_select < 0) {
 			return irq_select;
+		}
 		irq_sleep = of_irq_get_byname(device->dev.of_node, "sleep");
 		if (irq_sleep < 0)
 			return irq_sleep;
@@ -244,10 +251,12 @@ static int sn201202x_probe(struct spmi_device *device)
 		if (irq_wake < 0)
 			return irq_wake;
 
-		ret = devm_request_irq(&device->dev, irq_select, sn201202x_irq,
-				       0, NULL, &sn->select_completion);
-		if (ret)
-			return ret;
+		if (!sn->select_polled) {
+			ret = devm_request_irq(&device->dev, irq_select, sn201202x_irq,
+					       0, NULL, &sn->select_completion);
+			if (ret)
+				return ret;
+		}
 		ret = devm_request_irq(&device->dev, irq_sleep, sn201202x_irq,
 				       0, NULL, &sn->sleep_completion);
 		if (ret)
