@@ -2447,6 +2447,21 @@ static bool apple_dart_is_locked(struct apple_dart *dart)
 	return !!(apple_dart_readl(dart, dart->hw->lock) & dart->hw->lock_bit);
 }
 
+/* Every stream in DART bypass, none translating. */
+static bool apple_dart_streams_bypassed(struct apple_dart *dart)
+{
+	int sid;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		if ((apple_dart_readl(dart, DART_TCR(dart, sid)) &
+		     (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_TRANSLATE_ENABLE)) !=
+		    DART_T8110_TCR_BYPASS_DART ||
+		    (apple_dart_readl(dart, DART_TTBR(dart, sid, 0)) & dart->hw->ttbr_valid))
+			return false;
+	}
+	return true;
+}
+
 static void apple_dart_iounmap_np(void *data)
 {
 	iounmap((__force void __iomem *)data);
@@ -2749,7 +2764,19 @@ params_done:
 		ret = -EINVAL;
 		goto err_clk_disable;
 	}
-	if (dart->retained_sid0 || dart->owned_streams || dart->firmware_streams) {
+	/*
+	 * The J713 loader hands MTP over running, with every stream of its DART
+	 * in bypass and the firmware's buffers reserved. A reset cuts the
+	 * firmware off from those buffers and crashes it, taking the built-in
+	 * keyboard with it, so keep the DART exactly as it was handed over.
+	 */
+	if (!dart->retained_sid0 && !dart->owned_streams && !dart->firmware_streams &&
+	    of_machine_is_compatible("apple,j713") && res->start == 0x394800000ULL &&
+	    !dart->locked && !tunneled && dart->supports_bypass &&
+	    apple_dart_streams_bypassed(dart)) {
+		dart->retained_sid0 = 1;
+		dev_info(dev, "Retaining the live J713 MTP bypass\n");
+	} else if (dart->retained_sid0 || dart->owned_streams || dart->firmware_streams) {
 		if (!of_machine_is_compatible("apple,j700") ||
 		    !of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		    dart->locked || tunneled || !dart->supports_bypass) {
