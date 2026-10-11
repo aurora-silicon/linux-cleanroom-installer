@@ -203,6 +203,12 @@ struct apple_nvme_hw {
 	bool has_separate_nvmmu;
 	bool needs_ioq_registers;
 	bool apif;
+	/*
+	 * A stopped coprocessor takes the PMGR reset and a fresh RTKit boot.
+	 * T8140 cannot be reset this way (the assert raises an SError), so it
+	 * restarts resident firmware instead; T8132 needs the real cold start.
+	 */
+	bool cold_reset;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -1708,7 +1714,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 		APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
 
-		if (anv->hw->needs_ioq_registers && !anv->legacy_handoff) {
+		if (anv->hw->needs_ioq_registers && !anv->hw->cold_reset &&
+		    !anv->legacy_handoff) {
 			/*
 			 * Post-M4 ANS cannot be reset through PMGR: the reset
 			 * assert raises an SError. A previous boot stage that
@@ -2732,7 +2739,13 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.has_lsq_nvmmu = true,
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
+	.cold_reset = true,
 	.max_queue_depth = 64,
+	/*
+	 * As on T8140, FUA alone is not durable across a reset: the cleanroom
+	 * J713 bring-up kept a 1 GiB file only once each write was flushed.
+	 */
+	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
 
 static const struct apple_nvme_hw apple_nvme_t8140_hw = {
