@@ -48,6 +48,7 @@
 #include <linux/blkdev.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
+#include <linux/soc/apple/pmp-display.h>
 #include <linux/configfs.h>
 #include <linux/cpu.h>
 #include <linux/cpufreq.h>
