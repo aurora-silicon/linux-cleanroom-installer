@@ -2,7 +2,6 @@
 config DRM_APPLE_M4_GPU_POWER
 	tristate "J713 GPU power admission experiment"
 	depends on DRM && ARM64 && OF && APPLE_GFX_TVM && APPLE_PMP && APPLE_RTKIT
-	depends on !DRM_ASAHI
 	select CRYPTO_LIB_SHA256
 	select DRM_APPLE_M4_GPU
 	help
@@ -13,12 +12,12 @@ config DRM_APPLE_M4_GPU_POWER
 	  Includes the private native-buffer/provider helpers, but creating a
 	  visible DRM node still requires separate actual backend qualification.
 	  Requires a watchdog guard. No unload, suspend or power-off qualification.
-	  Leave disabled for production.
+	  Leave disabled for production. May be built alongside DRM_ASAHI:
+	  that driver binds other GPUs, this one only apple,agx-t8132 on J713.
 
 config DRM_APPLE_M4_GPU
 	tristate "J713 retained GPU Mesa ABI frontend"
 	depends on DRM && ARM64 && OF && APPLE_PMP && APPLE_RTKIT
-	depends on !DRM_ASAHI
 	select DRM_GEM_SHMEM_HELPER
 	select DRM_SCHED
 	select DRM_EXEC
