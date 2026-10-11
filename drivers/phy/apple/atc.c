@@ -525,6 +525,10 @@ enum atcphy_lane_mode {
 #define USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL BIT(2)
 #define USB2PHY_SIG_VBUSVLDEXT_FORCE_EN BIT(3)
 #define USB2PHY_SIG_HOST (7 << 12)
+#define USB2PHY_SIG_HOST_T8132 GENMASK(6, 4)
+
+#define PIPEHANDLER_T8132_USB2_CONFIG 0x44
+#define PIPEHANDLER_T8132_USB2_CONFIG_EN BIT(2)
 
 #define USB2PHY_MISCTUNE 0x1c
 #define USB2PHY_MISCTUNE_APBCLK_GATE_OFF BIT(29)
@@ -630,6 +634,13 @@ struct atcphy_hw {
 	u32 pipe_mux_data;
 	bool has_usb2phy_reg;
 	bool optional_tunables;
+	/*
+	 * T8132 (M4) implements only the USB2 PHY and its pipehandler: no
+	 * USB3/DP/USB4 lanes, core, lpdptx or axi2af registers (cleanroom
+	 * 03745d2a3743).
+	 */
+	bool usb2_only;
+	u32 usb2phy_sig_host;
 };
 
 /**
@@ -1416,6 +1427,12 @@ static void atcphy_park_pipehandler(struct apple_atcphy *atcphy)
 static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 {
 	lockdep_assert_held(&atcphy->lock);
+
+	if (atcphy->hw->usb2_only) {
+		set32(atcphy->regs.pipehandler + PIPEHANDLER_T8132_USB2_CONFIG,
+		      PIPEHANDLER_T8132_USB2_CONFIG_EN);
+		return;
+	}
 
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
@@ -2527,6 +2544,20 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	atc_tunnel_stop_t8103(atcphy);
 	atc_tunnel_restore(atcphy);
 
+	if (atcphy->hw->usb2_only) {
+		/* A USB3 request from the Type-C mux is served as USB2. */
+		if (mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP)
+			mode = APPLE_ATCPHY_MODE_USB2;
+		if (mode == APPLE_ATCPHY_MODE_OFF)
+			atcphy_usb2_power_off(atcphy);
+		else if (mode == APPLE_ATCPHY_MODE_USB2)
+			atcphy_usb2_power_on(atcphy);
+		else
+			return -EOPNOTSUPP;
+		atcphy->mode = mode;
+		return 0;
+	}
+
 	if (mode == APPLE_ATCPHY_MODE_OFF) {
 		ret = atcphy_power_off(atcphy);
 		atcphy->mode = mode;
@@ -2621,10 +2652,12 @@ static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode
 
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
-		set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
+		set32(atcphy->regs.usb2phy + USB2PHY_SIG,
+	      atcphy->hw->usb2phy_sig_host ?: USB2PHY_SIG_HOST);
 		break;
 	case PHY_MODE_USB_DEVICE:
-		clear32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
+		clear32(atcphy->regs.usb2phy + USB2PHY_SIG,
+		atcphy->hw->usb2phy_sig_host ?: USB2PHY_SIG_HOST);
 		break;
 	default:
 		return -EINVAL;
@@ -2650,7 +2683,8 @@ static int atcphy_usb2_init(struct phy *phy)
 	 * powered off as well the whole block is off; bring it back in the mode
 	 * the Type-C mux last asked for, USB2 until a cable event says otherwise.
 	 */
-	set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
+	set32(atcphy->regs.usb2phy + USB2PHY_SIG,
+	      atcphy->hw->usb2phy_sig_host ?: USB2PHY_SIG_HOST);
 	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF)
 		return atcphy_configure(atcphy, atcphy->typec_mode);
 
@@ -2873,15 +2907,23 @@ static struct phy *atcphy_xlate(struct device *dev, const struct of_phandle_args
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
 
+	struct phy *phy;
+
 	switch (args->args[0]) {
 	case PHY_TYPE_USB2:
-		return atcphy->phys.usb2;
+		phy = atcphy->phys.usb2;
+		break;
 	case PHY_TYPE_USB3:
-		return atcphy->phys.usb3;
+		phy = atcphy->phys.usb3;
+		break;
 	case PHY_TYPE_DP:
-		return atcphy->phys.dp;
+		phy = atcphy->phys.dp;
+		break;
+	default:
+		return ERR_PTR(-ENODEV);
 	}
-	return ERR_PTR(-ENODEV);
+
+	return phy ?: ERR_PTR(-ENODEV);
 }
 
 static int atcphy_probe_phy(struct apple_atcphy *atcphy)
@@ -2896,6 +2938,8 @@ static int atcphy_probe_phy(struct apple_atcphy *atcphy)
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(phys); i++) {
+		if (atcphy->hw->usb2_only && i != 0)
+			continue;
 		*phys[i].phy = devm_phy_create(atcphy->dev, NULL, phys[i].ops);
 		if (IS_ERR(*phys[i].phy))
 			return PTR_ERR(*phys[i].phy);
@@ -3159,6 +3203,9 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 {
 	size_t tunable_count;
 	bool ss_missing = false;
+
+	if (atcphy->hw->usb2_only)
+		return 0;
 	struct {
 		const char *dt_name;
 		struct apple_tunable **tunable;
@@ -3243,6 +3290,9 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 	void __iomem *addr;
 
 	for (int i = 0; i < ARRAY_SIZE(resources); i++) {
+		/* A USB2-only PHY has just the usb2phy and pipehandler banks. */
+		if (atcphy->hw->usb2_only && i < 3)
+			continue;
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, resources[i].name);
 		addr = devm_ioremap_resource(&pdev->dev, res);
 		if (IS_ERR(addr))
@@ -3298,7 +3348,8 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 
 	/* Reset atcphy to clear any state potentially left by the bootloader */
 	atcphy_usb2_power_off(atcphy);
-	atcphy_power_off(atcphy);
+	if (!atcphy->hw->usb2_only)
+		atcphy_power_off(atcphy);
 	atcphy_setup_pipehandler(atcphy);
 
 	/*
@@ -3309,7 +3360,8 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 	 * in reset.
 	 */
 	if (atcphy->fixed_usb2) {
-		set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
+		set32(atcphy->regs.usb2phy + USB2PHY_SIG,
+	      atcphy->hw->usb2phy_sig_host ?: USB2PHY_SIG_HOST);
 		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB2);
 		if (ret)
 			return dev_err_probe(atcphy->dev, ret, "Failed to bring up USB2\n");
@@ -3396,6 +3448,12 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 	.has_usb4 = true,
 };
 
+static const struct atcphy_hw atcphy_hw_t8132 = {
+	.gen = ATCPHY_GENERATION_T8122,
+	.usb2_only = true,
+	.usb2phy_sig_host = USB2PHY_SIG_HOST_T8132,
+};
+
 static const struct atcphy_hw atcphy_hw_t8140 = {
 	.gen = ATCPHY_GENERATION_T8122,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
@@ -3420,6 +3478,7 @@ static const struct of_device_id atcphy_match[] = {
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
 	{ .compatible = "apple,t8142-atcphy", .data = &atcphy_hw_t8142 },
 	{ .compatible = "apple,t8140-atcphy", .data = &atcphy_hw_t8140 },
+	{ .compatible = "apple,t8132-atcphy", .data = &atcphy_hw_t8132 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, atcphy_match);
