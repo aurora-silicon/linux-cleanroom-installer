@@ -82,6 +82,9 @@
 		power-domains = <&ps_disp_cpu>;
 		apple,j713-native-piodma;
 		apple,j713-native-scanout;
+		/* Full 2560x1664 panel including the notch rows, 224 ppi. */
+		apple,panel-width-mm = <290>;
+		apple,panel-height-mm = <188>;
 		#address-cells = <2>;
 		#size-cells = <2>;
 
