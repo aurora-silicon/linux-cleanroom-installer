@@ -220,11 +220,13 @@ impl<T: Operations> RtKit<T> {
         } else {
             None
         },
+        shmem_setup_ep: None,
         shmem_destroy: if T::HAS_SHMEM_ALLOC || T::HAS_SHMEM_MAP {
             Some(shmem_destroy_callback::<T>)
         } else {
             None
         },
+        protocol_version: 0,
     };
 
     /// Creates a new RTKit client for a given device and optional mailbox name or index.
