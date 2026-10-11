@@ -4,8 +4,25 @@
 
 #include <linux/kconfig.h>
 #include <linux/errno.h>
+#include <linux/types.h>
 
 struct device;
+
+/* J713 internal DCP only: requires validated, borrowed SID23 tables. */
+int apple_dart_dcp_check(struct device *dev);
+/* A borrowed RTKit payload must be fully writable, not inherited firmware TEXT. */
+int apple_dart_dcp_check_buffer(struct device *dev, dma_addr_t iova, size_t size);
+/* Retained CPU/DVA allocation: even failed publication pins pages until reboot. */
+void *apple_dart_dcp_alloc(struct device *dev, size_t size, dma_addr_t *dva);
+
+/* Qualified noncoherent J713 SID23/SID16 pair; no CPU access after publication. */
+int apple_dart_dcp_shared_alloc(struct device *dev, struct device *piodma,
+				size_t size, u64 *phys, u64 *dva);
+int apple_dart_dcp_shared_map(struct device *dev, struct device *piodma,
+			      u64 phys, u64 dva, size_t size);
+
+/* Private retained SID0 scanout, not the firmware's capped D451 allocation class. */
+void *apple_dart_dcp_scanout_alloc(struct device *dev, size_t size, dma_addr_t *dva);
 
 /*
  * The tunneled PCIe IOMMU shares the port clock. Stop issuing commands
