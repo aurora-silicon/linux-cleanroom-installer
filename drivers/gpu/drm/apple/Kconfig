@@ -1,4 +1,36 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
+config DRM_APPLE_M4_GPU_POWER
+	tristate "J713 GPU power admission experiment"
+	depends on DRM && ARM64 && OF && APPLE_GFX_TVM && APPLE_PMP && APPLE_RTKIT
+	depends on !DRM_ASAHI
+	select CRYPTO_LIB_SHA256
+	select DRM_APPLE_M4_GPU
+	help
+	  Explicitly enabled, retained outer GFX power and stopped-ASC check,
+	  followed by a separately triggered AGX vote and SGX identity reads.
+	  A second explicit gate permits a retained UAT/RTKit HELLO experiment.
+	  Does not publish GPU work queues or expose a DRM device.
+	  Includes the private native-buffer/provider helpers, but creating a
+	  visible DRM node still requires separate actual backend qualification.
+	  Requires a watchdog guard. No unload, suspend or power-off qualification.
+	  Leave disabled for production.
+
+config DRM_APPLE_M4_GPU
+	tristate "J713 retained GPU Mesa ABI frontend"
+	depends on DRM && ARM64 && OF && APPLE_PMP && APPLE_RTKIT
+	depends on !DRM_ASAHI
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_SCHED
+	select DRM_EXEC
+	help
+	  Render-node frontend for the separately qualified, retained J713 GPU
+	  owner. Uses the Asahi Mesa userspace ABI without owning a mailbox,
+	  firmware table or power domain. Registration and all execution require
+	  explicit backend qualification; building this alone starts no firmware.
+	  Includes bounded canonical timestamp ownership helpers; these do not
+	  authorize timestamp publication, WB admission or DRM registration.
+	  This is an intermediate bring-up driver. Leave disabled for production.
+
 config DRM_APPLE
 	tristate "DRM Support for Apple display controllers"
 	depends on DRM && OF && ARM64
