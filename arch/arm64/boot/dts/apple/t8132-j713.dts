@@ -545,6 +545,19 @@
  */
 &framebuffer0 {
 	/delete-property/ power-domains;
+	panel = <&fb_panel>;
+};
+
+/ {
+	/*
+	 * Physical size of the firmware framebuffer's 2560x1600 area below the
+	 * notch (13.6" panel, 224 ppi), so simpledrm reports the real DPI.
+	 */
+	fb_panel: panel {
+		width-mm = <290>;
+		height-mm = <181>;
+		status = "disabled";
+	};
 };
 
 &pinctrl_ap {
