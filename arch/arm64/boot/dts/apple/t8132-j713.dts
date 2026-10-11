@@ -558,3 +558,5 @@
 &ps_pms_sram {
 	apple,inherited-on;
 };
+
+#include "t8132-j713-gpu.dtsi"
