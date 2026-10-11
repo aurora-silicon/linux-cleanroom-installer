@@ -263,6 +263,119 @@ struct drm_syncobj *drm_syncobj_find(struct drm_file *file_private,
 }
 EXPORT_SYMBOL(drm_syncobj_find);
 
+static void drm_syncobj_future_callback(struct drm_syncobj *syncobj,
+				       struct drm_syncobj_callback *cb)
+{
+	struct dma_fence *fence;
+
+	lockdep_assert_held(&syncobj->lock);
+	fence = dma_fence_get(rcu_dereference_protected(syncobj->fence, 1));
+	if (!fence || dma_fence_chain_find_seqno(&fence, cb->point)) {
+		dma_fence_put(fence);
+		return;
+	}
+	/* A completed timeline point can resolve to no remaining chain node. */
+	if (!fence)
+		fence = dma_fence_get_stub();
+	list_del_init(&cb->node);
+	cb->func(cb, fence);
+	dma_fence_put(fence);
+}
+
+/**
+ * drm_syncobj_add_callback - observe future fence submission without waiting
+ * @syncobj: Referenced syncobj to observe
+ * @cb: Initialized caller-owned callback storage
+ * @point: Timeline point, or zero for binary syncobj's current fence
+ * @func: Atomic callback receiving a borrowed fence reference
+ *
+ * If the requested point is already submitted, @func is called before this
+ * function returns. Otherwise it fires once when a replacement or timeline
+ * point covers @point. It observes submission, not execution completion.
+ * The callback must take its own fence reference before queuing asynchronous
+ * work, and must not perform dependency waits or syncobj mutations here.
+ * All state used by @func must exist before calling this function.
+ *
+ * The owner must serialize registration against removal, reinitialization,
+ * reuse and destruction of @cb. In particular, removal must not start until
+ * this function returns. This API does not synchronize an in-progress add
+ * with a concurrent remover or keep the caller's callback storage alive.
+ * The caller also keeps its own @syncobj reference until this function returns.
+ *
+ * An owned syncobj reference persists until drm_syncobj_remove_callback(),
+ * even after completion. No polling, timeout or CPU dependency wait occurs.
+ *
+ * Return: 0 on registration, -EINVAL for a null function, or -EBUSY if @cb
+ * has not been removed after an earlier registration.
+ */
+int drm_syncobj_add_callback(struct drm_syncobj *syncobj,
+			     struct drm_syncobj_callback *cb, u64 point,
+			     void (*func)(struct drm_syncobj_callback *, struct dma_fence *))
+{
+	unsigned long flags;
+
+	if (!func)
+		return -EINVAL;
+	spin_lock_irqsave(&cb->lock, flags);
+	if (cb->syncobj) {
+		spin_unlock_irqrestore(&cb->lock, flags);
+		return -EBUSY;
+	}
+	drm_syncobj_get(syncobj);
+	cb->syncobj = syncobj;
+	cb->point = point;
+	cb->func = func;
+	spin_unlock_irqrestore(&cb->lock, flags);
+
+	spin_lock_irqsave(&syncobj->lock, flags);
+	/* The caller serializes registration against removal and storage reuse. */
+	list_add_tail(&cb->node, &syncobj->future_cb_list);
+	drm_syncobj_future_callback(syncobj, cb);
+	spin_unlock_irqrestore(&syncobj->lock, flags);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(drm_syncobj_add_callback);
+
+/**
+ * drm_syncobj_remove_callback - cancel and synchronize a future-fence callback
+ * @cb: Caller-owned initialized callback
+ *
+ * After return the callback cannot run again. Its storage may be freed once
+ * all concurrent removers have returned. Concurrent removal is supported.
+ * The owner must prevent this function from overlapping registration or
+ * reinitialization of @cb, and keep its storage alive through every remover.
+ * This must not run from @cb's callback,
+ * since that callback holds the syncobj lock. It never waits for GPU execution.
+ */
+void drm_syncobj_remove_callback(struct drm_syncobj_callback *cb)
+{
+	struct drm_syncobj *syncobj;
+	unsigned long flags;
+	bool owned = false;
+
+	spin_lock_irqsave(&cb->lock, flags);
+	syncobj = cb->syncobj;
+	if (syncobj)
+		drm_syncobj_get(syncobj); /* Protect the lock while another remover wins. */
+	spin_unlock_irqrestore(&cb->lock, flags);
+	if (!syncobj)
+		return;
+
+	spin_lock_irqsave(&syncobj->lock, flags);
+	spin_lock(&cb->lock);
+	if (cb->syncobj == syncobj) {
+		list_del_init(&cb->node);
+		cb->syncobj = NULL;
+		owned = true;
+	}
+	spin_unlock(&cb->lock);
+	spin_unlock_irqrestore(&syncobj->lock, flags);
+	if (owned)
+		drm_syncobj_put(syncobj);
+	drm_syncobj_put(syncobj);
+}
+EXPORT_SYMBOL_GPL(drm_syncobj_remove_callback);
+
 static void drm_syncobj_fence_add_wait(struct drm_syncobj *syncobj,
 				       struct syncobj_wait_entry *wait)
 {
@@ -337,6 +450,7 @@ void drm_syncobj_add_point(struct drm_syncobj *syncobj,
 {
 	struct syncobj_wait_entry *wait_cur, *wait_tmp;
 	struct syncobj_eventfd_entry *ev_fd_cur, *ev_fd_tmp;
+	struct drm_syncobj_callback *cb, *cb_tmp;
 	struct dma_fence *prev;
 
 	dma_fence_get(fence);
@@ -354,6 +468,8 @@ void drm_syncobj_add_point(struct drm_syncobj *syncobj,
 		syncobj_wait_syncobj_func(syncobj, wait_cur);
 	list_for_each_entry_safe(ev_fd_cur, ev_fd_tmp, &syncobj->ev_fd_list, node)
 		syncobj_eventfd_entry_func(syncobj, ev_fd_cur);
+	list_for_each_entry_safe(cb, cb_tmp, &syncobj->future_cb_list, node)
+		drm_syncobj_future_callback(syncobj, cb);
 	spin_unlock(&syncobj->lock);
 
 	/* Walk the chain once to trigger garbage collection */
@@ -375,6 +491,7 @@ void drm_syncobj_replace_fence(struct drm_syncobj *syncobj,
 	struct dma_fence *old_fence;
 	struct syncobj_wait_entry *wait_cur, *wait_tmp;
 	struct syncobj_eventfd_entry *ev_fd_cur, *ev_fd_tmp;
+	struct drm_syncobj_callback *cb, *cb_tmp;
 
 	if (fence)
 		dma_fence_get(fence);
@@ -390,6 +507,8 @@ void drm_syncobj_replace_fence(struct drm_syncobj *syncobj,
 			syncobj_wait_syncobj_func(syncobj, wait_cur);
 		list_for_each_entry_safe(ev_fd_cur, ev_fd_tmp, &syncobj->ev_fd_list, node)
 			syncobj_eventfd_entry_func(syncobj, ev_fd_cur);
+		list_for_each_entry_safe(cb, cb_tmp, &syncobj->future_cb_list, node)
+			drm_syncobj_future_callback(syncobj, cb);
 	}
 
 	spin_unlock(&syncobj->lock);
@@ -565,6 +684,7 @@ int drm_syncobj_create(struct drm_syncobj **out_syncobj, uint32_t flags,
 
 	kref_init(&syncobj->refcount);
 	INIT_LIST_HEAD(&syncobj->cb_list);
+	INIT_LIST_HEAD(&syncobj->future_cb_list);
 	INIT_LIST_HEAD(&syncobj->ev_fd_list);
 	spin_lock_init(&syncobj->lock);
 
