@@ -1367,7 +1367,12 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	of_property_read_u32(helper, "linux-enablement-mac,rtkit-inherited", &inherited);
-	dchid->inherited_mtp = of_machine_is_compatible("apple,j700") && inherited == 1;
+	/* The J713 loader keeps MTP running and marks it with an empty property. */
+	if (of_machine_is_compatible("apple,j713") &&
+	    of_property_present(helper, "linux-enablement-mac,rtkit-inherited"))
+		inherited = 1;
+	dchid->inherited_mtp = (of_machine_is_compatible("apple,j700") ||
+				of_machine_is_compatible("apple,j713")) && inherited == 1;
 	helper_pdev = of_find_device_by_node(helper);
 	of_node_put(helper);
 	if (!helper_pdev) {
