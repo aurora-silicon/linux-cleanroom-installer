@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #![recursion_limit = "2048"]
 
-//! Apple PMP driver
+//! Apple PMP driver (Rust owner within the pmp composite module)
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
 use core::mem;
+use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
 use kernel::{
     bindings,
@@ -127,6 +128,8 @@ struct PmpData {
     rtkit: Mutex<Option<rtkit::RtKit<PmpData>>>,
     #[pin]
     state: Mutex<PmpState>,
+    display: AtomicPtr<bindings::apple_pmp_display>,
+    display_error: AtomicI32,
 }
 
 impl PmpData {
@@ -142,7 +145,9 @@ impl PmpData {
                     pmp_mmio,
                     asc_mmio,
                     rtkit <- new_mutex!(None),
-                    state <- new_mutex!(PmpState::new()?)
+                    state <- new_mutex!(PmpState::new()?),
+                    display: AtomicPtr::new(core::ptr::null_mut()),
+                    display_error: AtomicI32::new(0)
                 }
             ),
             GFP_KERNEL,
@@ -347,6 +352,24 @@ impl PmpData {
         let msg = (OPC_SET_IOREG | OPC_ACK_MASK) << OPC_SHIFT | len;
         Ok(msg)
     }
+    fn fail_display(&self, error: Error) {
+        // Pair with lazy publication: either the publisher sees this error, or
+        // this path sees the published bridge. Never lose a pre-vote crash/reply.
+        let _ = self.display_error.compare_exchange(
+            0,
+            error.to_errno(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        // SAFETY: NULL is accepted, and a published bridge is never freed in this epoch.
+        unsafe {
+            bindings::apple_pmp_display_fail(
+                self.display.load(Ordering::SeqCst),
+                self.display_error.load(Ordering::SeqCst),
+            )
+        };
+    }
+
     fn recv_message(&self, msg: u64) -> Result<()> {
         let opc = (msg >> OPC_SHIFT) & 0xFF;
         let reply = match opc {
@@ -368,6 +391,57 @@ impl PmpData {
     }
 }
 
+unsafe extern "C" fn display_send(cookie: *const kernel::ffi::c_void, word: u64) -> i32 {
+    // SAFETY: the J713 bridge holds this Arc's foreign reference until reboot.
+    let data = unsafe { Arc::<PmpData>::borrow(cookie.cast_mut()) };
+    kernel::error::from_result(|| {
+        // SAFETY: the C owner holds the supplier device lock and verified bound drvdata.
+        let dev = unsafe { data.dev.as_bound() };
+        if data.asc_mmio.access(dev)?.read32(CPU_CONTROL) & CPU_RUN == 0 {
+            return Err(EIO);
+        }
+        let mut guard = data.rtkit.lock();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+        rtk.send_message(PMP_ENDPOINT, word)?;
+        Ok(0)
+    })
+}
+
+/// Private bridge entry: resolve typed data only after the PMP provider has bound.
+///
+/// # Safety
+/// `raw` is a live, fully bound device with its device lock held by the caller.
+#[kernel::macros::export]
+unsafe extern "C" fn apple_pmp_display_bound_owner(
+    raw: *mut bindings::device,
+) -> *mut bindings::apple_pmp_display {
+    // SAFETY: guaranteed by the C caller under the supplier device lock.
+    let dev = unsafe { device::Device::<device::Normal>::from_raw(raw).as_bound() };
+    let Ok(driver) = dev.drvdata::<PmpDriver>() else {
+        return core::ptr::null_mut();
+    };
+    let data = &driver.0;
+    let existing = data.display.load(Ordering::Acquire);
+    if !existing.is_null() {
+        return existing;
+    }
+    let cookie = data.clone().into_foreign();
+    // SAFETY: callback borrows this Arc; registration validates identity and sends nothing.
+    let display = unsafe { bindings::apple_pmp_display_register(raw, cookie, Some(display_send)) };
+    if display.is_null() {
+        // SAFETY: registration did not take ownership of the foreign reference.
+        drop(unsafe { Arc::<PmpData>::from_foreign(cookie) });
+    } else {
+        data.display.store(display, Ordering::SeqCst);
+        let error = data.display_error.load(Ordering::SeqCst);
+        if error != 0 {
+            // SAFETY: the bridge is now retained and must inherit earlier failures.
+            unsafe { bindings::apple_pmp_display_fail(display, error) };
+        }
+    }
+    display
+}
+
 unsafe impl Send for PmpData {}
 unsafe impl Sync for PmpData {}
 
@@ -386,7 +460,23 @@ impl rtkit::Operations for PmpData {
     type Data = Arc<PmpData>;
     type Buffer = NoBuffer;
 
-    fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _ep: u8, msg: u64) {
+    fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
+        // SAFETY: a non-null bridge is retained for the entire RTKit epoch.
+        if unsafe {
+            bindings::apple_pmp_display_receive(data.display.load(Ordering::Acquire), ep, msg)
+        } {
+            return;
+        }
+        if (msg >> OPC_SHIFT) & 0xff == 0x21
+            && unsafe { bindings::apple_pmp_display_retained_board() }
+        {
+            data.fail_display(Error::from_errno(-(bindings::EPROTO as i32)));
+            dev_err!(
+                data.dev,
+                "Unsolicited PMP power reply before display owner publication"
+            );
+            return;
+        }
         let ret = data.recv_message(msg);
         if let Err(e) = ret {
             dev_err!(data.dev, "Failed to handle rtkit message, error: {:?}", e);
@@ -394,6 +484,7 @@ impl rtkit::Operations for PmpData {
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
+        data.fail_display(EIO);
         dev_err!(data.dev, "PMP firmware crashed");
     }
 }
@@ -427,6 +518,11 @@ kernel::of_device_table!(
 
 impl platform::Driver for PmpDriver {
     type IdInfo = &'static PmpHwConfig;
+
+    fn suppress_bind_attrs() -> bool {
+        // SAFETY: read-only board identity check; other boards remain unchanged.
+        unsafe { bindings::apple_pmp_display_retained_board() }
+    }
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
@@ -466,6 +562,11 @@ impl platform::Driver for PmpDriver {
         data.start_cpu(pdev)?;
         data.start()?;
         Ok(PmpDriver(data))
+    }
+
+    fn unbind(_dev: &platform::Device<Core>, this: Pin<&Self>) {
+        // No further untagged requests may be correlated after provider teardown.
+        this.0.fail_display(ENODEV);
     }
 }
 

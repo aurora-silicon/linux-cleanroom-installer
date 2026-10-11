@@ -30,6 +30,7 @@ apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
 		pm_shim.o
 
 obj-$(CONFIG_APPLE_PMP) += pmp.o
+pmp-y := pmp-core.o pmp-display.o
 
 obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
 apple-mcc-y := mcc.o
