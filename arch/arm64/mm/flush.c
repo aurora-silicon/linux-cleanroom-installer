@@ -15,6 +15,11 @@
 #include <asm/cache.h>
 #include <asm/tlbflush.h>
 
+/* Reserved no-map firmware memory has no DMA API linear-map alias. */
+EXPORT_SYMBOL_GPL(dcache_inval_poc);
+/* Explicit publication of retained coprocessor page tables before ASC start. */
+EXPORT_SYMBOL_GPL(dcache_clean_poc);
+
 void sync_icache_aliases(unsigned long start, unsigned long end)
 {
 	if (icache_is_aliasing()) {
