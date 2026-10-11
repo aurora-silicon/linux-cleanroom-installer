@@ -761,6 +761,15 @@ static int dcp_m4_kms_modes(struct drm_connector *connector)
 	if (!mode)
 		return 0;
 	drm_mode_probed_add(connector, mode);
+	/* The built-in panel's physical size lets compositors pick their scale. */
+	if (connector->connector_type == DRM_MODE_CONNECTOR_eDP) {
+		u32 width = 0, height = 0;
+
+		of_property_read_u32(connector->dev->dev->of_node, "apple,panel-width-mm", &width);
+		of_property_read_u32(connector->dev->dev->of_node, "apple,panel-height-mm", &height);
+		connector->display_info.width_mm = width;
+		connector->display_info.height_mm = height;
+	}
 	return 1;
 }
 static const struct drm_connector_helper_funcs dcp_m4_kms_connector_helpers = {
