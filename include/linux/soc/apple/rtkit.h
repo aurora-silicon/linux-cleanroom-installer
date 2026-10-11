@@ -69,9 +69,13 @@ struct apple_rtkit_shmem {
  *                 descriptor pointer and do not change size: repeated
  *                 requests are matched against it. If not specified
  *                 dma_alloc_coherent is used. Called in process context.
+ * @shmem_setup_ep: Endpoint-aware alternative to shmem_setup. Called with the
+ *                 requesting system endpoint. Specify only one setup callback.
  * @shmem_destroy: Undo the shared memory buffer setup in shmem_setup. If not
  *                 specified dma_free_coherent is used. Called in process
  *                 context.
+ * @protocol_version: Optional exact protocol version required by the client.
+ *                 Zero retains normal highest-supported-version negotiation.
  */
 struct apple_rtkit_ops {
 	unsigned int flags;
@@ -79,7 +83,9 @@ struct apple_rtkit_ops {
 	void (*recv_message)(void *cookie, u8 endpoint, u64 message);
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
 	int (*shmem_setup)(void *cookie, struct apple_rtkit_shmem *bfr);
+	int (*shmem_setup_ep)(void *cookie, u8 endpoint, struct apple_rtkit_shmem *bfr);
 	void (*shmem_destroy)(void *cookie, struct apple_rtkit_shmem *bfr);
+	u16 protocol_version;
 };
 
 struct apple_rtkit;
