@@ -1,4 +1,22 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
+config DRM_APPLE_M4_READY
+	tristate "J713 internal DCP transport qualification"
+	depends on DRM && ARM64 && OF && APPLE_RTKIT && APPLE_DART
+	depends on APPLE_PMP
+	depends on !DRM_APPLE
+	depends on BACKLIGHT_CLASS_DEVICE
+	select DRM_KMS_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_CLIENT_SELECTION
+	select APERTURE_HELPERS
+	help
+	  Qualification of the inherited J713 internal DCP, with an opt-in
+	  fixed-mode diagnostic scanout and separately triggered native atomic KMS.
+	  KMS takes over the inherited framebuffer only after a completed scanout.
+	  The explicitly triggered transport session
+	  and its DMA storage stay pinned until reboot; unloading is unsupported.
+	  This is an intermediate bring-up driver, not a desktop display driver.
+
 config DRM_APPLE_M4_GPU_POWER
 	tristate "J713 GPU power admission experiment"
 	depends on DRM && ARM64 && OF && APPLE_GFX_TVM && APPLE_PMP && APPLE_RTKIT

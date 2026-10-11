@@ -19,6 +19,7 @@ appledrm-y += plane.o
 appledrm-$(CONFIG_TRACING) += trace.o
 
 obj-$(CONFIG_DRM_APPLE) += appledrm.o
+obj-$(CONFIG_DRM_APPLE_M4_READY) += apple-dcp-m4-ready.o
 obj-$(CONFIG_DRM_APPLE_M4_GPU_POWER) += apple-gpu-m4-power.o
 obj-$(CONFIG_DRM_APPLE_M4_GPU) += gpu-m4-drm.o
 obj-$(CONFIG_DRM_APPLE_M4_GPU) += gpu-m4-drm-scheduler.o
