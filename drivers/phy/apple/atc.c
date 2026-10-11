@@ -537,6 +537,7 @@ enum atcphy_lane_mode {
 enum atcphy_generation {
 	ATCPHY_GENERATION_T8103,
 	ATCPHY_GENERATION_T8122,
+	ATCPHY_GENERATION_T8132,
 };
 
 enum atcphy_dp_link_rate {
@@ -1429,8 +1430,12 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 	lockdep_assert_held(&atcphy->lock);
 
 	if (atcphy->hw->usb2_only) {
+		/* dwc3 still needs a PIPE clock: route the dummy PHY to it. */
 		set32(atcphy->regs.pipehandler + PIPEHANDLER_T8132_USB2_CONFIG,
 		      PIPEHANDLER_T8132_USB2_CONFIG_EN);
+		atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
+					   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
+		atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 		return;
 	}
 
@@ -3119,6 +3124,11 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	if (atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF)
 		target_mode = APPLE_ATCPHY_MODE_USB2;
 
+	/* A USB2-only PHY has no SuperSpeed lanes to calibrate: serve USB3 as USB2. */
+	if (atcphy->hw->usb2_only &&
+	    (target_mode == APPLE_ATCPHY_MODE_USB3 || target_mode == APPLE_ATCPHY_MODE_USB3_DP))
+		target_mode = APPLE_ATCPHY_MODE_USB2;
+
 	dev_dbg(atcphy->dev, "Type-C %lu: PHY %u->%u host=%u fixed=%u ss=%u swap=%u\n",
 		state->mode, atcphy->mode, target_mode, atcphy->host_active,
 		atcphy->fixed_usb2, atcphy->ss_tunables, atcphy->swap_lanes);
@@ -3449,7 +3459,9 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 };
 
 static const struct atcphy_hw atcphy_hw_t8132 = {
-	.gen = ATCPHY_GENERATION_T8122,
+	.gen = ATCPHY_GENERATION_T8132,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.usb2_only = true,
 	.usb2phy_sig_host = USB2PHY_SIG_HOST_T8132,
 };
