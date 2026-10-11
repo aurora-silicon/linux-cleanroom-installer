@@ -34,4 +34,15 @@ config APPLE_PMC
 	  GPU, while its device is powered on. It can also limit the DRAM
 	  controller rail as a thermal cooling device.
 
+config APPLE_GFX_TVM
+	bool "Apple J713 graphics power-domain qualification"
+	depends on APPLE_PMGR_PWRSTATE && OF && ARM64
+	help
+	  Outer TVM graphics gate and narrowly qualified GFX PMGR domain on J713.
+	  Built in, with no unbind support. Domain publication requires explicitly
+	  enabling the gfx_tvm.enable parameter and reprobe under a watchdog.
+	  Neither probing nor enabling this option starts GPU firmware. Keep the
+	  consumer's power reference until all firmware-visible storage is retired.
+	  Leave disabled outside development until the GPU lifetime is qualified.
+
 endif

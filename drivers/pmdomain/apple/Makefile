@@ -2,3 +2,4 @@
 obj-$(CONFIG_APPLE_PMGR_PWRSTATE)	+= pmgr-pwrstate.o
 obj-$(CONFIG_APPLE_PMP_REPORT)	+= pmp-report.o
 obj-$(CONFIG_APPLE_PMC)		+= pmc.o
+obj-$(CONFIG_APPLE_GFX_TVM)	+= gfx-tvm.o
