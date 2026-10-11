@@ -2143,6 +2143,14 @@ static int apple_dart_def_domain_type(struct device *dev)
 
 	if (cfg->stream_maps[0].dart->retained_sid0)
 		return IOMMU_DOMAIN_IDENTITY;
+	/*
+	 * The J713's BCM4388 boots its firmware under translation but never
+	 * consumes its host rings or raises an MSI; it only works with its
+	 * stream in bypass, as the validated cleanroom setup runs it.
+	 */
+	if (dev_is_pci(dev) && of_machine_is_compatible("apple,j713") &&
+	    cfg->supports_bypass && !cfg->locked)
+		return IOMMU_DOMAIN_IDENTITY;
 	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
 		return IOMMU_DOMAIN_IDENTITY;
 	if (!cfg->supports_bypass)
