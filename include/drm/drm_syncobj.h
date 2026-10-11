@@ -54,6 +54,10 @@ struct drm_syncobj {
 	 */
 	struct list_head cb_list;
 	/**
+	 * @future_cb_list: Driver callbacks waiting for a fence to be submitted.
+	 */
+	struct list_head future_cb_list;
+	/**
 	 * @ev_fd_list: List of registered eventfd.
 	 */
 	struct list_head ev_fd_list;
@@ -66,6 +70,53 @@ struct drm_syncobj {
 	 */
 	struct file *file;
 };
+
+/**
+ * struct drm_syncobj_callback - One-shot callback for future fence publication
+ *
+ * Drivers initialize this structure before registration. A successful add
+ * holds a syncobj reference until drm_syncobj_remove_callback(), including
+ * after the callback has fired. The caller owns the callback's storage and
+ * must remove it before freeing that storage or closing an associated job.
+ * Storage must remain alive until all concurrent removers have returned.
+ * The owner must serialize initialization and registration against removal,
+ * reuse and storage destruction. A remove must never overlap an add: this API
+ * does not keep callback storage alive through concurrent registration. Once
+ * add has returned, removal may race with fence publication. A callback can
+ * run inline inside add, so its owner initializes all callback-used job state
+ * before registration. The caller holds its own syncobj reference through add.
+ */
+struct drm_syncobj_callback {
+	/** @node: Entry in drm_syncobj.future_cb_list, protected by syncobj lock. */
+	struct list_head node;
+	/** @lock: Protects the owned syncobj reference during cancellation. */
+	spinlock_t lock;
+	/** @syncobj: Owned reference, cleared by cancellation. */
+	struct drm_syncobj *syncobj;
+	/** @point: Timeline point, or zero for the current binary fence. */
+	u64 point;
+	/**
+	 * @func: Called once with a borrowed reference to the submitted fence.
+	 * The callback runs under the syncobj lock and cannot sleep, remove
+	 * itself, or call other syncobj mutation APIs. It may take a fence
+	 * reference and schedule work to wait for execution asynchronously.
+	 */
+	void (*func)(struct drm_syncobj_callback *cb, struct dma_fence *fence);
+};
+
+static inline void drm_syncobj_callback_init(struct drm_syncobj_callback *cb)
+{
+	INIT_LIST_HEAD(&cb->node);
+	spin_lock_init(&cb->lock);
+	cb->syncobj = NULL;
+	cb->func = NULL;
+	cb->point = 0;
+}
+
+int drm_syncobj_add_callback(struct drm_syncobj *syncobj,
+			     struct drm_syncobj_callback *cb, u64 point,
+			     void (*func)(struct drm_syncobj_callback *, struct dma_fence *));
+void drm_syncobj_remove_callback(struct drm_syncobj_callback *cb);
 
 void drm_syncobj_free(struct kref *kref);
 
