@@ -377,12 +377,84 @@ out:
 		iounmap(floor);
 }
 
+/*
+ * J713 system-level cache. The boot path leaves every plane of both AMCC
+ * apertures at control 0, status 0: the cache is off. Enable it from that
+ * state only: control 1 through each aperture's multicast word (+0x1c1c00),
+ * then wait for every plane (two per aperture, stride 0x40000) to report 16
+ * data and 16 tag ways (status & 0x3ff0 == 0x2100). An enabled cache is left
+ * as it is, and nothing disables it again: there is no qualified dirty-data
+ * drain for that.
+ */
+#define J713_AMCC_PLANE_STRIDE	0x40000
+#define J713_AMCC_CONTROL	0x1c00
+#define J713_AMCC_STATUS	0x1c04
+#define J713_AMCC_MULTICAST	0x1c1c00
+#define J713_AMCC_WAYS_MASK	0x3ff0
+#define J713_AMCC_WAYS_ON	0x2100
+
+static bool j713_system_cache_enabled = true;
+module_param_named(j713_system_cache, j713_system_cache_enabled, bool, 0444);
+MODULE_PARM_DESC(j713_system_cache, "J713: enable the AMCC system-level cache left off by the boot path");
+
+static void j713_system_cache(void)
+{
+	static const u64 aperture[2] = { 0x220000000ULL, 0x222000000ULL };
+	static atomic_t started = ATOMIC_INIT(0);
+	void __iomem *amcc[2] = {};
+	u32 control[4], status[4];
+	bool off = true, on = true;
+
+	if (!j713_system_cache_enabled || atomic_xchg(&started, 1))
+		return;
+	for (u32 i = 0; i < 2; i++) {
+		amcc[i] = ioremap_np(aperture[i], J713_AMCC_MULTICAST + 4);
+		if (!amcc[i])
+			goto out;
+	}
+	for (u32 p = 0; p < 4; p++) {
+		void __iomem *plane = amcc[p / 2] + (p % 2) * J713_AMCC_PLANE_STRIDE;
+
+		control[p] = readl(plane + J713_AMCC_CONTROL);
+		status[p] = readl(plane + J713_AMCC_STATUS);
+		off &= !control[p] && !status[p];
+		on &= control[p] == 1 && (status[p] & J713_AMCC_WAYS_MASK) == J713_AMCC_WAYS_ON;
+	}
+	if (on)
+		goto out;
+	if (!off) {
+		pr_warn("pmp-display: J713 system cache left alone: control %#x %#x %#x %#x status %#x %#x %#x %#x\n",
+			control[0], control[1], control[2], control[3],
+			status[0], status[1], status[2], status[3]);
+		goto out;
+	}
+	writel(1, amcc[0] + J713_AMCC_MULTICAST);
+	writel(1, amcc[1] + J713_AMCC_MULTICAST);
+	dsb(sy);
+	for (u32 p = 0; p < 4; p++) {
+		void __iomem *plane = amcc[p / 2] + (p % 2) * J713_AMCC_PLANE_STRIDE;
+
+		if (readl_poll_timeout(plane + J713_AMCC_STATUS, status[p],
+				       (status[p] & J713_AMCC_WAYS_MASK) == J713_AMCC_WAYS_ON,
+				       100, 10000))
+			pr_err("pmp-display: J713 system cache plane %u: status %#x\n", p, status[p]);
+	}
+	pr_info("pmp-display: J713 system cache enabled: status %#x %#x %#x %#x\n",
+		status[0], status[1], status[2], status[3]);
+out:
+	for (u32 i = 0; i < 2; i++)
+		if (amcc[i])
+			iounmap(amcc[i]);
+}
+
 int apple_pmp_j713_display_get(struct device *consumer)
 {
 	int ret = j713_power_get(consumer, J713_POWER_DISP);
 
-	if (!ret)
+	if (!ret) {
+		j713_system_cache();
 		j713_memory_floor();
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_get);
