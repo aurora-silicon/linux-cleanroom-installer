@@ -15,6 +15,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include <linux/soc/apple/pmp-display.h>
 
 #include "pmp-display-protocol.h"
@@ -355,10 +356,13 @@ EXPORT_SYMBOL_GPL(apple_pmp_j514s_gpu_check);
 /*
  * Memory floor: CPU-client EACC0/PACC0 PTD indices 288/289 request DCS4 and
  * FAB2 (valid bit 61, DCS bits 51:48, FAB bits 35:32), other fields kept.
+ * DVFS state entries 8 and 10 (PTD range 3) publish the firmware's response.
  */
 #define J514S_PTD_FLOOR_IDX0	288
 #define J514S_PTD_FLOOR_MASK	(BIT_ULL(61) | GENMASK_ULL(51, 48) | GENMASK_ULL(35, 32))
 #define J514S_PTD_FLOOR		(BIT_ULL(61) | (4ULL << 48) | (2ULL << 32))
+#define J514S_PTD_FLOOR_SET(i)	(0x10000 + (J514S_PTD_FLOOR_IDX0 + (i)) * 8)
+#define J514S_PTD_DVFS_STATE(i)	((8 + 2 * (i)) * 16)
 #define J514S_PMP_ASC		0x350c00000ULL
 #define J514S_PMGR		0x350700000ULL
 
@@ -455,30 +459,70 @@ module_param_named(j514s_memory_floor, j514s_memory_floor_enabled, bool, 0444);
 MODULE_PARM_DESC(j514s_memory_floor, "J514S: request the DCS4/FAB2 memory floor once the PMP runs");
 
 /*
- * Once, with the PMP running (PTD status 1): one 64-bit request-set write per
- * index, exact readback. A rejected request is restored to its prior value.
+ * The PMP applies a CPU-client request on its change notification, and a read
+ * of the request entry may consume that notification (as for the DISPEXT
+ * vote). A floor written and echoed at once stayed latched without effect:
+ * DVFS state 0x100, CPU copy bandwidth at the no-floor level. So, from a
+ * delayed work once the PMP has settled: clear both requests (the floor is
+ * always a fresh transition), write both floors back to back, and confirm on
+ * the DVFS state entries without reading the requests; retry if the firmware
+ * did not respond.
  */
-static void j514s_memory_floor(void __iomem *ptd)
-{
-	static bool done;
-	u64 prior, want, got;
+#define J514S_FLOOR_SETTLE_MS	100
+#define J514S_FLOOR_TRIES	10
 
-	if (done || !j514s_memory_floor_enabled)
+static void j514s_memory_floor_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(j514s_floor_work, j514s_memory_floor_work);
+static atomic_t j514s_floor_started = ATOMIC_INIT(0);
+static unsigned int j514s_floor_try;
+static u64 j514s_floor_prior[2];
+
+static void j514s_memory_floor_work(struct work_struct *work)
+{
+	void __iomem *ptd = ioremap_np(J514S_PTD, J514S_PTD_SIZE);
+	u64 before[2], after[2];
+	bool confirmed = false;
+
+	if (!ptd || readq(ptd + J514S_PTD_STATUS) != 1)
+		goto retry;
+	/* The first try reads the requests while no change of ours is pending. */
+	if (!j514s_floor_try)
+		for (u32 i = 0; i < 2; i++)
+			j514s_floor_prior[i] = readq(ptd + (J514S_PTD_FLOOR_IDX0 + i) * 16) &
+					       ~J514S_PTD_FLOOR_MASK;
+	for (u32 i = 0; i < 2; i++)
+		writeq(j514s_floor_prior[i], ptd + J514S_PTD_FLOOR_SET(i));
+	msleep(J514S_FLOOR_SETTLE_MS);
+	for (u32 i = 0; i < 2; i++)
+		before[i] = readq(ptd + J514S_PTD_DVFS_STATE(i));
+	for (u32 i = 0; i < 2; i++)
+		writeq(j514s_floor_prior[i] | J514S_PTD_FLOOR, ptd + J514S_PTD_FLOOR_SET(i));
+	msleep(J514S_FLOOR_SETTLE_MS);
+	for (u32 i = 0; i < 2; i++)
+		after[i] = readq(ptd + J514S_PTD_DVFS_STATE(i));
+	confirmed = before[0] != after[0] || before[1] != after[1];
+	pr_info("pmp-display: J514S memory floor try %u: DVFS state %#llx/%#llx -> %#llx/%#llx%s\n",
+		j514s_floor_try + 1, before[0], before[1], after[0], after[1],
+		confirmed ? "" : ", no response");
+retry:
+	if (ptd)
+		iounmap(ptd);
+	if (!confirmed && ++j514s_floor_try < J514S_FLOOR_TRIES) {
+		schedule_delayed_work(&j514s_floor_work, HZ);
 		return;
-	done = true;
-	for (u32 idx = J514S_PTD_FLOOR_IDX0; idx < J514S_PTD_FLOOR_IDX0 + 2; idx++) {
-		prior = readq(ptd + idx * 16);
-		want = (prior & ~J514S_PTD_FLOOR_MASK) | J514S_PTD_FLOOR;
-		writeq(want, ptd + 0x10000 + idx * 8);
-		got = readq(ptd + idx * 16);
-		if (got != want) {
-			writeq(prior, ptd + 0x10000 + idx * 8);
-			pr_err("pmp-display: J514S memory floor %u rejected: %#llx -> %#llx\n",
-			       idx, prior, got);
-			return;
-		}
-		pr_info("pmp-display: J514S memory floor %u: %#llx -> %#llx\n", idx, prior, got);
 	}
+	if (!confirmed)
+		pr_warn("pmp-display: J514S memory floor not confirmed by the PMP\n");
+	module_put(THIS_MODULE);
+}
+
+/* Once, with the PMP running; the pending work holds the module. */
+static void j514s_memory_floor(void)
+{
+	if (!j514s_memory_floor_enabled || atomic_xchg(&j514s_floor_started, 1) ||
+	    !try_module_get(THIS_MODULE))
+		return;
+	schedule_delayed_work(&j514s_floor_work, HZ);
 }
 
 static int j514s_display_acked(bool wait)
@@ -495,9 +539,9 @@ static int j514s_display_acked(bool wait)
 	if (!ret && (!(readq(ptd + J514S_PTD_REQ) & J514S_PTD_DISP) ||
 		     !(readq(ptd + J514S_PTD_ACK) & J514S_PTD_DISP)))
 		ret = -EIO;
-	if (!ret && wait)
-		j514s_memory_floor(ptd);
 	iounmap(ptd);
+	if (!ret && wait)
+		j514s_memory_floor();
 	return ret;
 }
 
