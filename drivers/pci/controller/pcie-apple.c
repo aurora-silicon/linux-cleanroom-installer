@@ -3445,5 +3445,32 @@ static struct platform_driver apple_pcie_driver = {
 };
 module_platform_driver(apple_pcie_driver);
 
+#if IS_ENABLED(CONFIG_PCIE_APPLE_PIODMA_DIAG)
+/**
+ * apple_pcie_radio_retained() - whether a radio sits on a retained J700 host
+ * @pdev: radio function
+ *
+ * The bootloader-initialized J700 radio host (no PIODMA supplier) has no
+ * PIODMA admission to report. Its host probe already required the retained
+ * link to be up, kept the firmware RID/SID mappings and exposed only bus 1
+ * function 0, so that function counts as admitted once the host is bound.
+ */
+bool apple_pcie_radio_retained(struct pci_dev *pdev)
+{
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+	struct device *host = bridge->dev.parent;
+	struct apple_pcie *pcie;
+
+	if (!host || host->driver != &apple_pcie_driver.driver)
+		return false;
+	pcie = pci_host_bridge_priv(bridge);
+	return pcie->retained_radio && !pcie->piodma_supplier &&
+	       pdev->bus->parent && pci_is_root_bus(pdev->bus->parent) &&
+	       pdev->devfn == PCI_DEVFN(0, 0) &&
+	       pdev->vendor == PCI_VENDOR_ID_MEDIATEK && pdev->device == 0x7932;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_radio_retained);
+#endif
+
 MODULE_DESCRIPTION("Apple PCIe host bridge driver");
 MODULE_LICENSE("GPL v2");
