@@ -309,9 +309,81 @@ out:
 	return ret;
 }
 
+/*
+ * J713 (T8132) memory/fabric floor, voted through the PMC's application
+ * processor agent (3): floor word PMC + (agent << 14) with the memory state
+ * in bits 3:0 and the fabric state in bits 7:4, pending bit (agent) at +4,
+ * the honoured state at PMC + 0xaa000 + 4 * agent. The PMC only honours an
+ * agent enabled on a rail (enable words at PMC + 0xac000 + 4 * rail). Left at
+ * zero, the DRAM stays at its lowest state: 17 GB/s 8-thread CPU copy and
+ * half the GPU replay throughput. Request the highest stock states, memory 5
+ * and fabric 3, once the PMP runs; a pending or delayed vote is left alone.
+ */
+#define J713_PMC		0x382800000ULL
+#define J713_PMC_AP		3
+#define J713_PMC_STATE		(0xaa000 + 4 * J713_PMC_AP)
+#define J713_PMC_ENABLE		0xac000
+#define J713_PMC_FLOOR		0x35
+
+static bool j713_memory_floor_enabled = true;
+module_param_named(j713_memory_floor, j713_memory_floor_enabled, bool, 0444);
+MODULE_PARM_DESC(j713_memory_floor, "J713: vote the memory 5/fabric 3 floor through the PMC AP agent");
+
+static void j713_memory_floor(void)
+{
+	static atomic_t started = ATOMIC_INIT(0);
+	void __iomem *floor = NULL, *state = NULL, *enable = NULL;
+	u32 prior, val;
+
+	if (!j713_memory_floor_enabled || atomic_xchg(&started, 1))
+		return;
+	floor = ioremap_np(J713_PMC + (J713_PMC_AP << 14), 8);
+	state = ioremap_np(J713_PMC + J713_PMC_STATE, 4);
+	enable = ioremap_np(J713_PMC + J713_PMC_ENABLE, 8);
+	if (!floor || !state || !enable)
+		goto out;
+	/* Memory (rail 0) and fabric (rail 1) must honour the AP agent. */
+	if (!(readl(enable) & BIT(J713_PMC_AP)) || !(readl(enable + 4) & BIT(J713_PMC_AP))) {
+		pr_warn("pmp-display: J713 memory floor: AP agent not enabled (%#x/%#x)\n",
+			readl(enable), readl(enable + 4));
+		goto out;
+	}
+	if (readl_poll_timeout(floor + 4, val, !(val & BIT(J713_PMC_AP)), 1000, 200000)) {
+		pr_warn("pmp-display: J713 memory floor: AP vote pending (%#x)\n", val);
+		goto out;
+	}
+	prior = readl(floor);
+	if (prior & ~0xffU) {
+		pr_warn("pmp-display: J713 memory floor: delayed AP vote %#x kept\n", prior);
+		goto out;
+	}
+	if (prior != J713_PMC_FLOOR) {
+		writel(J713_PMC_FLOOR, floor);
+		if (readl_poll_timeout(floor + 4, val, !(val & BIT(J713_PMC_AP)), 1000, 200000) ||
+		    readl(floor) != J713_PMC_FLOOR) {
+			writel(prior, floor);
+			pr_err("pmp-display: J713 memory floor not accepted (pending %#x)\n", val);
+			goto out;
+		}
+	}
+	pr_info("pmp-display: J713 memory floor: AP vote %#x -> %#x, honoured %#x\n",
+		prior, readl(floor), readl(state));
+out:
+	if (enable)
+		iounmap(enable);
+	if (state)
+		iounmap(state);
+	if (floor)
+		iounmap(floor);
+}
+
 int apple_pmp_j713_display_get(struct device *consumer)
 {
-	return j713_power_get(consumer, J713_POWER_DISP);
+	int ret = j713_power_get(consumer, J713_POWER_DISP);
+
+	if (!ret)
+		j713_memory_floor();
+	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_j713_display_get);
 
