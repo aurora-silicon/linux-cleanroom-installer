@@ -22,6 +22,7 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_prime.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -40,17 +41,37 @@ static bool dcp_m4_direct_scanout = true;
 module_param_named(direct_scanout, dcp_m4_direct_scanout, bool, 0644);
 MODULE_PARM_DESC(direct_scanout, "Scan qualified imported framebuffers without a CPU copy");
 
+static bool dcp_m4_direct_local = true;
+module_param_named(direct_local, dcp_m4_direct_local, bool, 0644);
+MODULE_PARM_DESC(direct_local, "Also scan local (dumb/GBM) framebuffers directly; they are write-combined");
+
+/* Hardware cursor (internal panel): an upper DCP surface fed from a canvas. */
+#define DCP_M4_CURSOR_SIZE	64
+static int dcp_m4_cursor_plane = -1;
+module_param_named(cursor_plane, dcp_m4_cursor_plane, int, 0444);
+MODULE_PARM_DESC(cursor_plane, "Internal panel hardware cursor plane: -1 auto (J514S), 0 off, 1 on");
+static uint dcp_m4_cursor_index = 3;
+module_param_named(cursor_index, dcp_m4_cursor_index, uint, 0444);
+MODULE_PARM_DESC(cursor_index, "Firmware surface-array index of the cursor, 1..3");
+static uint dcp_m4_cursor_id = 1;
+module_param_named(cursor_id, dcp_m4_cursor_id, uint, 0444);
+MODULE_PARM_DESC(cursor_id, "Swap surface identity word of the cursor surface");
+static uint dcp_m4_cursor_flags;
+module_param_named(cursor_flags, dcp_m4_cursor_flags, uint, 0444);
+MODULE_PARM_DESC(cursor_flags, "Swap surf_flags word of the cursor surface");
+
 /* REMOVE-DEBUG: flip path, swap latency (A406 start to D590) and mapping lifetime. */
 struct dcp_m4_kms_stats {
 	u64 flips, direct, copy[DCP_M4_COPY_REASONS];
 	u64 swap_ns_last, swap_ns_max, swap_ns_total;
 	atomic64_t maps, map_failures, unmaps, retained, idle_vblanks;
 	atomic64_t backlight_swaps; /* Brightness-only re-presents of the active surface. */
+	atomic64_t cursor_swaps; /* Swaps carrying only the cursor surface. */
 };
 
 /* Panel brightness in nits: the A407 binary64 field accepts integral 0..500. */
-#define DCP_M4_NITS_MAX		500
-#define DCP_M4_NITS_DEFAULT	120
+#define DCP_M4_NITS_MAX		((int)dcp_m4_pf->brightness_max)
+#define DCP_M4_NITS_DEFAULT	((int)dcp_m4_pf->brightness_default)
 
 struct dcp_m4_output;
 struct dcp_m4_ext;
@@ -66,7 +87,7 @@ struct dcp_m4_bo {
 	struct drm_gem_shmem_object shmem; /* First: the shmem helpers free it. */
 	struct dcp_m4_output *output;
 	struct dma_buf_attachment *attach;
-	struct sg_table *sgt;
+	struct sg_table *sgt;	/* imported: attachment mapping; local: own mapping */
 	u64 dva, mapped;
 	int map_error; /* Sticky: this object stays on the copy path. */
 };
@@ -110,6 +131,13 @@ struct dcp_m4_output {
 	u32 nits;
 	int nits_applied;
 	bool blanked;
+	/* Hardware cursor: two retained 64x64 ARGB canvases, under dcp->lock. */
+	struct drm_plane cursor;
+	struct dcp_m4_frame cursor_frame[2];
+	void *cursor_pixels[2];
+	int cursor_slot;	/* Canvas DCP may scan, or -1. */
+	u32 cursor_keep;	/* BIT(cursor index) with a cursor plane, else 0. */
+	bool has_cursor;
 };
 
 struct dcp_m4_kms {
@@ -202,6 +230,66 @@ static int dcp_m4_bo_map(struct dcp_m4_bo *bo, struct dcp_m4_output *o)
 	return 0;
 }
 
+/*
+ * Map a local (dumb/GBM) object for direct scanout: pin its pages and map them
+ * through the scanout consumer's own DMA domain. Local objects are created
+ * write-combined, so CPU writers leave no dirty lines; the non-coherent DMA
+ * map cleans what allocation-time zeroing left in the cache. Typical producer:
+ * a compositor's GPU renders into the buffer through a PRIME import.
+ */
+static int dcp_m4_bo_map_local(struct dcp_m4_bo *bo, struct dcp_m4_output *o)
+{
+	struct drm_gem_shmem_object *shmem = &bo->shmem;
+	struct iommu_domain *domain;
+	struct scatterlist *sg;
+	struct sg_table *sgt;
+	u64 start = 0, length = 0;
+	unsigned int i;
+	int ret;
+
+	if (!shmem->map_wc || !dcp_m4_kms_translated(o->scanout))
+		return -ENODEV;
+	ret = drm_gem_shmem_pin(shmem);
+	if (ret)
+		return ret;
+	sgt = drm_prime_pages_to_sg(shmem->base.dev, shmem->pages,
+				    shmem->base.size >> PAGE_SHIFT);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		goto unpin;
+	}
+	ret = dma_map_sgtable(o->scanout, sgt, DMA_BIDIRECTIONAL, 0);
+	if (ret)
+		goto free;
+	domain = iommu_get_domain_for_dev(o->scanout);
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		ret = dcp_m4_extent_add(&start, &length, sg_dma_address(sg), sg_dma_len(sg));
+		if (ret)
+			break;
+	}
+	if (!ret)
+		ret = dcp_m4_direct_extent(start, length, shmem->base.size);
+	for (u64 off = 0; !ret && off < length; off += SZ_16K)
+		if (!iommu_iova_to_phys(domain, start + off))
+			ret = -EIO;
+	if (ret) {
+		/* DCP never received this DVA. */
+		dma_unmap_sgtable(o->scanout, sgt, DMA_BIDIRECTIONAL, 0);
+		goto free;
+	}
+	bo->sgt = sgt;
+	bo->dva = start;
+	bo->mapped = length;
+	bo->output = o;
+	return 0;
+free:
+	sg_free_table(sgt);
+	kfree(sgt);
+unpin:
+	drm_gem_shmem_unpin(shmem);
+	return ret;
+}
+
 /* Choose direct scanout or the CPU copy for one framebuffer on one output. */
 static enum dcp_m4_copy_reason dcp_m4_kms_direct(struct dcp_m4_output *o,
 		struct drm_framebuffer *fb, struct dcp_m4_bo **direct)
@@ -212,8 +300,12 @@ static enum dcp_m4_copy_reason dcp_m4_kms_direct(struct dcp_m4_output *o,
 	struct dcp_m4_bo *bo;
 	int ret;
 
-	/* Local shmem is CPU-written through cached pages; the copy cleans it. */
-	if (!obj || !drm_gem_is_imported(obj))
+	bool local;
+
+	if (!obj)
+		return DCP_M4_COPY_LOCAL;
+	local = !drm_gem_is_imported(obj);
+	if (local && !READ_ONCE(dcp_m4_direct_local))
 		return DCP_M4_COPY_LOCAL;
 	if (fb->format->num_planes != 1 || fb->offsets[0] || needed > obj->size ||
 	    needed > U32_MAX)
@@ -225,7 +317,7 @@ static enum dcp_m4_copy_reason dcp_m4_kms_direct(struct dcp_m4_output *o,
 	if (!bo->output && !bo->map_error) {
 		bo->map_error = READ_ONCE(o->runtime->dcp->error);
 		if (!bo->map_error)
-			bo->map_error = dcp_m4_bo_map(bo, o);
+			bo->map_error = local ? dcp_m4_bo_map_local(bo, o) : dcp_m4_bo_map(bo, o);
 		atomic64_inc(bo->map_error ? &k->stats.map_failures : &k->stats.maps);
 	}
 	ret = bo->map_error ? bo->map_error : bo->output != o ? -EXDEV : 0;
@@ -244,8 +336,16 @@ static void dcp_m4_bo_free(struct drm_gem_object *obj)
 	/* The last framebuffer reference is gone: DCP has a completed successor. */
 	if (bo->sgt && READ_ONCE(bo->output->runtime->dcp->error)) {
 		/* Uncertain firmware state: keep the DVA, pages and dma-buf until reboot. */
-		get_dma_buf(bo->attach->dmabuf);
 		atomic64_inc(&k->stats.retained);
+		if (!bo->attach)
+			return;	/* local: leak the object with its pinned pages */
+		get_dma_buf(bo->attach->dmabuf);
+	} else if (bo->sgt && !bo->attach) {
+		dma_unmap_sgtable(bo->output->scanout, bo->sgt, DMA_BIDIRECTIONAL, 0);
+		sg_free_table(bo->sgt);
+		kfree(bo->sgt);
+		drm_gem_shmem_unpin(&bo->shmem);
+		atomic64_inc(&k->stats.unmaps);
 	} else if (bo->sgt) {
 		dma_buf_unmap_attachment_unlocked(bo->attach, bo->sgt, DMA_BIDIRECTIONAL);
 		dma_buf_detach(bo->attach->dmabuf, bo->attach);
@@ -273,6 +373,8 @@ static struct drm_gem_object *dcp_m4_gem_create_object(struct drm_device *drm, s
 	if (!bo)
 		return ERR_PTR(-ENOMEM);
 	bo->shmem.base.funcs = &dcp_m4_bo_funcs;
+	/* Write-combined CPU access: eligible for direct scanout (no dirty lines). */
+	bo->shmem.map_wc = true;
 	return &bo->shmem.base;
 }
 
@@ -385,6 +487,59 @@ static const struct drm_plane_helper_funcs dcp_m4_kms_plane_helpers = {
 	.atomic_check = dcp_m4_kms_plane_check,
 	.atomic_update = dcp_m4_kms_plane_update,
 };
+static int dcp_m4_kms_cursor_prepare_fb(struct drm_plane *plane, struct drm_plane_state *state)
+{
+	struct dcp_m4_plane_state *s = to_dcp_m4_plane_state(state);
+
+	/* Always blitted into a canvas: producer fences, then a CPU mapping. */
+	s->direct = NULL;
+	s->copy = DCP_M4_COPY_LOCAL;
+	return drm_gem_plane_helper_prepare_fb(plane, state);
+}
+
+static int dcp_m4_kms_cursor_check(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	struct drm_plane_state *p = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *c;
+	int ret;
+
+	if (!p->crtc || !p->fb)
+		return 0;
+	c = drm_atomic_get_new_crtc_state(state, p->crtc);
+	ret = drm_atomic_helper_check_plane_state(p, c, DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING, true, true);
+	if (ret) {
+		/* REMOVE-DEBUG */
+		dev_info_ratelimited(plane->dev->dev, "cursor plane check %d: src %ux%u crtc %ux%u\n",
+				     ret, p->src_w >> 16, p->src_h >> 16, p->crtc_w, p->crtc_h);
+		return ret;
+	}
+	/* Whole-pixel source inside the framebuffer, at most one canvas. */
+	if (((p->src_x | p->src_y | p->src_w | p->src_h) & 0xffff) ||
+	    (p->src_x >> 16) + (p->src_w >> 16) > p->fb->width ||
+	    (p->src_y >> 16) + (p->src_h >> 16) > p->fb->height ||
+	    (p->src_w >> 16) > DCP_M4_CURSOR_SIZE || (p->src_h >> 16) > DCP_M4_CURSOR_SIZE ||
+	    p->fb->offsets[0] || p->fb->modifier != DRM_FORMAT_MOD_LINEAR ||
+	    p->fb->format->format != DRM_FORMAT_ARGB8888) {
+		/* REMOVE-DEBUG: bring-up visibility of compositor cursor requests. */
+		dev_info_ratelimited(plane->dev->dev,
+			    "cursor rejected: fb %ux%u fmt %p4cc mod %#llx src %u,%u %ux%u\n",
+			    p->fb->width, p->fb->height, &p->fb->format->format,
+			    p->fb->modifier, p->src_x >> 16, p->src_y >> 16,
+			    p->src_w >> 16, p->src_h >> 16);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static const struct drm_plane_helper_funcs dcp_m4_kms_cursor_helpers = {
+	.prepare_fb = dcp_m4_kms_cursor_prepare_fb,
+	.begin_fb_access = dcp_m4_kms_begin_fb_access,
+	.end_fb_access = dcp_m4_kms_end_fb_access,
+	.atomic_check = dcp_m4_kms_cursor_check,
+	.atomic_update = dcp_m4_kms_plane_update,
+};
+
 static const struct drm_plane_funcs dcp_m4_kms_plane_funcs = {
 	.reset = dcp_m4_kms_plane_reset,
 	.atomic_duplicate_state = dcp_m4_kms_plane_duplicate,
@@ -476,10 +631,13 @@ static void dcp_m4_kms_account(struct dcp_m4_kms *k, enum dcp_m4_copy_reason cop
 }
 
 /* Under dcp->lock: one swap, carrying brightness only when it changes the panel. */
-static int dcp_m4_output_swap(struct dcp_m4_output *o, const struct dcp_m4_frame *frame, u32 nits)
+static int dcp_m4_output_swap_full(struct dcp_m4_output *o, bool primary,
+				   const struct dcp_m4_frame *frame,
+				   const struct dcp_m4_upper *upper, u32 nits)
 {
 	bool change = o->nits_applied != (int)nits;
-	int ret = dcp_m4_runtime_swap_brightness(o->runtime, frame, change, nits);
+	int ret = dcp_m4_runtime_swap_full(o->runtime, primary, frame, upper, o->cursor_keep,
+					   change, nits);
 
 	/* The panel holds the new value only once A407 and its D590 completed. */
 	if (!ret && change)
@@ -487,15 +645,81 @@ static int dcp_m4_output_swap(struct dcp_m4_output *o, const struct dcp_m4_frame
 	return ret;
 }
 
+static int dcp_m4_output_swap(struct dcp_m4_output *o, const struct dcp_m4_frame *frame, u32 nits)
+{
+	return dcp_m4_output_swap_full(o, true, frame, NULL, nits);
+}
+
+/*
+ * Present the cursor through a fully on-panel 64x64 canvas: clamp the canvas
+ * into the panel and blit the visible part of the cursor at its offset, the
+ * rest transparent, so firmware never sees a clipped or sub-32x32 rectangle.
+ * *slot is the canvas presented, or -1 to hide.
+ */
+static int dcp_m4_cursor_build(struct dcp_m4_output *o, struct drm_plane_state *cs,
+			       struct dcp_m4_upper *u, int *slot)
+{
+	struct dcp_m4_plane_state *s = to_dcp_m4_plane_state(cs);
+	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(cs);
+	const s32 n = DCP_M4_CURSOR_SIZE;
+	int next = o->cursor_slot == 0 ? 1 : 0;
+	s32 x, y, ox, oy, w, h, pitch;
+	const u8 *src;
+	u8 *dst;
+	int ret;
+
+	*u = (struct dcp_m4_upper) {
+		.index = dcp_m4_cursor_index, .id = dcp_m4_cursor_id,
+		.flags = dcp_m4_cursor_flags,
+	};
+	*slot = -1;
+	if (!cs->fb || !cs->visible)
+		return 0;
+	if (!s->vmapped || shadow->data[0].is_iomem)
+		return -EINVAL;
+	/* The source sub-rectangle, unscaled (atomic check). */
+	w = cs->src_w >> 16;
+	h = cs->src_h >> 16;
+	pitch = cs->fb->pitches[0];
+	x = clamp_t(s32, cs->crtc_x, 0, DCP_M4_PANEL_WIDTH - n);
+	y = clamp_t(s32, cs->crtc_y, 0, DCP_M4_PANEL_HEIGHT - n);
+	ox = cs->crtc_x - x;	/* Cursor origin inside the canvas. */
+	oy = cs->crtc_y - y;
+	ret = drm_gem_fb_begin_cpu_access(cs->fb, DMA_FROM_DEVICE);
+	if (ret)
+		return ret;
+	src = (const u8 *)shadow->data[0].vaddr + (cs->src_y >> 16) * pitch + (cs->src_x >> 16) * 4;
+	dst = o->cursor_pixels[next];
+	for (s32 v = 0; v < n; v++) {
+		s32 sy = v - oy, sx0 = max(0, -ox), sx1 = min(w, n - ox);
+		u8 *row = dst + v * n * 4;
+
+		memset(row, 0, n * 4);
+		if (sy >= 0 && sy < h && sx0 < sx1)
+			memcpy(row + (sx0 + ox) * 4, src + sy * pitch + sx0 * 4, (sx1 - sx0) * 4);
+	}
+	drm_gem_fb_end_cpu_access(cs->fb, DMA_FROM_DEVICE);
+	dma_wmb();
+	u->frame = &o->cursor_frame[next];
+	u->x = x;
+	u->y = y;
+	*slot = next;
+	return 0;
+}
+
 static void dcp_m4_kms_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 {
 	struct dcp_m4_output *o = to_dcp_m4_output(crtc);
 	struct dcp_m4_runtime *r = o->runtime;
 	struct drm_plane_state *p = drm_atomic_get_new_plane_state(state, &o->plane);
+	struct drm_plane_state *cs = o->has_cursor ?
+		drm_atomic_get_new_plane_state(state, &o->cursor) : NULL;
+	struct dcp_m4_upper upper;
+	int cslot = -1;
 	struct drm_framebuffer *held = NULL, *retire = NULL;
 	struct drm_shadow_plane_state *shadow;
 	struct dcp_m4_plane_state *s;
-	struct dcp_m4_frame direct, *frame;
+	struct dcp_m4_frame direct, *frame = NULL;
 	struct iosys_map dst;
 	struct drm_rect clip = DRM_RECT_INIT(0, 0, DCP_M4_PANEL_WIDTH, DCP_M4_PANEL_HEIGHT);
 	int next = o->active_slot == 0 ? 1 : 0;
@@ -505,7 +729,7 @@ static void dcp_m4_kms_flush(struct drm_crtc *crtc, struct drm_atomic_state *sta
 	if (!crtc->state->active)
 		return;
 	/* Modeset checks add affected planes; a CRTC-only no-op has no new pixels. */
-	if (!p) {
+	if (!p && !cs) {
 		dcp_m4_kms_finish(crtc, READ_ONCE(r->dcp->error), false);
 		return;
 	}
@@ -513,6 +737,22 @@ static void dcp_m4_kms_flush(struct drm_crtc *crtc, struct drm_atomic_state *sta
 	ret = dcp_m4_runtime_live(r);
 	if (ret)
 		goto failed;
+	if (cs) {
+		ret = dcp_m4_cursor_build(o, cs, &upper, &cslot);
+		if (ret)
+			goto failed;
+	}
+	if (!p) {
+		/* Cursor only: the primary surface stays as it is. */
+		ret = dcp_m4_output_swap_full(o, false, NULL, &upper, o->nits);
+		if (ret)
+			goto failed;
+		o->cursor_slot = cslot;
+		atomic64_inc(&o->kms->stats.cursor_swaps);
+		dcp_m4_kms_finish(crtc, 0, true);
+		mutex_unlock(&r->dcp->lock);
+		return;
+	}
 	if (!p->fb) {
 		ret = -EINVAL;
 		goto failed;
@@ -549,9 +789,11 @@ static void dcp_m4_kms_flush(struct drm_crtc *crtc, struct drm_atomic_state *sta
 	}
 	start = ktime_get_ns();
 	/* The first swap, and the first after a blank, apply the stored request. */
-	ret = dcp_m4_output_swap(o, frame, o->nits);
+	ret = dcp_m4_output_swap_full(o, true, frame, cs ? &upper : NULL, o->nits);
 	if (ret)
 		goto failed;
+	if (cs)
+		o->cursor_slot = cslot;
 	dcp_m4_kms_account(o->kms, s->copy, ktime_get_ns() - start);
 	/* Only a definite successor completion permits releasing the previous pixels. */
 	retire = o->active_fb;
@@ -599,6 +841,7 @@ static void dcp_m4_kms_disable(struct drm_crtc *crtc, struct drm_atomic_state *s
 		retire = o->active_fb;
 		o->active_fb = NULL;
 		o->active_slot = -1;
+		o->cursor_slot = -1;
 	}
 	mutex_unlock(&r->dcp->lock);
 	drm_crtc_vblank_off(crtc);
@@ -819,7 +1062,18 @@ static int dcp_m4_output_init(struct dcp_m4_kms *k, struct dcp_m4_output *o,
 	if (ret)
 		return ret;
 	drm_plane_helper_add(&o->plane, &dcp_m4_kms_plane_helpers);
-	ret = drm_crtc_init_with_planes(drm, &o->crtc, &o->plane, NULL,
+	if (o->has_cursor) {
+		static const u32 cursor_formats[] = { DRM_FORMAT_ARGB8888 };
+
+		ret = drm_universal_plane_init(drm, &o->cursor, 0, &dcp_m4_kms_plane_funcs,
+					       cursor_formats, ARRAY_SIZE(cursor_formats),
+					       modifiers, DRM_PLANE_TYPE_CURSOR, NULL);
+		if (ret)
+			return ret;
+		drm_plane_helper_add(&o->cursor, &dcp_m4_kms_cursor_helpers);
+	}
+	ret = drm_crtc_init_with_planes(drm, &o->crtc, &o->plane,
+					o->has_cursor ? &o->cursor : NULL,
 					&dcp_m4_kms_crtc_funcs, NULL);
 	if (ret)
 		return ret;
@@ -877,7 +1131,7 @@ static int dcp_m4_kms_create(struct dcp_m4_ready *dcp)
 	o->active_slot = 0; /* DCP still scans that diagnostic surface. */
 	o->nits = DCP_M4_NITS_DEFAULT;
 	o->nits_applied = -1; /* Inherited panel state until a swap carries a value. */
-	o->pixels[1] = apple_dart_dcp_scanout_alloc(&dcp->scanout->dev,
+	o->pixels[1] = dcp_m4_scanout_alloc(&dcp->scanout->dev,
 						   r->scanout_frame.backing_size, &dva);
 	if (IS_ERR(o->pixels[1]))
 		return PTR_ERR(o->pixels[1]);
@@ -897,6 +1151,28 @@ static int dcp_m4_kms_create(struct dcp_m4_ready *dcp)
 	drm->mode_config.preferred_depth = 24;
 	drm->mode_config.funcs = &dcp_m4_kms_config_funcs;
 	drm->mode_config.helper_private = &dcp_m4_kms_config_helpers;
+	o->cursor_slot = -1;
+	if (dcp_m4_cursor_plane > 0 || (dcp_m4_cursor_plane < 0 && dcp_m4_pf->fw14)) {
+		const u32 n = DCP_M4_CURSOR_SIZE;
+
+		if (dcp_m4_cursor_index < 1 || dcp_m4_cursor_index > 3)
+			return -EINVAL;
+		for (u32 i = 0; i < 2; i++) {
+			o->cursor_pixels[i] = dcp_m4_scanout_alloc(&dcp->scanout->dev,
+								   n * n * 4, &dva);
+			if (IS_ERR(o->cursor_pixels[i]))
+				return PTR_ERR(o->cursor_pixels[i]);
+			o->cursor_frame[i] = (struct dcp_m4_frame) {
+				.dva = dva, .backing_size = n * n * 4, .width = n, .height = n,
+				.stride = n * 4, .format = DCP_M4_ARGB8888,
+			};
+		}
+		o->cursor_keep = BIT(dcp_m4_cursor_index);
+		o->has_cursor = true;
+		drm->mode_config.cursor_width = drm->mode_config.cursor_height = n;
+		/* Cursor framebuffers are small; the primary check keeps the panel size. */
+		drm->mode_config.min_width = drm->mode_config.min_height = 1;
+	}
 	ret = dcp_m4_output_init(k, o, DRM_MODE_CONNECTOR_eDP);
 	if (ret)
 		return ret;
@@ -910,7 +1186,7 @@ static int dcp_m4_kms_create(struct dcp_m4_ready *dcp)
 	 * and the panel plane scans out exactly its own size; a larger
 	 * external mode (e.g. 3840x2160@30) would make that commit fail.
 	 */
-	if (k->ext_count) {
+	if (k->ext_count && !o->has_cursor) {
 		drm->mode_config.min_width = min_t(u32, 640, t->hdisplay);
 		drm->mode_config.min_height = min_t(u32, 480, t->vdisplay);
 	}
@@ -992,7 +1268,7 @@ static ssize_t kms_stats_show(struct device *dev, struct device_attribute *attr,
 		"flips=%llu direct=%llu copy_local=%llu copy_layout=%llu copy_map=%llu "
 		"copy_disabled=%llu swap_ns_last=%llu swap_ns_max=%llu swap_ns_total=%llu "
 		"maps=%lld map_failures=%lld unmaps=%lld retained=%lld idle_vblanks=%lld "
-		"backlight_swaps=%lld nits=%u nits_applied=%d\n",
+		"backlight_swaps=%lld cursor_swaps=%lld nits=%u nits_applied=%d\n",
 		READ_ONCE(s->flips), READ_ONCE(s->direct),
 		READ_ONCE(s->copy[DCP_M4_COPY_LOCAL]), READ_ONCE(s->copy[DCP_M4_COPY_LAYOUT]),
 		READ_ONCE(s->copy[DCP_M4_COPY_MAP]), READ_ONCE(s->copy[DCP_M4_COPY_DISABLED]),
@@ -1001,6 +1277,7 @@ static ssize_t kms_stats_show(struct device *dev, struct device_attribute *attr,
 		atomic64_read(&s->maps), atomic64_read(&s->map_failures),
 		atomic64_read(&s->unmaps), atomic64_read(&s->retained),
 		atomic64_read(&s->idle_vblanks), atomic64_read(&s->backlight_swaps),
+		atomic64_read(&s->cursor_swaps),
 		READ_ONCE(k->internal.nits), READ_ONCE(k->internal.nits_applied));
 }
 static DEVICE_ATTR_RO(kms_stats);

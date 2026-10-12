@@ -19,6 +19,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-display.h>
 
+#include "dcp-m4-profile.h"
 #include "dcp-m4-protocol.h"
 #include "dcp-m4-transaction.h"
 #include "dcp-m4-timing.h"
@@ -57,6 +58,81 @@ struct dcp_m4_ready {
 	struct dcp_m4_kms *kms;
 	struct dcp_m4_ext *ext[2];	/* External DCPEXT owners, independent of this DCP. */
 };
+
+/*
+ * Per-board DART/PMP glue. J713 keeps its retained-root DART owner and PMP
+ * display provider. J514S uses the generic locked-DART DMA API: the inherited
+ * mappings are protected as reserved iommu-addresses regions.
+ */
+static int dcp_m4_dart_check(struct device *dev)
+{
+	if (!dcp_m4_pf->fw14)
+		return apple_dart_dcp_check(dev);
+	return iommu_get_domain_for_dev(dev) ? 0 : -ENODEV;
+}
+
+static int dcp_m4_dart_check_buffer(struct device *dev, dma_addr_t iova, size_t size)
+{
+	if (!dcp_m4_pf->fw14)
+		return apple_dart_dcp_check_buffer(dev, iova, size);
+	return dcp_m4_dart_check(dev);
+}
+
+static void *dcp_m4_dma_alloc(struct device *dev, size_t size, dma_addr_t *dva)
+{
+	void *cpu;
+
+	if (!dcp_m4_pf->fw14)
+		return apple_dart_dcp_alloc(dev, size, dva);
+	cpu = dma_alloc_coherent(dev, size, dva, GFP_KERNEL);
+	return cpu ?: ERR_PTR(-ENOMEM);
+}
+
+static void *dcp_m4_scanout_alloc(struct device *dev, size_t size, dma_addr_t *dva)
+{
+	void *cpu;
+
+	if (!dcp_m4_pf->fw14)
+		return apple_dart_dcp_scanout_alloc(dev, size, dva);
+	cpu = dma_alloc_coherent(dev, size, dva, GFP_KERNEL);
+	return cpu ?: ERR_PTR(-ENOMEM);
+}
+
+static int dcp_m4_pmp_prepare(struct device *dev)
+{
+	return dcp_m4_pf->fw14 ? apple_pmp_j514s_display_prepare(dev) :
+		apple_pmp_j713_display_prepare(dev);
+}
+
+static int dcp_m4_pmp_get(struct device *dev)
+{
+	return dcp_m4_pf->fw14 ? apple_pmp_j514s_display_get(dev) :
+		apple_pmp_j713_display_get(dev);
+}
+
+static int dcp_m4_pmp_check(struct device *dev)
+{
+	return dcp_m4_pf->fw14 ? apple_pmp_j514s_display_check(dev) :
+		apple_pmp_j713_display_check(dev);
+}
+
+/* Board identity, handoff markers and the DCP ASC address. */
+struct dcp_m4_board {
+	const struct dcp_m4_profile *profile;
+	const char *machine, *dcp, *uuid, *inherited, *scanout;
+	u64 coproc;
+};
+
+static const struct dcp_m4_board dcp_m4_boards[] = {
+	{ &dcp_m4_profile_j713, "apple,j713", "apple,t8132-dcp",
+	  "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E", "apple,j713-inherited-mappings",
+	  "apple,t8132-display-diagnostics", 0x30ae00000ULL },
+	{ &dcp_m4_profile_j514s, "apple,j514s", "apple,t6030-dcp",
+	  "DDF38191-93B3-324A-BC8F-643006F5AC82", "apple,j514s-inherited-mappings",
+	  "apple,t6030-display-diagnostics", 0x28ec00000ULL },
+};
+
+static const struct dcp_m4_board *dcp_m4_board = &dcp_m4_boards[0];
 
 static void dcp_m4_runtime_wake(struct dcp_m4_ready *dcp);
 static void dcp_m4_runtime_receive(struct dcp_m4_ready *dcp, u64 word);
@@ -113,10 +189,10 @@ static int dcp_m4_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 	int ret = -EINVAL;
 
 	if (!bfr->size || bfr->size > SZ_16M || dcp->allocated > SZ_64M - bfr->size ||
-	    apple_dart_dcp_check(dcp->dev))
+	    dcp_m4_dart_check(dcp->dev))
 		goto fail;
 	if (!bfr->iova) {
-		bfr->buffer = apple_dart_dcp_alloc(dcp->dev, bfr->size, &bfr->iova);
+		bfr->buffer = dcp_m4_dma_alloc(dcp->dev, bfr->size, &bfr->iova);
 		if (IS_ERR(bfr->buffer)) {
 			ret = PTR_ERR(bfr->buffer);
 			bfr->buffer = NULL;
@@ -125,7 +201,7 @@ static int dcp_m4_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		/* Allocation stays pinned even if subsequent transport validation fails. */
 		dcp->allocated += bfr->size;
 		if (!dcp_m4_range(1ULL << 40, 1ULL << 36, bfr->iova, bfr->size) ||
-		    apple_dart_dcp_check(dcp->dev))
+		    dcp_m4_dart_check(dcp->dev))
 			goto fail;
 		bfr->is_mapped = false;
 		dev_info(dcp->dev, "RTKit allocated %zu bytes at %pad\n", bfr->size, &bfr->iova);
@@ -139,13 +215,13 @@ static int dcp_m4_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 				goto fail;
 			off += SZ_16K - ((bfr->iova + off) & (SZ_16K - 1));
 		}
-		if (apple_dart_dcp_check(dcp->dev))
+		if (dcp_m4_dart_check(dcp->dev))
 			goto fail;
 		pa = bfr->iova;
 	} else {
 		if (!dcp_m4_range(1ULL << 40, 1ULL << 36, bfr->iova, bfr->size))
 			goto fail;
-		ret = apple_dart_dcp_check_buffer(dcp->dev, bfr->iova, bfr->size);
+		ret = dcp_m4_dart_check_buffer(dcp->dev, bfr->iova, bfr->size);
 		if (ret)
 			goto fail;
 		ret = -EINVAL;
@@ -266,9 +342,17 @@ static ssize_t ready_store(struct device *dev, struct device_attribute *attr,
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = apple_dart_dcp_check(dev);
+	ret = dcp_m4_dart_check(dev);
 	if (ret)
 		goto out;
+	/* J514S: the PMP must have acknowledged DISP before the DCP is adopted. */
+	if (dcp_m4_pf->fw14) {
+		ret = dcp_m4_pmp_get(dev);
+		if (ret) {
+			dev_err(dev, "PMP DISP acknowledgement missing: %d\n", ret);
+			goto out;
+		}
+	}
 	if (!(readl(dcp->coproc + 0x44) & BIT(4))) {
 		ret = -ENODEV;
 		goto out;
@@ -288,13 +372,13 @@ static ssize_t ready_store(struct device *dev, struct device_attribute *attr,
 		goto fail;
 	}
 	dev_info(dev, "RTKit awake; endpoint 0x37 advertised\n");
-	dcp->rpc = apple_dart_dcp_alloc(dev, DCP_M4_RPC_SIZE, &dcp->rpc_dva);
+	dcp->rpc = dcp_m4_dma_alloc(dev, DCP_M4_RPC_SIZE, &dcp->rpc_dva);
 	if (IS_ERR(dcp->rpc)) {
 		ret = PTR_ERR(dcp->rpc);
 		dcp->rpc = NULL;
 		goto fail;
 	}
-	ret = apple_dart_dcp_check(dev);
+	ret = dcp_m4_dart_check(dev);
 	if (ret)
 		goto fail;
 	ret = dcp_m4_init_word(dcp->rpc_dva, &init_word);
@@ -382,15 +466,21 @@ static ssize_t rpc_probe_store(struct device *dev, struct device_attribute *attr
 	spin_unlock_irqrestore(&dcp->state_lock, flags);
 	if (ret)
 		goto out;
-	ret = apple_dart_dcp_check(dev);
+	ret = dcp_m4_dart_check(dev);
 	if (ret)
 		goto fail;
 	if (!(readl(dcp->coproc + 0x44) & BIT(4))) {
 		ret = -ENODEV;
 		goto fail;
 	}
-	ret = dcp_m4_call_begin(&dcp->transaction, dcp->rpc, DCP_M4_RPC_SIZE,
-			      get_unaligned_le32("A457"), false, NULL, 0, 0, &word);
+	{
+		unsigned int m = dcp_m4_pf->open_method;
+		u32 tag = 'A' | (('0' + m / 100) << 8) | (('0' + m / 10 % 10) << 16) |
+			(('0' + m % 10) << 24);
+
+		ret = dcp_m4_call_begin(&dcp->transaction, dcp->rpc, DCP_M4_RPC_SIZE,
+				      tag, false, NULL, 0, 0, &word);
+	}
 	if (ret)
 		goto fail;
 	dma_wmb();
@@ -425,7 +515,7 @@ static ssize_t rpc_probe_store(struct device *dev, struct device_attribute *attr
 			      word, NULL, 0);
 	if (ret)
 		goto fail;
-	ret = apple_dart_dcp_check(dev);
+	ret = dcp_m4_dart_check(dev);
 	if (ret)
 		goto fail;
 	if (!(readl(dcp->coproc + 0x44) & BIT(4))) {
@@ -457,14 +547,52 @@ static int dcp_m4_shared_alloc(void *cookie, u32 size, u64 *phys, u64 *dva)
 {
 	struct dcp_m4_ready *dcp = cookie;
 
-	return apple_dart_dcp_shared_alloc(dcp->dev, &dcp->piodma->dev, size, phys, dva);
+	struct iommu_domain *domain;
+	dma_addr_t iova;
+	phys_addr_t pa;
+	void *cpu;
+
+	if (!dcp_m4_pf->fw14)
+		return apple_dart_dcp_shared_alloc(dcp->dev, &dcp->piodma->dev, size, phys, dva);
+	/* Zeroed, physically contiguous, pinned until reboot (no ownership return). */
+	domain = iommu_get_domain_for_dev(dcp->dev);
+	if (!domain)
+		return -ENODEV;
+	cpu = dma_alloc_attrs(dcp->dev, size, &iova, GFP_KERNEL | __GFP_ZERO,
+			      DMA_ATTR_FORCE_CONTIGUOUS);
+	if (!cpu)
+		return -ENOMEM;
+	pa = iommu_iova_to_phys(domain, iova);
+	if (!pa)
+		return -EIO;
+	for (u32 off = 0; off < size; off += SZ_16K)
+		if (iommu_iova_to_phys(domain, iova + off) != pa + off)
+			return -EIO;
+	*phys = pa;
+	*dva = iova;
+	return 0;
 }
 
 static int dcp_m4_shared_map(void *cookie, u64 phys, u64 dva, u32 size)
 {
 	struct dcp_m4_ready *dcp = cookie;
 
-	return apple_dart_dcp_shared_map(dcp->dev, &dcp->piodma->dev, phys, dva, size);
+	struct iommu_domain *domain;
+	int ret;
+
+	if (!dcp_m4_pf->fw14)
+		return apple_dart_dcp_shared_map(dcp->dev, &dcp->piodma->dev, phys, dva, size);
+	/* Same PA and size at the same DVA in the PIODMA (SID4) domain. */
+	domain = iommu_get_domain_for_dev(&dcp->piodma->dev);
+	if (!domain)
+		return -ENODEV;
+	ret = iommu_map(domain, dva, phys, size, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+	if (ret)
+		return ret;
+	for (u32 off = 0; off < size; off += SZ_16K)
+		if (iommu_iova_to_phys(domain, dva + off) != phys + off)
+			return -EIO;
+	return 0;
 }
 
 static const struct dcp_m4_memory_ops dcp_m4_memory_ops = {
@@ -481,7 +609,7 @@ static int dcp_m4_create_piodma(struct dcp_m4_ready *dcp)
 	node = of_get_child_by_name(dcp->dev->of_node, "piodma");
 	alias = of_find_node_by_path("disp0_piodma");
 	if (!node || node != alias || !of_device_is_available(node) ||
-	    !of_property_read_bool(node, "apple,j713-inherited-mappings"))
+	    !of_property_read_bool(node, dcp_m4_board->inherited))
 		goto out;
 	existing = of_find_device_by_node(node);
 	if (existing) {
@@ -497,7 +625,7 @@ static int dcp_m4_create_piodma(struct dcp_m4_ready *dcp)
 	if (!ret)
 		ret = of_dma_configure(&dcp->piodma->dev, node, true);
 	if (!ret)
-		ret = apple_dart_dcp_check(&dcp->piodma->dev);
+		ret = dcp_m4_dart_check(&dcp->piodma->dev);
 out:
 	of_node_put(alias);
 	of_node_put(node);
@@ -512,8 +640,8 @@ static int dcp_m4_acquire_scanout(struct dcp_m4_ready *dcp)
 	int ret = -ENODEV;
 
 	if (!node || !of_device_is_available(node) ||
-	    !of_device_is_compatible(node, "apple,t8132-display-diagnostics") ||
-	    !of_property_read_bool(node, "apple,j713-inherited-mappings"))
+	    !of_device_is_compatible(node, dcp_m4_board->scanout) ||
+	    !of_property_read_bool(node, dcp_m4_board->inherited))
 		goto out;
 	pdev = of_find_device_by_node(node);
 	if (!pdev)
@@ -531,7 +659,7 @@ static int dcp_m4_acquire_scanout(struct dcp_m4_ready *dcp)
 	if (!ret)
 		ret = of_dma_configure(&pdev->dev, node, true);
 	if (!ret)
-		ret = apple_dart_dcp_check(&pdev->dev);
+		ret = dcp_m4_dart_check(&pdev->dev);
 	if (!ret)
 		pm_runtime_get_noresume(&pdev->dev);
 unlock:
@@ -571,7 +699,7 @@ static ssize_t shared_probe_store(struct device *dev, struct device_attribute *a
 	spin_unlock_irqrestore(&dcp->state_lock, flags);
 	if (ret)
 		goto out;
-	ret = apple_dart_dcp_check(dev);
+	ret = dcp_m4_dart_check(dev);
 	if (ret)
 		goto fail;
 	if (!(readl(dcp->coproc + 0x44) & BIT(4))) {
@@ -605,9 +733,9 @@ static ssize_t shared_probe_store(struct device *dev, struct device_attribute *a
 			i + 1, dcp->memory->object[i].phys, dcp->memory->object[i].dva,
 			dcp->memory->object[i].size);
 	}
-	ret = apple_dart_dcp_check(dev);
+	ret = dcp_m4_dart_check(dev);
 	if (!ret)
-		ret = apple_dart_dcp_check(&dcp->piodma->dev);
+		ret = dcp_m4_dart_check(&dcp->piodma->dev);
 	if (ret)
 		goto fail;
 	spin_lock_irqsave(&dcp->state_lock, flags);
@@ -647,19 +775,29 @@ static int dcp_m4_probe(struct platform_device *pdev)
 	const char *uuid;
 	int ret;
 
-	if (!of_machine_is_compatible("apple,j713") ||
+	for (unsigned int i = 0; i < ARRAY_SIZE(dcp_m4_boards); i++)
+		if (of_machine_is_compatible(dcp_m4_boards[i].machine) &&
+		    of_device_is_compatible(dev->of_node, dcp_m4_boards[i].dcp))
+			dcp_m4_board = &dcp_m4_boards[i];
+	if (!of_machine_is_compatible(dcp_m4_board->machine) ||
+	    !of_device_is_compatible(dev->of_node, dcp_m4_board->dcp) ||
 	    of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
-	    strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E"))
+	    strcmp(uuid, dcp_m4_board->uuid)) {
+		dev_info(dev, "not a qualified board/firmware; not binding\n");
 		return -ENODEV;
-	ret = apple_dart_dcp_check(dev);
+	}
+	dcp_m4_pf = dcp_m4_board->profile;
+	ret = dcp_m4_dart_check(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "inherited SID23 domain not qualified\n");
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (ret)
 		return ret;
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "coproc");
-	if (!res || res->start != 0x30ae00000ULL || resource_size(res) != SZ_16K)
+	if (!res || res->start != dcp_m4_board->coproc || resource_size(res) != SZ_16K) {
+		dev_info(dev, "unexpected coproc resource; not binding\n");
 		return -ENODEV;
+	}
 	dcp = devm_kzalloc(dev, sizeof(*dcp), GFP_KERNEL);
 	if (!dcp)
 		return -ENOMEM;
@@ -671,13 +809,17 @@ static int dcp_m4_probe(struct platform_device *pdev)
 	dcp->coproc = devm_ioremap_resource(dev, res);
 	if (IS_ERR(dcp->coproc))
 		return PTR_ERR(dcp->coproc);
-	if (!(readl(dcp->coproc + 0x44) & BIT(4)))
+	if (!(readl(dcp->coproc + 0x44) & BIT(4))) {
+		dev_info(dev, "DCP CPU not running (ASC +0x44 = %#x); not binding\n",
+			 readl(dcp->coproc + 0x44));
 		return -ENODEV;
+	}
+	dev_info(dev, "%s DCP profile, CPU running\n", dcp_m4_pf->name);
 	dcp->rtkit = devm_apple_rtkit_init(dev, dcp, "mbox", 0, &dcp_m4_rtkit_ops);
 	if (IS_ERR(dcp->rtkit))
 		return dev_err_probe(dev, PTR_ERR(dcp->rtkit), "cannot acquire RTKit mailbox\n");
 	/* Last fallible step: do not retain a supplier for a failed local probe. */
-	ret = apple_pmp_j713_display_prepare(dev);
+	ret = dcp_m4_pmp_prepare(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "retained PMP supplier not ready\n");
 	platform_set_drvdata(pdev, dcp);
@@ -699,6 +841,7 @@ static void dcp_m4_shutdown(struct platform_device *pdev)
 
 static const struct of_device_id dcp_m4_match[] = {
 	{ .compatible = "apple,t8132-dcp" },
+	{ .compatible = "apple,t6030-dcp" },
 	{},
 };
 MODULE_DEVICE_TABLE(of, dcp_m4_match);

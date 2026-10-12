@@ -2,16 +2,19 @@
 #ifndef APPLE_DCP_M4_FRAME_H
 #define APPLE_DCP_M4_FRAME_H
 
+#include <linux/bits.h>
 #include <linux/errno.h>
 #include <linux/limits.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
+#include "dcp-m4-profile.h"
 
-#define DCP_M4_SWAP_SIZE		0x1bd8U
+/* Profile-backed: J713 0x1bd8 / 2560x1664, J514S 0x1b58 / 3024x1964. */
+#define DCP_M4_SWAP_SIZE		(dcp_m4_pf->swap_size)
 #define DCP_M4_SURFACE_SIZE	0x22cU
-#define DCP_M4_PANEL_WIDTH	2560U
-#define DCP_M4_PANEL_HEIGHT	1664U
+#define DCP_M4_PANEL_WIDTH	(dcp_m4_pf->panel_width)
+#define DCP_M4_PANEL_HEIGHT	(dcp_m4_pf->panel_height)
 
 /* Used only after matching firmware-advertised preferred physical timing. */
 enum dcp_m4_frame_format {
@@ -173,40 +176,114 @@ static inline int dcp_m4_frame_check_ext(const struct dcp_m4_frame *frame)
 	return 0;
 }
 
-static inline int dcp_m4_swap_encode_checked(void *output, size_t length, u32 swap_id,
-					     const struct dcp_m4_frame *frame,
-					     bool brightness_change, u32 nits,
-					     int (*check)(const struct dcp_m4_frame *frame))
+/*
+ * One upper surface of an indexed swap (cursor/overlay contract): firmware
+ * surface-array index 1..3, a fully on-panel destination (the caller clips),
+ * no scaling. A NULL frame removes the surface.
+ */
+struct dcp_m4_upper {
+	const struct dcp_m4_frame *frame;
+	u32 index, x, y;
+	u32 id, flags;
+};
+
+static inline int dcp_m4_upper_check(const struct dcp_m4_upper *u)
+{
+	const struct dcp_m4_frame *f = u->frame;
+	u64 size;
+
+	if (u->index < 1 || u->index > 3)
+		return -EINVAL;
+	if (!f)
+		return 0;
+	size = (u64)f->stride * f->height;
+	/* Firmware rejects (or crashes on) visible surfaces below 32x32. */
+	if (f->width < 32 || f->height < 32 || f->width > 256 || f->height > 256 ||
+	    f->stride < f->width * 4 || f->stride % 64 || f->backing_size < size ||
+	    !f->dva || f->dva % 0x4000 || f->dva >= (1ULL << 42) ||
+	    f->format != DCP_M4_ARGB8888 ||
+	    u->x > DCP_M4_PANEL_WIDTH - f->width || u->y > DCP_M4_PANEL_HEIGHT - f->height)
+		return -EINVAL;
+	return 0;
+}
+
+/*
+ * Swap request. With primary, surface 0 is presented (frame) or everything is
+ * blanked (NULL frame, background colour): mask 0x80000007, less the upper
+ * indices in keep while presenting (so a primary flip never removes a live
+ * cursor), plus them when blanking. upper adds its own update bit: a swap
+ * without primary leaves surface 0 untouched (bit 0 clear, null byte 1).
+ */
+static inline int dcp_m4_swap_encode_full(void *output, size_t length, u32 swap_id,
+					  bool primary, const struct dcp_m4_frame *frame,
+					  const struct dcp_m4_upper *upper, u32 keep,
+					  bool brightness_change, u32 nits,
+					  int (*check)(const struct dcp_m4_frame *frame))
 {
 	u8 *data = output;
+	u32 mask = 0;
 
-	if (length != DCP_M4_SWAP_SIZE || !swap_id || (brightness_change && nits > 500))
+	if (length != DCP_M4_SWAP_SIZE || !swap_id || (brightness_change && nits > 500) ||
+	    (!primary && !upper) || (keep & ~0xeU))
 		return -EINVAL;
-	if (frame && check(frame))
+	if (primary && frame && check(frame))
 		return -EINVAL;
+	if (upper && dcp_m4_upper_check(upper))
+		return -EINVAL;
+	if (primary)
+		mask = frame ? 0x80000007 & ~keep : 0x80000007 | keep;
+	if (upper)
+		mask |= BIT(upper->index);
 	memset(data, 0, length);
 	put_unaligned_le32(swap_id, data + 0x98);
-	put_unaligned_le32(0x80000007, data + 0x14c);
-	put_unaligned_le32(0x80000007, data + 0x150);
-	put_unaligned_le32(frame ? 0xff000000 : 0xff402060, data + 0x154);
-	memset(data + 0x1bcb, 1, 10);
-	data[0x1bd6] = 1;
-	data[0x1bd7] = 1;
+	put_unaligned_le32(mask, data + 0x14c);
+	put_unaligned_le32(mask, data + 0x150);
+	put_unaligned_le32(primary && !frame ? dcp_m4_pf->disabled_color : 0xff000000,
+			   data + 0x154);
+	memset(data + dcp_m4_pf->swap_nullable, 1, 10);
+	data[dcp_m4_pf->swap_tail] = 1;
+	data[dcp_m4_pf->swap_tail + 1] = 1;
 	if (brightness_change) {
 		data[0x354] = 1;
-		put_unaligned_le64(dcp_m4_nits_binary64(nits), data + 0x35e);
+		put_unaligned_le64(dcp_m4_nits_binary64(nits), data + dcp_m4_pf->swap_nits);
 	}
-	if (frame) {
+	if (primary && frame) {
 		put_unaligned_le32(1, data + 0x9c);
 		put_unaligned_le32(frame->width, data + 0xb4);
 		put_unaligned_le32(frame->height, data + 0xb8);
 		put_unaligned_le32(frame->width, data + 0x114);
 		put_unaligned_le32(frame->height, data + 0x118);
-		dcp_m4_surface_encode(data + 0x588, frame);
-		put_unaligned_le64(frame->dva, data + 0xe38);
-		data[0x1bcb] = 0;
+		dcp_m4_surface_encode(data + dcp_m4_pf->swap_surface, frame);
+		put_unaligned_le64(frame->dva, data + dcp_m4_pf->swap_dva);
+		data[dcp_m4_pf->swap_nullable] = 0;
+	}
+	if (upper && upper->frame) {
+		const struct dcp_m4_frame *f = upper->frame;
+		u32 i = upper->index;
+
+		put_unaligned_le32(upper->id, data + 0x9c + 4 * i);
+		/* Source x,y,w,h then destination x,y,w,h. */
+		put_unaligned_le32(f->width, data + 0xac + 16 * i + 8);
+		put_unaligned_le32(f->height, data + 0xac + 16 * i + 12);
+		put_unaligned_le32(upper->flags, data + 0xec + 4 * i);
+		put_unaligned_le32(upper->x, data + 0x10c + 16 * i);
+		put_unaligned_le32(upper->y, data + 0x10c + 16 * i + 4);
+		put_unaligned_le32(f->width, data + 0x10c + 16 * i + 8);
+		put_unaligned_le32(f->height, data + 0x10c + 16 * i + 12);
+		dcp_m4_surface_encode(data + dcp_m4_pf->swap_surface + DCP_M4_SURFACE_SIZE * i, f);
+		put_unaligned_le64(f->dva, data + dcp_m4_pf->swap_dva + 8 * i);
+		data[dcp_m4_pf->swap_nullable + i] = 0;
 	}
 	return 0;
+}
+
+static inline int dcp_m4_swap_encode_checked(void *output, size_t length, u32 swap_id,
+					     const struct dcp_m4_frame *frame,
+					     bool brightness_change, u32 nits,
+					     int (*check)(const struct dcp_m4_frame *frame))
+{
+	return dcp_m4_swap_encode_full(output, length, swap_id, true, frame, NULL, 0,
+				       brightness_change, nits, check);
 }
 
 static inline int dcp_m4_swap_encode(void *output, size_t length, u32 swap_id,
@@ -243,7 +320,7 @@ static inline int dcp_m4_swap_submit_reply(const void *input, size_t size)
 
 static inline int dcp_m4_swap_complete(const void *input, size_t size, u32 pending_id)
 {
-	if (size != 0x730)
+	if (size != dcp_m4_pf->done_size)
 		return -EMSGSIZE;
 	return pending_id && get_unaligned_le32(input) == pending_id ? 0 : -EPROTO;
 }

@@ -5,6 +5,7 @@
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
+#include "dcp-m4-profile.h"
 
 /* J713 firmware 81BAF476-679D-3CC0-8C6A-E6B6FA659D5E only. */
 #define DCP_M4_RPC_SIZE		0xc0000U
@@ -36,6 +37,9 @@ static inline int dcp_m4_init_word(u64 address, u64 *word)
 
 static inline bool dcp_m4_ready(u64 word)
 {
+	/* Firmware 14.7: alignment in bits 47:16, no hash field. */
+	if (dcp_m4_pf->fw14)
+		return (word & 0xfeff) == 1 && (word >> 16) == DCP_M4_ALIGNMENT;
 	/* Firmware sets the remote flag; it is not part of the identity. */
 	return (word & 0xfeff) == 1 &&
 		((word >> 16) & 0xffffffffULL) == DCP_M4_READY_HASH &&
@@ -53,9 +57,15 @@ static inline int dcp_m4_ready_notification(u64 word, bool init_sent, u64 previo
 }
 
 /* This profile admits stream zero only, not the older context-ID encoding. */
+static inline int dcp_m4_decode_word_ext(u64 word, struct dcp_m4_packet *packet);
+
 static inline int dcp_m4_decode_word(u64 word, struct dcp_m4_packet *packet)
 {
 	u16 control = word;
+
+	/* Firmware 14.7 callbacks use streams 0..3 on either route, any bit 9. */
+	if (dcp_m4_pf->fw14)
+		return dcp_m4_decode_word_ext(word, packet);
 	u16 offset = word >> 16;
 	u16 length = word >> 32;
 
@@ -125,7 +135,7 @@ static inline int dcp_m4_packet_offset(const struct dcp_m4_packet *packet, bool 
 	unsigned int base;
 
 	if (packet->reply || (callback ? packet->stream >= 4 : packet->stream) ||
-	    (packet->callback_flag && (!callback || !packet->remote)) ||
+	    (packet->callback_flag && (!callback || (!packet->remote && !dcp_m4_pf->fw14))) ||
 	    packet->offset % DCP_M4_ALIGNMENT ||
 	    packet->offset >= DCP_M4_STREAM_SIZE || packet->length < DCP_M4_PACKET_HEADER ||
 	    packet->length > DCP_M4_STREAM_SIZE - packet->offset)

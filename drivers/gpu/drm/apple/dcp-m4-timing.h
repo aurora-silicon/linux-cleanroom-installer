@@ -3,10 +3,14 @@
 #define APPLE_DCP_M4_TIMING_H
 
 #include <linux/errno.h>
+#include <linux/limits.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
+#include "dcp-m4-profile.h"
+
+#define DCP_M4_TIMING_TOKENS 2048
 
 /* The first qualified J713 physical mode, not a generic panel-mode fallback. */
 struct dcp_m4_timing {
@@ -27,7 +31,7 @@ struct dcp_m4_timing_token {
 struct dcp_m4_timing_parser {
 	const u8 *data;
 	u32 size, pos, used;
-	struct dcp_m4_timing_token token[256];
+	struct dcp_m4_timing_token token[DCP_M4_TIMING_TOKENS];
 };
 
 static inline int dcp_m4_timing_object(struct dcp_m4_timing_parser *p, unsigned int depth)
@@ -36,7 +40,7 @@ static inline int dcp_m4_timing_object(struct dcp_m4_timing_parser *p, unsigned 
 	u32 tag, bytes = 0, children = 0;
 	unsigned int index;
 
-	if (depth > 8 || p->used == 256)
+	if (depth > 8 || p->used == DCP_M4_TIMING_TOKENS)
 		return -E2BIG;
 	p->pos = (p->pos + 3) & ~3U;
 	if (p->pos > p->size || p->size - p->pos < 4)
@@ -52,12 +56,12 @@ static inline int dcp_m4_timing_object(struct dcp_m4_timing_parser *p, unsigned 
 	t->offset = p->pos;
 	switch (t->type) {
 	case 1:
-		if (t->count > 32)
+		if (t->count > 128)
 			return -E2BIG;
 		children = t->count * 2;
 		break;
 	case 2:
-		if (t->count > 16)
+		if (t->count > 128)
 			return -E2BIG;
 		children = t->count;
 		break;
@@ -68,7 +72,7 @@ static inline int dcp_m4_timing_object(struct dcp_m4_timing_parser *p, unsigned 
 		break;
 	case 9:
 	case 10:
-		if (t->count > (t->type == 9 ? 64 : 256))
+		if (t->count > (t->type == 9 ? 256 : 65536))
 			return -E2BIG;
 		bytes = t->count;
 		break;
@@ -159,6 +163,74 @@ static inline int dcp_m4_timing_axis(const struct dcp_m4_timing_parser *p,
 	return 0;
 }
 
+static inline int dcp_m4_timing_value(const struct dcp_m4_timing_parser *p,
+				     unsigned int dict, const char *name, u64 *value)
+{
+	int index = dcp_m4_timing_field(p, dict, name, 4);
+
+	if (index < 0)
+		return index;
+	*value = p->token[index].value;
+	return 0;
+}
+
+/* Firmware 14.7: read one axis' geometry instead of matching fixed values. */
+static inline int dcp_m4_timing_axis_read(const struct dcp_m4_timing_parser *p,
+					 unsigned int mode, const char *name, u32 v[6])
+{
+	static const char * const fields[] = {
+		"Active", "Total", "FrontPorch", "SyncWidth", "BackPorch", "PreciseSyncRate",
+	};
+	int axis = dcp_m4_timing_field(p, mode, name, 1);
+	u64 value;
+
+	if (axis < 0)
+		return axis;
+	for (unsigned int i = 0; i < 6; i++) {
+		if (dcp_m4_timing_value(p, axis, fields[i], &value) || value > U32_MAX)
+			return -EINVAL;
+		v[i] = value;
+	}
+	if (!v[0] || (u64)v[0] + v[2] + v[3] + v[4] != v[1])
+		return -EINVAL;
+	return 0;
+}
+
+static inline int dcp_m4_parse_timing_fw14(struct dcp_m4_timing_parser *p,
+					  struct dcp_m4_timing *out)
+{
+	u32 h[6], v[6];
+	u64 id, color_id, clock;
+	int colors;
+
+	if (p->token[0].type != 2 || !p->token[0].count || p->token[1].type != 1 ||
+	    dcp_m4_timing_value(p, 1, "ID", &id) || !id || id > U32_MAX ||
+	    dcp_m4_timing_axis_read(p, 1, "HorizontalAttributes", h) ||
+	    dcp_m4_timing_axis_read(p, 1, "VerticalAttributes", v))
+		return -EINVAL;
+	if (h[0] != dcp_m4_pf->panel_width || v[0] != dcp_m4_pf->panel_height)
+		return -EINVAL;
+	/* Nominal 60 or 120 Hz only (16.16). */
+	if (v[5] < (59U << 16) || v[5] > (121U << 16))
+		return -EINVAL;
+	colors = dcp_m4_timing_field(p, 1, "ColorModes", 2);
+	if (colors < 0 || !p->token[colors].count ||
+	    dcp_m4_timing_value(p, colors + 1, "ID", &color_id) || !color_id ||
+	    color_id > U32_MAX)
+		return -EINVAL;
+	clock = (((u64)h[1] * v[1] * v[5]) >> 16);
+	*out = (struct dcp_m4_timing) {
+		.id = id, .color_id = color_id,
+		.hdisplay = h[0], .hsync_start = h[0] + h[2], .hsync_end = h[0] + h[2] + h[3],
+		.htotal = h[1],
+		.vdisplay = v[0], .vsync_start = v[0] + v[2], .vsync_end = v[0] + v[2] + v[3],
+		.vtotal = v[1],
+		.clock_khz = (clock + 500) / 1000,
+		.refresh_16_16 = v[5],
+	};
+	return 0;
+}
+
 static inline int dcp_m4_parse_timing(const void *data, size_t size, struct dcp_m4_timing *out)
 {
 	struct dcp_m4_timing_parser *p;
@@ -179,6 +251,10 @@ static inline int dcp_m4_parse_timing(const void *data, size_t size, struct dcp_
 	ret = dcp_m4_timing_object(p, 0);
 	if (ret)
 		goto done;
+	if (dcp_m4_pf->fw14) {
+		ret = p->pos == size ? dcp_m4_parse_timing_fw14(p, out) : -EINVAL;
+		goto done;
+	}
 	ret = -EINVAL;
 	if (p->pos != size || p->token[0].type != 2 || p->token[0].count != 1 ||
 	    p->token[1].type != 1 ||

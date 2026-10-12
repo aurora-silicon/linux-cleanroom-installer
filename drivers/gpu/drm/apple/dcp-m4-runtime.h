@@ -2,6 +2,7 @@
 /* Included by the J713 owner. Mailbox reception must never wait for an RPC. */
 #include <linux/crc32.h>
 #include <linux/jiffies.h>
+#include <linux/timekeeping.h>
 #include <linux/workqueue.h>
 #include "dcp-m4-callback.h"
 #include "dcp-m4-property.h"
@@ -93,12 +94,12 @@ static int dcp_m4_runtime_health(struct dcp_m4_runtime *r)
 	int ret = READ_ONCE(dcp->error);
 
 	if (!ret && (!(readl(dcp->coproc + 0x44) & BIT(4)) ||
-	    apple_dart_dcp_check(dcp->dev) || apple_dart_dcp_check(&dcp->piodma->dev)))
+	    dcp_m4_dart_check(dcp->dev) || dcp_m4_dart_check(&dcp->piodma->dev)))
 		ret = -EIO;
 	if (!ret && r->power_done)
-		ret = apple_pmp_j713_display_check(dcp->dev);
+		ret = dcp_m4_pmp_check(dcp->dev);
 	if (!ret && dcp->scanout)
-		ret = apple_dart_dcp_check(&dcp->scanout->dev);
+		ret = dcp_m4_dart_check(&dcp->scanout->dev);
 	return ret;
 }
 
@@ -162,13 +163,18 @@ static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
 	return dcp_m4_swap_record_done(&r->swap, id);
 }
 
+static u64 dcp_m4_runtime_wall_ms(void *cookie)
+{
+	return ktime_get_real_ns() / NSEC_PER_MSEC;
+}
+
 static const struct dcp_m4_callback_ops dcp_m4_runtime_ops = {
 	.call = dcp_m4_runtime_call,
 	.property = dcp_m4_runtime_property,
 	.memory = dcp_m4_runtime_memory,
 	.event = dcp_m4_runtime_event,
 	.swap_done = dcp_m4_runtime_swap_done,
-	.boot_stride = 10240,
+	.wall_ms = dcp_m4_runtime_wall_ms,
 };
 
 static void dcp_m4_runtime_bad_word(struct dcp_m4_runtime *r, u64 word, int error)
@@ -318,9 +324,13 @@ static void dcp_m4_runtime_idle(struct work_struct *work)
 		queue_work(r->wq, &r->idle);
 }
 
-/* Serialized owner only; both the A407 reply and its D590 fence must complete. */
-static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
-		const struct dcp_m4_frame *frame, bool brightness_change, u32 nits)
+/*
+ * Serialized owner only; both the A407 reply and its D590 fence must complete.
+ * primary/frame/upper/keep as dcp_m4_swap_encode_full().
+ */
+static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+		const struct dcp_m4_frame *frame, const struct dcp_m4_upper *upper, u32 keep,
+		bool brightness_change, u32 nits)
 {
 	struct dcp_m4_ready *dcp = r->dcp;
 	u8 start[16] = {0}, started[8], submitted[12];
@@ -329,8 +339,10 @@ static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
 	u64 word;
 	int ret;
 
-	if (frame && (!r->power_done || !r->background_done || !dcp->scanout ||
-		      dcp_m4_frame_check(frame)))
+	if (((primary && frame) || (upper && upper->frame)) &&
+	    (!r->power_done || !r->background_done || !dcp->scanout))
+		return -EINVAL;
+	if ((primary && frame && dcp_m4_frame_check(frame)) || (upper && dcp_m4_upper_check(upper)))
 		return -EINVAL;
 	input = kzalloc(DCP_M4_SWAP_SIZE, GFP_KERNEL);
 	if (!input) {
@@ -345,7 +357,8 @@ static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
 	if (!ret)
 		ret = dcp_m4_swap_begin(&r->swap, id);
 	if (!ret)
-		ret = dcp_m4_swap_encode(input, DCP_M4_SWAP_SIZE, id, frame, brightness_change, nits);
+		ret = dcp_m4_swap_encode_full(input, DCP_M4_SWAP_SIZE, id, primary, frame, upper,
+					      keep, brightness_change, nits, dcp_m4_frame_check);
 	if (!ret)
 		ret = dcp_m4_runtime_call(r, 407, false, input, DCP_M4_SWAP_SIZE,
 					 submitted, sizeof(submitted));
@@ -371,6 +384,12 @@ static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
 		dev_dbg(dcp->dev, "Display swap %u complete: A407 reply and D590\n", r->swap.id);
 	}
 	return ret;
+}
+
+static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
+		const struct dcp_m4_frame *frame, bool brightness_change, u32 nits)
+{
+	return dcp_m4_runtime_swap_full(r, true, frame, NULL, 0, brightness_change, nits);
 }
 
 static int dcp_m4_runtime_swap(struct dcp_m4_runtime *r, const struct dcp_m4_frame *frame)
@@ -416,10 +435,13 @@ static int dcp_m4_boot_framebuffer_check(void)
 		if (!of_device_is_available(np))
 			continue;
 		found++;
+		/* The inherited console may exclude the notch (J713 64, J514S 74 lines). */
 		if (of_property_read_u32(np, "width", &width) ||
 		    of_property_read_u32(np, "height", &height) ||
 		    of_property_read_u32(np, "stride", &stride) ||
-		    width != 2560 || (height != 1600 && height != 1664) || stride != 10240) {
+		    width != dcp_m4_pf->panel_width || stride != dcp_m4_pf->boot_stride ||
+		    (height != dcp_m4_pf->panel_height &&
+		     height != dcp_m4_pf->panel_height - (dcp_m4_pf->fw14 ? 74 : 64))) {
 			of_node_put(np);
 			return -EINVAL;
 		}
@@ -466,7 +488,7 @@ static ssize_t startup_store(struct device *dev, struct device_attribute *attr,
 	r->dcp = dcp;
 	init_completion(&r->received);
 	INIT_WORK(&r->idle, dcp_m4_runtime_idle);
-	r->wq = alloc_ordered_workqueue("j713-dcp-callbacks", WQ_MEM_RECLAIM);
+	r->wq = alloc_ordered_workqueue("dcp-m4-callbacks", WQ_MEM_RECLAIM);
 	if (!r->wq) {
 		ret = -ENOMEM;
 		goto failed;
@@ -474,12 +496,12 @@ static ssize_t startup_store(struct device *dev, struct device_attribute *attr,
 	spin_lock_irqsave(&dcp->state_lock, flags);
 	smp_store_release(&dcp->runtime, r);
 	spin_unlock_irqrestore(&dcp->state_lock, flags);
-	/* Fresh session only: the qualified full startup order is A401 then A457. */
+	/* Fresh session only: A401, then the first client open (J713 A457, J514S A455). */
 	ret = dcp_m4_runtime_call(r, 401, false, NULL, 0, output, sizeof(output));
 	if (!ret && get_unaligned_le32(output) != 1)
 		ret = -EPROTO;
 	if (!ret)
-		ret = dcp_m4_runtime_call(r, 457, false, NULL, 0, NULL, 0);
+		ret = dcp_m4_runtime_call(r, dcp_m4_pf->open_method, false, NULL, 0, NULL, 0);
 	/* A reply may be followed by property callbacks queued for this owner. */
 	if (!ret)
 		ret = dcp_m4_runtime_drain(r, 256);
@@ -543,7 +565,7 @@ static ssize_t pmp_vote_show(struct device *dev, struct device_attribute *attr, 
 	int error = READ_ONCE(dcp->error);
 
 	if (!error && done)
-		error = apple_pmp_j713_display_check(dev);
+		error = dcp_m4_pmp_check(dev);
 	return sysfs_emit(buf, "attempted=%u complete=%u error=%d run=%u\n",
 		r && READ_ONCE(r->power_started), done && !error, error,
 		!!(readl(dcp->coproc + 0x44) & BIT(4)));
@@ -565,9 +587,9 @@ static ssize_t pmp_vote_store(struct device *dev, struct device_attribute *attr,
 	r->power_started = true;
 	ret = dcp_m4_runtime_health(r);
 	if (!ret)
-		ret = apple_pmp_j713_display_get(dev);
+		ret = dcp_m4_pmp_get(dev);
 	if (!ret)
-		ret = apple_pmp_j713_display_check(dev);
+		ret = dcp_m4_pmp_check(dev);
 	if (!ret)
 		ret = dcp_m4_runtime_health(r);
 	if (ret)
@@ -628,7 +650,7 @@ static ssize_t scanout_probe_store(struct device *dev, struct device_attribute *
 		.backing_size = (u64)DCP_M4_PANEL_WIDTH * 4 * DCP_M4_PANEL_HEIGHT,
 		.format = DCP_M4_XRGB8888,
 	};
-	r->scanout_cpu = apple_dart_dcp_scanout_alloc(&dcp->scanout->dev,
+	r->scanout_cpu = dcp_m4_scanout_alloc(&dcp->scanout->dev,
 						    r->scanout_frame.backing_size, &dva);
 	if (IS_ERR(r->scanout_cpu)) {
 		ret = PTR_ERR(r->scanout_cpu);

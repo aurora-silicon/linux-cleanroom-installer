@@ -6,6 +6,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
+#include "dcp-m4-profile.h"
 
 #define DCP_M4_MEMORY_OBJECTS 64
 #define DCP_M4_MEMORY_LIMIT (64U << 20)
@@ -40,14 +41,18 @@ static inline int dcp_m4_memory_callback(struct dcp_m4_memory *memory,
 	const u8 *in = input;
 	u8 *out = output;
 	u64 size, phys = 0, dva = 0, id;
+	u32 align;
 	int ret = -EINVAL;
 
 	if (memory->failed)
 		return -EIO;
 	if (method == 451) {
 		size = get_unaligned_le64(in + 4);
+		align = get_unaligned_le32(in + 12);
+		/* J713 asks for exactly 4; firmware 14.7 any power of two <= 16 KiB. */
 		if (get_unaligned_le32(in) != 0x703 || !size || size > DCP_M4_MEMORY_MAX ||
-		    get_unaligned_le32(in + 12) != 4 || in[16] || in[17] || in[18])
+		    (dcp_m4_pf->fw14 ? !align || (align & (align - 1)) || align > DCP_M4_MEMORY_PAGE :
+				      align != 4) || in[16] || in[17] || in[18])
 			goto failed;
 		/* Byte 19 is padding, observed nonzero in otherwise valid requests. */
 		size = (size + DCP_M4_MEMORY_PAGE - 1) & ~(u64)(DCP_M4_MEMORY_PAGE - 1);
@@ -103,6 +108,9 @@ static inline int dcp_m4_memory_callback(struct dcp_m4_memory *memory,
 		put_unaligned_le32(1, out);
 		return 0;
 	}
+	/* Firmware 14.7 may repeat D201 for an already mapped live ID. */
+	if (object->mapped && dcp_m4_pf->fw14)
+		goto reply;
 	if (object->mapped)
 		goto failed;
 	if (!ops->map) {
@@ -113,6 +121,14 @@ static inline int dcp_m4_memory_callback(struct dcp_m4_memory *memory,
 	if (ret)
 		goto failed;
 	object->mapped = true;
+reply:
+	if (dcp_m4_pf->fw14) {
+		/* 12/20: AP vaddr 0 at 0, mapped DVA at 8, status 0 at 16. */
+		put_unaligned_le64(0, out);
+		put_unaligned_le64(object->dva, out + 8);
+		put_unaligned_le32(0, out + 16);
+		return 0;
+	}
 	put_unaligned_le32(id, out);
 	put_unaligned_le64(object->dva, out + 4);
 	put_unaligned_le32(0, out + 12);
