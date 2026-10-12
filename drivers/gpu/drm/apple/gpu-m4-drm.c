@@ -13,6 +13,7 @@
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
+#include <linux/soc/apple/pmp-display.h>
 #include <asm/arch_timer.h>
 #include <asm/cacheflush.h>
 #include <drm/drm_drv.h>
@@ -1769,9 +1770,11 @@ static bool gpu_m4_drm_params_j713(const struct drm_asahi_params_global *params)
 }
 
 /*
- * The exact J514S G15S (M3 Pro, B1) compute profile: 2 x 10 logical cores
- * with 14 enabled, legacy HAL, 0x2ffffff8000 user VA end. Features are a
- * subset of VM_STATUS | SCHEDULED_QUEUES | COMPUTE_WIDE_VISIBILITY.
+ * The T6030 G15S (M3 Pro, B1) compute profile, J514S or J516S: 2 x 10 logical
+ * cores with a per-machine (binned) non-empty enabled set in each cluster, a
+ * per-machine top frequency, legacy HAL, 0x2ffffff8000 user VA end. Features
+ * are a subset of VM_STATUS | SCHEDULED_QUEUES | COMPUTE_WIDE_VISIBILITY |
+ * FRAGMENT_DEPENDENCY.
  */
 #define GPU_M4_DRM_J514S_FEATURES (DRM_ASAHI_FEATURE_VM_STATUS | \
 	DRM_ASAHI_FEATURE_SCHEDULED_QUEUES | DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY | \
@@ -1779,16 +1782,16 @@ static bool gpu_m4_drm_params_j713(const struct drm_asahi_params_global *params)
 
 static bool gpu_m4_drm_params_j514s(const struct drm_asahi_params_global *params)
 {
-	if (!of_machine_is_compatible("apple,j514s") ||
-	    !of_machine_is_compatible("apple,t6030") ||
+	if (!apple_pmp_t6030_board() ||
 	    params->gpu_generation != 15 || params->gpu_variant != 'S' ||
 	    params->gpu_revision != 0x11 || params->chip_id != 0x6030 ||
 	    params->num_dies != 1 || params->num_clusters_total != 2 ||
 	    params->num_cores_per_cluster != 10 ||
-	    params->core_masks[0] != 0x1fc || params->core_masks[1] != 0x1bd ||
+	    !params->core_masks[0] || (params->core_masks[0] & ~0x3ffULL) ||
+	    !params->core_masks[1] || (params->core_masks[1] & ~0x3ffULL) ||
 	    params->usc_generation != 3 ||
 	    params->gpu_hal_generation != DRM_ASAHI_GPU_HAL_LEGACY ||
-	    params->max_frequency_khz != 1380000 ||
+	    !params->max_frequency_khz || params->max_frequency_khz > 3000000 ||
 	    params->vm_start != 0x4000 || params->vm_end != 0x2ffffff8000ULL ||
 	    params->vm_kernel_min_size != 0x20000000 ||
 	    params->max_commands_per_submission != 64 || params->max_attachments != 16 ||

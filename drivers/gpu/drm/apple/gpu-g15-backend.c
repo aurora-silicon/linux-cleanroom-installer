@@ -185,8 +185,7 @@ static const struct drm_asahi_params_global g15_params = {
 	.num_dies = 1,
 	.num_clusters_total = 2,
 	.num_cores_per_cluster = 10,
-	.max_frequency_khz = 1380000,
-	.core_masks = { 0x1fc, 0x1bd },
+	/* core_masks and max_frequency_khz: per machine, set at registration. */
 	.vm_start = 0x4000,
 	.vm_end = 0x2ffffff8000ULL,
 	.vm_kernel_min_size = 0x20000000,
@@ -3453,6 +3452,10 @@ int g15_backend_start(struct g15_gpu *gpu)
 		 G15_FW_BASE, be->fw_next, be->g.slot[0].work.va, be->g.slot[0].work.gva,
 		 be->g.pools[0].gva, be->g.freelist.gva, be->g.pool_table.gva);
 	params = g15_params;
+	/* This machine's binning and top DVFS state, as stage 1 measured them. */
+	params.core_masks[0] = gpu->core_masks[0];
+	params.core_masks[1] = gpu->core_masks[1];
+	params.max_frequency_khz = gpu->max_khz;
 	if (early_tiling)
 		params.features |= DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY;
 	drm = gpu_m4_drm_create_private(gpu->dev, be, &params, &g15_drm_ops, 0);

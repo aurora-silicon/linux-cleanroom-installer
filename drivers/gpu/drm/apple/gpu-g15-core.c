@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * J514S (T6030, G15S) GPU firmware stage 1: cold to READY.
+ * T6030 (M3 Pro: J514S, J516S) G15S GPU firmware stage 1: cold to READY.
  *
  * Cleanroom implementation of the written stage-1 contract: power admission
  * and the PMP AGX vote, RTKit, the running UAT/PPL handoff, the 49-object
@@ -11,6 +11,7 @@
  * through the "start" attribute under a watchdog guard; everything
  * firmware-visible is retained until reboot.
  */
+#include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
@@ -35,22 +36,57 @@
 
 static bool enable;
 module_param(enable, bool, 0400);
-MODULE_PARM_DESC(enable, "Permit the watchdog-guarded J514S GPU firmware start");
+MODULE_PARM_DESC(enable, "Permit the watchdog-guarded T6030 GPU firmware start");
 
-/* Retained J514S profile: 174 recorded boots, iBoot-10151.140.19.700.2. */
-static const struct { u64 pa, size; } g15_profile[G15_REGIONS] = {
-	[G15_TTBS] = { 0x1047ffb8000ULL, 0x4000 },
-	[G15_TABLES] = { 0x1047ff78000ULL, 0x40000 },
-	[G15_HANDOFF] = { 0x1047ff70000ULL, 0x4000 },
-	[G15_SHARED_L2] = { 0x1047ff74000ULL, 0x4000 },
-	[G15_TEXT] = { 0x1000090c000ULL, 0x5c000 },
-	[G15_DATA] = { 0x10001950000ULL, 0x114000 },
+/*
+ * GPU firmware builds whose ABI this driver implements. The canonical object
+ * VAs (gpu-g15.h), the initdata graph, the board-image templates and the
+ * stage-2 work images all belong to one build, so the build is identified
+ * before anything is written: by its loaded TEXT (normalized: the 8 entropy
+ * bytes after the GKTS marker zeroed) and its segment sizes. An unknown build
+ * is refused with its measured identity, to be qualified and added here.
+ */
+struct g15_fw_build {
+	const char *name;
+	u64 text_size, data_size;
+	u32 marker;		/* GKTS marker offset in TEXT */
+	u8 text_sha256[32];
 };
 
-static const u8 g15_text_sha256[32] = {
-	0x11, 0xe4, 0x9f, 0x75, 0x0b, 0x67, 0x1a, 0x2b, 0x13, 0xd0, 0x92, 0xdb, 0x1c, 0xbc, 0xa3, 0xa8,
-	0x77, 0x55, 0x86, 0xd6, 0xb1, 0xe3, 0xaa, 0xe8, 0xa6, 0xa4, 0x64, 0xa7, 0x80, 0x02, 0x93, 0xd5,
+static const struct g15_fw_build g15_fw_builds[] = {
+	{
+		.name = "macOS 14.7-14.8.x stub firmware (iBoot-10151.140.19.700.2)",
+		.text_size = 0x5c000, .data_size = 0x114000, .marker = 0x58e88,
+		.text_sha256 = {
+		0x11, 0xe4, 0x9f, 0x75, 0x0b, 0x67, 0x1a, 0x2b, 0x13, 0xd0, 0x92, 0xdb, 0x1c, 0xbc, 0xa3, 0xa8,
+		0x77, 0x55, 0x86, 0xd6, 0xb1, 0xe3, 0xaa, 0xe8, 0xa6, 0xa4, 0x64, 0xa7, 0x80, 0x02, 0x93, 0xd5,
+		},
+	},
 };
+
+/*
+ * UAT handoff region sizes of that firmware ABI (TTBAT page, TTBAT tables,
+ * PPL handoff page, shared L2 page); the addresses come from the ADT.
+ */
+static const u64 g15_region_size[G15_TEXT] = {
+	[G15_TTBS] = 0x4000, [G15_TABLES] = 0x40000,
+	[G15_HANDOFF] = 0x4000, [G15_SHARED_L2] = 0x4000,
+};
+
+/*
+ * G15S hardware this ABI is qualified on: the SGX identity and layout words.
+ * The enabled-core mask is per machine (binning) and is not part of this.
+ */
+static const struct {
+	u32 version, counts;
+	const char *name;
+} g15_hw_ids[] = {
+	{ 0x07031100, 0x00110209, "T6030 G15S rev 0x11" },
+};
+
+/* T6030 G15S: two clusters of ten logical cores. */
+#define G15_CLUSTER_BITS	10
+#define G15_CLUSTER_MASK	GENMASK(G15_CLUSTER_BITS - 1, 0)
 
 /* HardwareDataB IOMapping records (contract 4.6). */
 static const struct {
@@ -162,6 +198,69 @@ static int g15_adt_u64(const struct g15_adt *adt, size_t node, const char *name,
 	return 0;
 }
 
+static int g15_adt_u32(const struct g15_adt *adt, size_t node, const char *name, u32 *v)
+{
+	u32 len;
+	const u8 *p = g15_adt_prop(adt, node, name, &len);
+
+	if (!p || len != 4)
+		return -EINVAL;
+	*v = get_unaligned_le32(p);
+	return 0;
+}
+
+/*
+ * This machine's GPU performance states (per-chip binning): ADT sgx
+ * perf-states and perf-states-sram, (frequency Hz, millivolt) pairs. The
+ * board-image layout implements one table shape; another shape is refused.
+ * Values the qualified layout takes as given are compared, not trusted.
+ */
+static int g15_collect_perf(struct g15_gpu *gpu, const struct g15_adt *adt, size_t sgx)
+{
+	static const struct { const char *name; u32 value; } fixed[] = {
+		{ "perf-state-count", G15_ADT_PERF_STATES },
+		{ "gpu-num-perf-states", G15_ADT_PERF_STATES - 1 },
+		{ "perf-state-table-count", 1 },
+		{ "gpu-power-sample-period", 8 },
+		{ "gpu-pwr-sample-period-aic-clks", 200000 },
+	};
+	const u8 *core, *sram;
+	u32 len, sram_len, v;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(fixed); i++) {
+		if (g15_adt_u32(adt, sgx, fixed[i].name, &v) || v != fixed[i].value) {
+			dev_err(gpu->dev, "ADT sgx %s is not the supported %u\n",
+				fixed[i].name, fixed[i].value);
+			return -EINVAL;
+		}
+	}
+	core = g15_adt_prop(adt, sgx, "perf-states", &len);
+	sram = g15_adt_prop(adt, sgx, "perf-states-sram", &sram_len);
+	if (!core || !sram || len != 8 * G15_ADT_PERF_STATES || sram_len != len) {
+		dev_err(gpu->dev, "ADT perf-state tables missing or of another shape\n");
+		return -EINVAL;
+	}
+	for (unsigned int i = 0; i < G15_ADT_PERF_STATES; i++) {
+		u32 hz = get_unaligned_le32(core + 8 * i);
+
+		if (get_unaligned_le32(sram + 8 * i) != hz || hz % 1000000 ||
+		    hz > 3000000000U || (!i != !hz)) {
+			dev_err(gpu->dev, "ADT perf-state %u (%u Hz) not usable\n", i, hz);
+			return -EINVAL;
+		}
+		gpu->perf_mhz[i] = hz / 1000000;
+		gpu->perf_mv[i] = get_unaligned_le32(core + 8 * i + 4);
+		gpu->sram_mv[i] = get_unaligned_le32(sram + 8 * i + 4);
+		if (gpu->perf_mv[i] < 100 || gpu->perf_mv[i] > 1100 ||
+		    gpu->sram_mv[i] < 100 || gpu->sram_mv[i] > 1100) {
+			dev_err(gpu->dev, "ADT perf-state %u voltage %u/%u mV out of range\n",
+				i, gpu->perf_mv[i], gpu->sram_mv[i]);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 /* Read-only collector: the bootloader's phram "adt" export, parsed privately. */
 static int g15_collect_regions(struct g15_gpu *gpu)
 {
@@ -171,7 +270,8 @@ static int g15_collect_regions(struct g15_gpu *gpu)
 	struct device_node *rmem, *np;
 	struct g15_adt adt = {};
 	struct resource res;
-	size_t armio, sgx, asc, nub;
+	size_t armio, sgx, asc, nub, chosen;
+	u64 dram_base, dram_size;
 	const u8 *ranges, *nub_ranges, *p;
 	u32 len, nub_len;
 	void *map;
@@ -253,34 +353,58 @@ static int g15_collect_regions(struct g15_gpu *gpu)
 		else
 			gpu->text_va = va;
 	}
-	if (gpu->text_va != G15_UPPER || gpu->data_va != G15_UPPER + 0x5c000)
+	/* Firmware ABI: TEXT at the base of the upper half, DATA right after it. */
+	if (gpu->text_va != G15_UPPER ||
+	    gpu->data_va != gpu->text_va + resource_size(&gpu->region[G15_TEXT]))
 		goto out;
-	/* Explicit J514S profile admission plus Linux-RAM exclusion. */
+	chosen = g15_adt_child(&adt, 0, "chosen");
+	if (!chosen || g15_adt_u64(&adt, chosen, "dram-base", &dram_base) ||
+	    g15_adt_u64(&adt, chosen, "dram-size", &dram_size) || !dram_size ||
+	    dram_base + dram_size < dram_base) {
+		dev_err(gpu->dev, "ADT DRAM bounds unreadable\n");
+		goto out;
+	}
+	/* Structural admission: the ADT says where; this checks it is sane. */
 	for (unsigned int i = 0; i < G15_REGIONS; i++) {
 		struct resource *r = &gpu->region[i];
+		u64 size = resource_size(r);
 
-		if (r->start != g15_profile[i].pa || resource_size(r) != g15_profile[i].size ||
-		    region_intersects(r->start, resource_size(r), IORESOURCE_SYSTEM_RAM,
+		if (!size || ((r->start | size) & (G15_PAGE - 1)) ||
+		    r->end > (G15_PA_MASK | (G15_PAGE - 1)) ||
+		    r->start < dram_base || r->end > dram_base + dram_size - 1 ||
+		    (i < G15_TEXT && size != g15_region_size[i]) ||
+		    region_intersects(r->start, size, IORESOURCE_SYSTEM_RAM,
 				      IORES_DESC_NONE) != REGION_DISJOINT) {
-			dev_err(gpu->dev, "ADT region %u %pR outside the J514S profile\n", i, r);
+			dev_err(gpu->dev, "ADT GPU region %u %pR not admissible\n", i, r);
 			goto out;
 		}
+		for (unsigned int j = 0; j < i; j++) {
+			if (resource_overlaps(r, &gpu->region[j])) {
+				dev_err(gpu->dev, "ADT GPU regions %u and %u overlap\n", j, i);
+				goto out;
+			}
+		}
 	}
-	ret = 0;
+	ret = g15_collect_perf(gpu, &adt, sgx);
 out:
 	kvfree(copy);
 	return ret;
 }
 
-/* Normalized TEXT identity: GKTS marker, private copy with entropy zeroed. */
+/*
+ * Normalized TEXT identity: find the single GKTS marker, zero the 8 entropy
+ * bytes after it in a private copy, hash, and look the build up.
+ */
 static int g15_text_identity(struct g15_gpu *gpu)
 {
 	static const u8 marker[8] = { 0x47, 0x4b, 0x54, 0x53, 0x08, 0, 0, 0 };
 	size_t size = resource_size(&gpu->region[G15_TEXT]);
+	u64 data_size = resource_size(&gpu->region[G15_DATA]);
 	u8 digest[SHA256_DIGEST_SIZE];
+	size_t at = 0, found = 0;
 	void *map;
 	u8 *copy;
-	int ret = 0;
+	int ret = -EINVAL;
 
 	map = memremap(gpu->region[G15_TEXT].start, size, MEMREMAP_WB);
 	if (!map)
@@ -291,14 +415,35 @@ static int g15_text_identity(struct g15_gpu *gpu)
 	memunmap(map);
 	if (!copy)
 		return -ENOMEM;
-	if (memcmp(copy + 0x58e88, marker, 8)) {
-		ret = -EINVAL;
-	} else {
-		memset(copy + 0x58e90, 0, 8);
-		sha256(copy, size, digest);
-		if (memcmp(digest, g15_text_sha256, sizeof(digest)))
-			ret = -EINVAL;
+	for (size_t off = 0; off + 16 <= size; off += 8) {
+		if (!memcmp(copy + off, marker, sizeof(marker))) {
+			at = off;
+			found++;
+		}
 	}
+	if (found != 1) {
+		dev_err(gpu->dev, "GPU firmware TEXT has %zu GKTS markers, need one\n", found);
+		goto out;
+	}
+	memset(copy + at + 8, 0, 8);
+	sha256(copy, size, digest);
+	for (unsigned int i = 0; i < ARRAY_SIZE(g15_fw_builds); i++) {
+		const struct g15_fw_build *b = &g15_fw_builds[i];
+
+		if (b->text_size == size && b->data_size == data_size && b->marker == at &&
+		    !memcmp(b->text_sha256, digest, sizeof(digest))) {
+			gpu->fw = b;
+			dev_info(gpu->dev, "GPU firmware build: %s\n", b->name);
+			ret = 0;
+			goto out;
+		}
+	}
+	dev_err(gpu->dev,
+		"unsupported GPU firmware build: TEXT %#zx DATA %#llx GKTS %#zx sha256 %*phN\n",
+		size, data_size, at, (int)sizeof(digest), digest);
+	for (unsigned int i = 0; i < ARRAY_SIZE(g15_fw_builds); i++)
+		dev_err(gpu->dev, "supported: %s\n", g15_fw_builds[i].name);
+out:
 	vfree(copy);
 	return ret;
 }
@@ -320,6 +465,46 @@ static int g15_image(void *dst, size_t size, const struct g15_image_line *lines,
 	}
 	sha256(dst, size, digest);
 	return memcmp(digest, sha, sizeof(digest)) ? -EINVAL : 0;
+}
+
+/*
+ * The machine-specific part of HardwareData, rebuilt from this machine's ADT
+ * performance states over the template: the firmware's two DVFS tables take
+ * the three shared low states, then per voltage level the higher (table A)
+ * and the lower (table B) frequency of the ADT pair. Table A carries the core
+ * and SRAM voltages (eight identical lanes per state) and its top frequency.
+ * With the reference machine's ADT this reproduces the template exactly.
+ */
+#define G15_DVFS_STATES	9
+static const u8 g15_dvfs_a[G15_DVFS_STATES] = { 0, 1, 2, 3, 5, 7, 9, 11, 13 };
+static const u8 g15_dvfs_b[G15_DVFS_STATES] = { 0, 1, 2, 3, 4, 6, 8, 10, 12 };
+
+static int g15_board_from_adt(struct g15_gpu *gpu, u8 *hw)
+{
+	for (unsigned int s = 1; s < G15_DVFS_STATES; s++) {
+		u8 a = g15_dvfs_a[s], pa = g15_dvfs_a[s - 1];
+		u8 b = g15_dvfs_b[s], pb = g15_dvfs_b[s - 1];
+
+		if (gpu->perf_mhz[a] <= gpu->perf_mhz[pa] || gpu->perf_mhz[b] <= gpu->perf_mhz[pb] ||
+		    gpu->perf_mv[a] < gpu->perf_mv[pa] || gpu->sram_mv[a] < gpu->sram_mv[pa]) {
+			dev_err(gpu->dev, "ADT perf-states do not form ordered DVFS tables\n");
+			return -EINVAL;
+		}
+	}
+	for (unsigned int s = 0; s < G15_DVFS_STATES; s++) {
+		u8 a = g15_dvfs_a[s], b = g15_dvfs_b[s];
+
+		put_unaligned_le32(gpu->perf_mhz[a], hw + 0xb5c + 4 * s);
+		put_unaligned_le32(gpu->perf_mhz[b], hw + 0xf9c + 4 * s);
+		put_unaligned_le32(gpu->perf_mhz[b], hw + 0x1350 + 4 * s);
+		for (unsigned int k = 0; k < 8; k++) {
+			put_unaligned_le32(gpu->perf_mv[a], hw + 0xb9c + 0x20 * s + 4 * k);
+			put_unaligned_le32(gpu->sram_mv[a], hw + 0xd9c + 0x20 * s + 4 * k);
+		}
+	}
+	put_unaligned_le32(gpu->perf_mhz[g15_dvfs_a[G15_DVFS_STATES - 1]], hw + 0x4dc4);
+	gpu->max_khz = gpu->perf_mhz[g15_dvfs_a[G15_DVFS_STATES - 1]] * 1000;
+	return 0;
 }
 
 /* ------------------------------------------------------ host window --- */
@@ -765,13 +950,26 @@ static int g15_build(struct g15_gpu *gpu)
 	      g15_image(power, G15_POWER_SIZE, g15_power_lines,
 			ARRAY_SIZE(g15_power_lines), g15_power_sha256);
 	if (ret) {
-		dev_err(gpu->dev, "board data image hash mismatch\n");
+		dev_err(gpu->dev, "board data template hash mismatch\n");
 		goto out;
 	}
 	ret = -EINVAL;
-	if (get_unaligned_le32(hw + 0xa38) != 1 || get_unaligned_le32(hw + 0xb58) != 8 ||
+	if (get_unaligned_le32(hw + 0xa38) != 1 ||
+	    get_unaligned_le32(hw + 0xb58) != G15_DVFS_STATES - 1 ||
 	    get_unaligned_le32(glob + 0x980) != 10)
 		goto out;
+	ret = g15_board_from_adt(gpu, hw);
+	if (ret)
+		goto out;
+	{
+		u8 digest[SHA256_DIGEST_SIZE];
+
+		sha256(hw, G15_HARDWARE_SIZE, digest);
+		dev_info(gpu->dev, "board data: ADT performance states, %u MHz top%s\n",
+			 gpu->max_khz / 1000, memcmp(digest, g15_hardware_sha256, sizeof(digest)) ?
+			 " (differs from the reference machine)" : " (reference machine)");
+	}
+	ret = -EINVAL;
 	put_unaligned_le64(gpu->region[G15_TTBS].start, hw + 0xb44);
 	for (unsigned int i = 0; i < ARRAY_SIZE(g15_iomaps); i++)
 		put_unaligned_le64(g15_iomaps[i].va + g15_iomaps[i].delta,
@@ -938,8 +1136,25 @@ static int g15_start(struct g15_gpu *gpu)
 	gpu->cores = readl(gpu->sgx_core + 0x1500);
 	dev_info(gpu->dev, "M3 G15S: power acknowledged, version=%#x counts=%#x core-mask=%#x\n",
 		 gpu->version, gpu->counts, gpu->cores);
-	if (gpu->version != 0x07031100 || gpu->counts != 0x00110209 || gpu->cores != 0x6f5fc)
+	ret = -EPROTO;
+	for (unsigned int i = 0; i < ARRAY_SIZE(g15_hw_ids); i++)
+		if (gpu->version == g15_hw_ids[i].version && gpu->counts == g15_hw_ids[i].counts)
+			ret = 0;
+	if (ret) {
+		dev_err(gpu->dev, "unsupported G15S hardware: version %#x counts %#x\n",
+			gpu->version, gpu->counts);
+		return ret;
+	}
+	/* Binning: any non-empty enabled set in each of the two clusters. */
+	gpu->core_masks[0] = gpu->cores & G15_CLUSTER_MASK;
+	gpu->core_masks[1] = (gpu->cores >> G15_CLUSTER_BITS) & G15_CLUSTER_MASK;
+	if (!gpu->core_masks[0] || !gpu->core_masks[1] ||
+	    (gpu->cores >> (2 * G15_CLUSTER_BITS))) {
+		dev_err(gpu->dev, "implausible G15S core mask %#x\n", gpu->cores);
 		return -EPROTO;
+	}
+	dev_info(gpu->dev, "M3 G15S: %u + %u cores enabled\n",
+		 hweight32(gpu->core_masks[0]), hweight32(gpu->core_masks[1]));
 	writel(0x70001, gpu->sgx_open);
 	/* Cold only: ASC RUN clear and an all-zero TTBAT before ownership. */
 	gpu->control = readl(gpu->asc + 0x44);
@@ -1112,7 +1327,7 @@ static int g15_probe(struct platform_device *pdev)
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
 	__module_get(THIS_MODULE);
-	dev_info(dev, "J514S G15S admitted, ASC=%#x; write start=1 under a watchdog\n",
+	dev_info(dev, "T6030 G15S admitted, ASC=%#x; write start=1 under a watchdog\n",
 		 readl(gpu->asc + 0x44));
 	return 0;
 }
@@ -1135,11 +1350,10 @@ static struct platform_driver g15_driver = {
 
 static int __init g15_init(void)
 {
-	if (!enable || !of_machine_is_compatible("apple,j514s") ||
-	    !of_machine_is_compatible("apple,t6030"))
+	if (!enable || !apple_pmp_t6030_board())
 		return -ENODEV;
 	return platform_driver_register(&g15_driver);
 }
 module_init(g15_init);
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_DESCRIPTION("J514S G15S GPU firmware stage 1 (cleanroom)");
+MODULE_DESCRIPTION("T6030 (M3 Pro) G15S GPU owner (cleanroom)");

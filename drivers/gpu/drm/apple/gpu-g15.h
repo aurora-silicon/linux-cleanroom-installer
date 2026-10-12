@@ -70,6 +70,11 @@ struct g15_page {
 	dma_addr_t pa;
 };
 
+/* ADT sgx perf-state table shape the board-image layout implements. */
+#define G15_ADT_PERF_STATES	14
+
+struct g15_fw_build;
+
 #define G15_MAX_PAGES	2048
 #define G15_MAX_L3	128
 
@@ -80,6 +85,12 @@ struct g15_gpu {
 	void __iomem *ttbs, *tables, *handoff, *shared_l2;
 	struct resource region[G15_REGIONS];
 	u64 text_va, data_va;
+	const struct g15_fw_build *fw;	/* identified firmware build (ABI) */
+	/* This machine's ADT performance states (MHz, core and SRAM mV). */
+	u32 perf_mhz[G15_ADT_PERF_STATES], perf_mv[G15_ADT_PERF_STATES];
+	u32 sram_mv[G15_ADT_PERF_STATES];
+	u32 max_khz;			/* highest firmware DVFS state */
+	u32 core_masks[2];		/* per-cluster enabled cores (10 bits each) */
 	struct apple_rtkit *rtkit;
 	void __iomem *crash;
 	u64 crash_pa;
