@@ -91,3 +91,16 @@ config DRM_APPLE_KUNIT_TEST
 	  larger rings, as well as malformed ring size combinations.
 	  This option is intended for developer test kernels.
 	  Also test the Type-C modeset, hotplug and service ownership state.
+
+config DRM_APPLE_G15
+	tristate "J514S (M3 Pro, G15S) GPU firmware and compute"
+	depends on ARM64 && OF && APPLE_RTKIT && APPLE_PMP
+	depends on DRM_APPLE_M4_GPU
+	select CRYPTO_LIB_SHA256
+	help
+	  Cleanroom bring-up of the J514S G15S GPU firmware to READY:
+	  power, PMP AGX vote, RTKit, running UAT handoff and initdata,
+	  then the compute and TA/3D render backend behind the shared
+	  Asahi-UAPI render-node frontend. Admits only the retained J514S
+	  firmware profile (region layout and firmware hash).
+	  Inert unless loaded with enable=1; started explicitly.
