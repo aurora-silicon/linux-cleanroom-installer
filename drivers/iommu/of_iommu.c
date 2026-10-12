@@ -237,39 +237,46 @@ void of_iommu_get_resv_regions(struct device *dev, struct list_head *list)
 		end = maps + size / sizeof(__be32);
 
 		while (maps < end) {
+			int prot = IOMMU_READ | IOMMU_WRITE;
+			struct iommu_resv_region *region;
+			enum iommu_resv_type type;
 			struct device_node *np;
-			u32 phandle;
+			phys_addr_t iova;
+			size_t length;
+			bool mine;
 
-			phandle = be32_to_cpup(maps++);
-			np = of_find_node_by_phandle(phandle);
-
-			if (np == dev->of_node) {
-				int prot = IOMMU_READ | IOMMU_WRITE;
-				struct iommu_resv_region *region;
-				enum iommu_resv_type type;
-				phys_addr_t iova;
-				size_t length;
-
-				if (of_dma_is_coherent(dev->of_node))
-					prot |= IOMMU_CACHE;
-
-				maps = of_translate_dma_region(np, maps, &iova, &length);
-				if (length == 0) {
-					dev_warn(dev, "Cannot reserve IOVA region of 0 size\n");
-					continue;
-				}
-				type = iommu_resv_region_get_type(dev, &phys, iova, length);
-
-				if (type == IOMMU_RESV_TRANSLATED)
-					region = iommu_alloc_resv_region_tr(phys.start, iova, length, prot, type,
-								    GFP_KERNEL);
-				else
-					region = iommu_alloc_resv_region(iova, length, prot, type,
-								 GFP_KERNEL);
-
-				if (region)
-					list_add_tail(&region->list, list);
+			np = of_find_node_by_phandle(be32_to_cpup(maps++));
+			/* The tuple's cell count comes from its owner; without
+			 * a valid owner the rest of the property can't be parsed. */
+			if (!np) {
+				dev_warn(dev, "invalid iommu-addresses owner in %pOF\n",
+					 it.node);
+				break;
 			}
+			/* Consume every tuple, including other owners' ones:
+			 * shared reservations list several devices. */
+			maps = of_translate_dma_region(np, maps, &iova, &length);
+			mine = np == dev->of_node;
+			of_node_put(np);
+			if (!mine)
+				continue;
+			if (length == 0) {
+				dev_warn(dev, "Cannot reserve IOVA region of 0 size\n");
+				continue;
+			}
+			if (of_dma_is_coherent(dev->of_node))
+				prot |= IOMMU_CACHE;
+			type = iommu_resv_region_get_type(dev, &phys, iova, length);
+
+			if (type == IOMMU_RESV_TRANSLATED)
+				region = iommu_alloc_resv_region_tr(phys.start, iova, length, prot, type,
+							    GFP_KERNEL);
+			else
+				region = iommu_alloc_resv_region(iova, length, prot, type,
+							 GFP_KERNEL);
+
+			if (region)
+				list_add_tail(&region->list, list);
 		}
 	}
 #endif
