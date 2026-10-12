@@ -1,0 +1,15 @@
+[Unit]
+Description=Aurora SEP services
+After=local-fs.target
+RequiresMountsFor=/var/lib
+# Activate Touch ID as soon as the driver is up.
+Wants=aurora-sep-ready.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecCondition=/bin/sh -c 'modinfo apple_sep >/dev/null 2>&1'
+ExecStart=/usr/local/sbin/aurora-sep-load
+
+[Install]
+WantedBy=multi-user.target

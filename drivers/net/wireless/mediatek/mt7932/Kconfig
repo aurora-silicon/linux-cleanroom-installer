@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MT7932_FULLMAC
+	tristate "Experimental J700 MT7932 fullmac wireless support"
+	depends on PCI && OF && ARM64 && IOMMU_DMA
+	depends on PCIE_APPLE_PIODMA_DIAG && CFG80211
+	select FW_LOADER
+	help
+	  Native support for the built-in J700 Wi-Fi endpoint: managed
+	  WPA2-CCMP station operation on 2.4 GHz and on the 5 GHz UNII-1, -2,
+	  -2e and -3 channels that the regulatory domain permits. Radar (DFS)
+	  channels are scanned passively but not joined.
+	  Requires original firmware, own calibration and original-derived
+	  country policy packages in addition to the cfg80211 regulatory database.
+	  The device is probed before the root filesystem is mounted, so say M
+	  unless those files are in the initramfs.
+	  Requires a trained retained PCI link and a translated SID1 DMA domain.
+	  Firmware, runtime DMA and calibration negotiation start automatically;
+	  cfg80211 and userspace select the country and network. No test boot
+	  parameters are required for ordinary station operation.
+	  Once DMA pointers are published the module is pinned until hardware
+	  reset. Normal unload is refused, including with active Bluetooth.
+	  A failed probe reset retains the binding and DMA; a successful checked
+	  reset retires ownership before releasing probe resources.
+	  Other MediaTek devices and other machines are not matched.
+
+config MT7932_RF_KUNIT_TEST
+	bool "KUnit tests for MT7932 terminal RF failure" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && MT7932_FULLMAC
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the driver's terminal calibration failure and startup
+	  admission paths with synthetic devices, without radio hardware.
+	  Check association wakeups, retained peer ownership and refusal to
+	  reopen RF admission after a terminal calibration error.

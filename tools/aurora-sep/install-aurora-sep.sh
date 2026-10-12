@@ -1,0 +1,881 @@
+#!/bin/bash
+# Install the aurora custom/sep kernel and Touch ID on an Omarchy Mac.
+#
+#   curl -fsSL https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh | bash
+#   ... | bash -s -- --read-only      install, but never let the driver write to the enclave
+#   ... | bash -s -- --uninstall      go back to the kernel this Mac had before
+#
+# Kernel: iconidentify/aurora-linux custom/sep (0cde04307749), aurora-silicon/linux aurora-wip plus the
+# Secure Enclave (Touch ID) driver, Thunderbolt (#8), the Apple video
+# decoder (#45), the M2 Max (t6021) profile and the consolidated Touch ID
+# series (aurora-silicon/linux#69: matching after a reboot on every profile,
+# M1 Pro J314s, j293 SPI mode, a scan in progress ended before sleep),
+# Thunderbolt displays on M1 and M1 Pro/Max by default, and two displays
+# through one dock on every M2 Pro/Max laptop (aurora-silicon/linux#8, with
+# #46, #50 and #64), and the MacBook Neo (J700) work from #40, #42,
+# #43, #54 and #55, including its Touch ID device tree.
+# 11.20 adds Touch ID on the MacBook Air M2 15" (J415, aurora-silicon/linux#152),
+# a retry from a fresh sensor registration when the first sensor patch fails at
+# boot, battery time estimates that read "no data" instead of 0 (#53), the
+# Omarchy boot logo in place of Tux, and aurora-wip through 3bb0a6104a11 (the
+# MacBook Neo video decoder, PCIe bring-up and radio drivers, inert elsewhere).
+# On a MacBook Neo the script keeps the Neo's own m1n1.
+# 11.21 adds Bluetooth recovery for the Broadcom PCIe controllers: a radio
+# wedged by an rfkill cycle under heavy traffic is reset on the next open, and
+# its calibration and address restored (aurora-silicon/linux#7).
+# 11.22 installs the VA-API bridge for the video decoder too, so players use
+# the hardware decoder instead of falling back to software, and
+# aurora-touchid-setup --help prints its usage instead of starting an enrolment.
+# The display manager waits (up to 30 s) for the Apple display driver, so a
+# late driver can't leave the built-in screen black, and reloading the Touch ID
+# driver on M1 is refused with "reboot to re-attach" instead of hanging.
+# 11.23 routes USB-C displays on the M2 Pro/Max MacBook Pros in the order the
+# compositor pairs them, so two monitors attached at boot each keep their own
+# modes, and describes the Touch ID sensor on every M2 Pro/Max MacBook Pro.
+# 11.24 adds Touch ID on the MacBook Pro 14"/16" M1 Max and the MacBook Air 13"
+# M2, untested on both. On those boards the script first keeps the boot.bin the
+# Mac booted with on the EFI partition and prints how to restore it from macOS.
+# 11.25 adds the in-tree Apple Neural Engine driver (aurora-silicon/linux#155),
+# switched on for the M1 Max and M2 Max only, and the read-only SEP diagnostics
+# under /sys/bus/platform/devices/*.sep/diag/. When omarchy-ane-dkms is
+# installed the script says so: its modules take precedence over this kernel's.
+# 11.25.1 (installer only, same packages): rebuilding m1n1's stage 2 now keeps
+# the rest of /etc/default/update-m1n1, so a MacBook Neo keeps its own M1N1=
+# and U_BOOT= instead of being rebuilt from an m1n1 that cannot boot it.
+# It replaces linux-asahi (or linux-aurora) as a pacman package,
+# so mkinitcpio and update-m1n1 run from their own hooks; on a GRUB Mac this
+# script regenerates grub.cfg and keeps the previous kernel as a fallback entry.
+#
+# Touch ID: libfprint with the Apple SEP driver, fprintd, the apple-sep
+# service, a sleep hook that stops fprintd before suspend (so a lock screen
+# waiting for a finger at lid close can't leave the sensor claimed), and
+# this Mac's own sensor calibration. After the reboot, run
+# aurora-touchid-setup to enrol a finger and use it for sudo and the lock screen.
+#
+# m1n1: m1n1-aurora builds AsahiLinux/m1n1 main (3e354a24), which knows the
+# macOS 26.5 to 27.0 firmware the MacBook Neo ships with, plus three patches:
+# the SEP warm-registration guard and preboot-UUID forwarding from
+# aurora-silicon/m1n1, and the usb4-N-pcie-adapter alias fallback
+# (aurora-silicon/m1n1#4).
+# On M2 and later the platform hands Linux an already-running Secure
+# Enclave, and the driver attaches to it with one registration that can only be
+# sent once per boot. Stock m1n1 asks the enclave for randomness on the way up,
+# spending that attempt before Linux sees it. aurora-silicon/m1n1 has a guard
+# that skips the request when the enclave is already running. On M1, where the
+# enclave is still in its boot ROM, the guard never fires.
+#
+# Testing this build? Run with --agent-prompt for the test plan and the format
+# to report results in.
+set -euo pipefail
+
+# The kernel package version and the release tag move independently: a release
+# that only changes m1n1 reuses the previous kernel packages unchanged.
+VERSION=7.1.12.aurora2-11.25
+TAG=sep-7.1.12.aurora2-11.25.1
+# Packages are fetched from this script's own tag, never from "latest": the
+# checksums below belong to this release and nothing else.
+RELEASE_URL=https://github.com/iconidentify/aurora-linux/releases/download/$TAG
+RELEASES_API=https://api.github.com/repos/iconidentify/aurora-linux/releases
+# Where to always get the current script, whatever this copy turns out to be.
+LATEST_URL=https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh
+PACKAGES=(
+  "linux-aurora-$VERSION-aarch64.pkg.tar.zst f8b78b21f4031113a06c7f7fc7cbe1d72a23ba803adfcfc838ee3e927d3d0c85"
+  "linux-aurora-headers-$VERSION-aarch64.pkg.tar.zst a1a1524ccc35b4b4c82e4a01fda90ae13c43719ecb8dfc8108fa9a008d9500e6"
+  "libfprint-1.94.100-1.1-aarch64.pkg.tar.zst bc7d9762db6644f2cfb58ddb209602c1d513845eb1498c098e01f12600fcbdf9"
+  "aurora-touchid-20261002-1-any.pkg.tar.zst a9dda6e0526874e4ac760629f3aa5bd37421379a1d8af34000f3dc7b73a21b17"
+  "m1n1-aurora-1.6.1.aurora3-1-aarch64.pkg.tar.zst bc3451aaa88bc3f4912bc3613f9569aa8f3e05f376fa851fa837b5e2080e8c2f"
+)
+PINNED="linux-aurora linux-aurora-headers libfprint m1n1-aurora"
+PIN_BEGIN="# >>> aurora-sep pin (remove with: install-aurora-sep.sh --uninstall)"
+PIN_END="# <<< aurora-sep pin"
+STATE=/var/lib/aurora-sep
+FALLBACK_ID=aurora-sep-previous-kernel
+# Written only by --read-only; keeps the driver from writing to the enclave.
+MODPROBE_CONF=/etc/modprobe.d/aurora-sep.conf
+READ_ONLY=0
+
+say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+sudo=""
+if (( EUID != 0 )); then
+  command -v sudo >/dev/null || die "run as root or install sudo"
+  sudo=sudo
+fi
+
+# A saved copy of this script keeps installing its own build forever. Tell the
+# operator - human or agent - when a newer one exists. Never fatal: no network,
+# rate limit or API change should stop an install that was going to work.
+newer_release() {
+  # Explicitly non-fatal. The pipeline returns non-zero whenever there is no
+  # network, GitHub rate-limits, or the response is not what we expect, and
+  # whether set -e acts on that inside a command substitution is subtle enough
+  # that it should not be left to chance in a script that runs as root.
+  local seen=""
+  # Ask for the release marked Latest. Listing all releases is not ordered by
+  # version: they share a commit, so GitHub falls back to comparing tag names
+  # as text, and 11.9 sorts above 11.10.
+  seen=$(curl -fsSL --max-time 8 "$RELEASES_API/latest" 2>/dev/null |
+    grep -o '"tag_name"[[:space:]]*:[[:space:]]*"sep-[^"]*"' |
+    head -1 | sed 's/.*"\(sep-[^"]*\)"$/\1/') || true
+  [[ -n $seen && $seen != "$TAG" ]] && echo "$seen"
+  return 0
+}
+
+version_notice() {
+  local seen
+  seen=$(newer_release)
+  if [[ -n $seen ]]; then
+    warn "this script installs $TAG, but $seen is published.
+    You are probably running a saved copy. The current one:
+      curl -fsSL $LATEST_URL | bash"
+  else
+    say "$TAG is the current release"
+  fi
+}
+
+boot_chain() {
+  # /boot/efi can be readable only by root, so test through sudo.
+  if pacman -Q omarchy-mac-boot >/dev/null 2>&1 &&
+    { $sudo test -e /boot/EFI/BOOT/BOOTAA64.EFI || $sudo test -e /boot/efi/EFI/BOOT/BOOTAA64.EFI; } &&
+    command -v limine >/dev/null; then
+    echo limine
+  elif [[ -f /boot/grub/grub.cfg ]] && command -v grub-mkconfig >/dev/null; then
+    echo grub
+  else
+    echo unknown
+  fi
+}
+
+# The MacBook Neo (T8140) boots an m1n1 built from aurora-silicon's J700
+# branch. m1n1-aurora has no T8140 support, so on a Neo this script never
+# installs it or the stock m1n1 over the one the Mac already boots.
+is_neo() {
+  tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null | grep -qx 'apple,t8140'
+}
+
+# Boards whose Touch ID support nobody has booted yet. Once a board's device
+# tree names the enclave, m1n1 needs two boot manifests from the platform for
+# it, and a board without them stops in m1n1 before any boot entry. Every
+# board checked so far has them; these have not been checked.
+UNPROVEN_SEP_BOARDS="j314c j316c j413"
+
+this_board() {
+  tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null | sed -n '1s/^apple,//p'
+}
+
+# Before anything rebuilds boot.bin on such a board, keep the one this boot
+# came up on next to it on the EFI partition, where macOS can reach it, and
+# say how to put it back. A later run keeps the first copy.
+unproven_board_backup() {
+  local board target keep uuid
+  board=$(this_board)
+  [[ -n $board && " $UNPROVEN_SEP_BOARDS " == *" $board "* ]] || return 0
+  for target in /boot/efi/m1n1/boot.bin /boot/m1n1/boot.bin; do
+    [[ -f $target && $(findmnt -no FSTYPE --target "$target") == vfat ]] || continue
+    keep=$target.before-$VERSION
+    [[ -f $keep ]] || $sudo cp "$target" "$keep" ||
+      die "could not keep a copy of $target; nothing was installed"
+    uuid=$(findmnt -no PARTUUID --target "$target")
+    warn "Touch ID on this Mac model ($board) is new in $VERSION, and nobody has
+    booted it on this model yet. If the Mac stops in m1n1 after this install (m1n1
+    text on screen, often \"No valid payload found\", and no boot menu), put the
+    boot loader it booted with back from macOS:
+      1. Hold the power button until the Mac turns off, then press and hold it
+         again for the startup options, and start macOS (or Options, then
+         Utilities > Terminal).
+      2. In Terminal, run: diskutil list
+         Find the partition whose UUID is $uuid (any case) with:
+           diskutil info diskNsM | grep -i 'partition uuid'
+      3. sudo diskutil mount diskNsM   (it prints the /Volumes path)
+      4. cp '<that path>/m1n1/boot.bin.before-$VERSION' '<that path>/m1n1/boot.bin'
+    The copy is kept at $keep. Either way, please report it at
+    https://github.com/iconidentify/aurora-linux/issues"
+    return 0
+  done
+  die "could not find m1n1's boot.bin on the EFI partition to keep a copy of; nothing was installed"
+}
+
+current_kernel() {
+  if pacman -Q linux-aurora >/dev/null 2>&1; then echo linux-aurora
+  elif pacman -Q linux-asahi >/dev/null 2>&1; then echo linux-asahi
+  fi
+}
+
+preflight() {
+  [[ $(uname -m) == aarch64 ]] || die "this is not an aarch64 machine"
+  grep -qa 'apple,' /proc/device-tree/compatible 2>/dev/null || die "this is not an Apple Silicon Mac"
+  command -v pacman >/dev/null || die "pacman not found; this is for Omarchy on Arch Linux ARM"
+  [[ -n $(current_kernel) ]] || die "neither linux-asahi nor linux-aurora is installed; this Mac's kernel is not one this script replaces"
+  [[ $(boot_chain) != unknown ]] || die "could not find GRUB or Limine on this Mac; not touching its boot setup"
+}
+
+remove_pin() {
+  $sudo sed -i "/^$(sed 's/[][\/.*^$]/\\&/g' <<<"$PIN_BEGIN")\$/,/^$PIN_END\$/d" /etc/pacman.conf
+}
+
+add_pin() {
+  remove_pin
+  # IgnorePkg lines accumulate, so any existing IgnorePkg stays in force.
+  $sudo sed -i "/^\[options\]/a $PIN_BEGIN\nIgnorePkg = $PINNED\n$PIN_END" /etc/pacman.conf
+}
+
+snapshot() {
+  if command -v snapper >/dev/null && $sudo snapper list-configs 2>/dev/null | grep -q '^root'; then
+    say "Taking a snapper snapshot"
+    $sudo snapper -c root create -c important -d "before $1" || warn "snapshot failed; continuing"
+  fi
+}
+
+# /boot has to hold the fallback copy of the old kernel and the new kernel's
+# image and initramfs; checked before anything changes.
+boot_space() {
+  local kernel=$1 need free
+  need=$(du -cm "/boot/vmlinuz-$kernel" "/boot/initramfs-$kernel.img" 2>/dev/null | tail -1 | cut -f1)
+  [[ -f $STATE/previous ]] && need=0
+  # Room for linux-aurora's image and initramfs, unless it is already installed.
+  if [[ $kernel == linux-aurora ]]; then need=$(( need + 20 )); else need=$(( need + 90 )); fi
+  free=$(df -m --output=avail /boot | tail -1 | tr -d ' ')
+  (( free >= need )) || die "/boot has ${free} MB free and this needs about ${need} MB (the old kernel kept as a fallback plus the new one).
+Free space in /boot first (old test kernels, for example), then run this again. Nothing was changed."
+}
+
+# GRUB: keep the running kernel bootable from the menu, whatever pacman removes.
+keep_grub_fallback() {
+  local kernel=$1 release="" dir root_uuid subvol cmdline linux initrd
+  # The modules that belong to the package being replaced (not necessarily
+  # the running kernel, which may be a hand-installed test kernel).
+  for dir in /usr/lib/modules/*/; do
+    [[ $(cat "${dir}pkgbase" 2>/dev/null) == "$kernel" ]] && release=$(basename "$dir")
+  done
+  [[ -n $release ]] || { warn "could not find the modules of $kernel; no fallback entry"; return 0; }
+  [[ -f /boot/vmlinuz-$kernel && -f /boot/initramfs-$kernel.img ]] || { warn "no /boot/vmlinuz-$kernel to keep as a fallback"; return 0; }
+  $sudo install -d "$STATE"
+  if ! $sudo cp /boot/vmlinuz-$kernel /boot/vmlinuz-aurora-sep-previous ||
+    ! $sudo cp /boot/initramfs-$kernel.img /boot/initramfs-aurora-sep-previous.img; then
+    $sudo rm -f /boot/vmlinuz-aurora-sep-previous /boot/initramfs-aurora-sep-previous.img
+    die "could not copy the previous kernel to /boot (out of space?). Nothing else was changed."
+  fi
+  # pacman removes the old kernel's modules; keep the running kernel's for the fallback.
+  $sudo cp -a "/usr/lib/modules/$release" "$STATE/modules-$release"
+  # The fallback's device trees must never be what update-m1n1 picks.
+  $sudo rm -rf "$STATE/modules-$release/dtbs"
+  echo "$kernel $release" | $sudo tee "$STATE/previous" >/dev/null
+  # kernel-modules-hook's linux-modules-cleanup.service deletes every
+  # /usr/lib/modules tree that no package owns and that is not the running
+  # kernel, so the fallback's modules live in $STATE and are put back only when
+  # the fallback kernel itself boots, before anything loads a module.
+  $sudo tee /etc/systemd/system/aurora-sep-fallback-modules.service >/dev/null <<EOF
+[Unit]
+Description=Restore the modules of the pre-aurora-sep fallback kernel
+DefaultDependencies=no
+ConditionKernelVersion=$release
+ConditionPathExists=!/usr/lib/modules/$release/modules.dep
+After=systemd-remount-fs.service
+Before=systemd-modules-load.service systemd-udevd.service systemd-udev-trigger.service linux-modules-cleanup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cp -a $STATE/modules-$release /usr/lib/modules/$release
+
+[Install]
+WantedBy=sysinit.target
+EOF
+  $sudo systemctl daemon-reload
+  $sudo systemctl enable aurora-sep-fallback-modules.service
+
+  root_uuid=$(findmnt -no UUID /)
+  subvol=$(findmnt -no FSROOT /)
+  cmdline=$(sed -e 's/BOOT_IMAGE=[^ ]*//' /proc/cmdline)
+  if [[ $(findmnt -no FSTYPE /boot) == vfat ]]; then
+    linux=/vmlinuz-aurora-sep-previous initrd=/initramfs-aurora-sep-previous.img
+    search="search --no-floppy --fs-uuid --set=root $(findmnt -no UUID /boot)"
+  else
+    linux="${subvol%/}/boot/vmlinuz-aurora-sep-previous" initrd="${subvol%/}/boot/initramfs-aurora-sep-previous.img"
+    search="search --no-floppy --fs-uuid --set=root $root_uuid"
+  fi
+  $sudo tee /etc/grub.d/42_aurora_sep_previous >/dev/null <<EOF
+#!/bin/sh
+cat <<'MENU'
+menuentry 'Previous kernel ($kernel $release, before aurora-sep)' --class omarchy --class gnu-linux --id $FALLBACK_ID {
+    load_video
+    set gfxpayload=keep
+    insmod part_gpt
+    insmod fat
+    insmod btrfs
+    $search
+    linux $linux $cmdline
+    initrd $initrd
+}
+MENU
+EOF
+  $sudo chmod 755 /etc/grub.d/42_aurora_sep_previous
+}
+
+# update-m1n1 takes the device trees of the highest-versioned *-ARCH kernel
+# directory, which after this install can be the old linux-asahi's (a newer
+# version number, kept for the fallback entry) without the Touch ID sensor node.
+# Point it at whatever directory linux-aurora owns, now and after its updates.
+m1n1_update() {
+  local target conf=/etc/default/update-m1n1 tmp
+  [[ -f $conf && ! -f $STATE/update-m1n1.default.saved ]] &&
+    $sudo cp "$conf" "$STATE/update-m1n1.default.saved"
+  # Replace only the DTBS setting and keep the rest of the file: a MacBook
+  # Neo's M1N1= and U_BOOT= point at its own J700 builds, and dropping them
+  # would rebuild boot.bin from an m1n1 that cannot boot it.
+  tmp=$(mktemp)
+  if [[ -f $conf ]]; then
+    $sudo sed -e '/^# aurora-sep: build m1n1/,/^DTBS=/d' -e '/^DTBS=/d' "$conf" >"$tmp"
+  fi
+  cat >>"$tmp" <<'EOF'
+# aurora-sep: build m1n1's stage 2 from the device trees the installed
+# linux-aurora package owns, which carry the Touch ID sensor node.
+#
+# Not from a module directory whose pkgbase says linux-aurora: right after an
+# upgrade the running kernel's modules are restored unowned but still carry that
+# pkgbase, so both kernels' DTBs would be bundled. m1n1 keeps the last matching
+# DTB, and the glob sorts 11.10 before 11.9, so the stale one can win.
+# (update-m1n1 runs under set -e, so this assignment must always succeed.)
+DTBS=$(pacman -Qlq linux-aurora 2>/dev/null | grep '/dtbs/[^/]*\.dtb$'; true)
+EOF
+  $sudo install -m 644 "$tmp" "$conf"
+  rm -f "$tmp"
+  for target in /boot/m1n1/boot.bin /boot/efi/m1n1/boot.bin; do
+    [[ -f $target && ! -f $STATE/boot.bin.saved ]] && $sudo cp "$target" "$STATE/boot.bin.saved"
+  done
+  say "Rebuilding m1n1 with the aurora device trees"
+  $sudo update-m1n1 || die "update-m1n1 failed; the previous boot.bin is saved in $STATE/boot.bin.saved"
+}
+
+grub_update() {
+  # mkinitcpio's hook installs /boot/vmlinuz-linux-aurora; a preset whose
+  # kernel is gone would make later mkinitcpio -P runs fail.
+  if [[ -f /etc/mkinitcpio.d/linux-asahi.preset ]] && ! pacman -Q linux-asahi >/dev/null 2>&1; then
+    $sudo mv /etc/mkinitcpio.d/linux-asahi.preset "$STATE/linux-asahi.preset.saved"
+  fi
+  say "Regenerating the GRUB menu"
+  $sudo grub-mkconfig -o /boot/grub/grub.cfg
+
+  # Select the linux-aurora entry by its id, never by position. Entry 0 is
+  # whichever kernel grub-mkconfig considers newest, and a Mac that has been
+  # used for testing often has hand-installed vmlinuz-* files in /boot with no
+  # matching initramfs. grub-mkconfig happily writes those as entries with no
+  # initrd line at all, and booting one hangs before it can mount root.
+  # grub.cfg can be root-only, so read it through sudo like the ESP check above.
+  # grub-mkconfig puts every kernel but its idea of the newest inside the
+  # "Advanced options" submenu, and a bare id only resolves against top-level
+  # entries: setting one that lives in the submenu silently falls back to entry
+  # 0. The documented way to reach it is the submenu>entry path, and it has to
+  # be quoted in /etc/default/grub or the > is a shell redirect.
+  local entry submenu target
+  entry=$($sudo grep -oE 'gnulinux-linux-aurora-advanced-[0-9a-f-]+' /boot/grub/grub.cfg | head -1)
+  [[ -n $entry ]] || die "grub.cfg has no linux-aurora entry; the previous kernel is still the fallback entry"
+  submenu=$($sudo grep -oE 'gnulinux-advanced-[0-9a-f-]+' /boot/grub/grub.cfg | head -1)
+  if [[ -n $submenu ]]; then target="$submenu>$entry"; else target="$entry"; fi
+
+  if ! grep -qxF "GRUB_DEFAULT=\"$target\"" /etc/default/grub; then
+    [[ -f $STATE/grub.default.saved ]] || $sudo cp /etc/default/grub "$STATE/grub.default.saved"
+    if grep -qE '^GRUB_DEFAULT=' /etc/default/grub; then
+      $sudo sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"$target\"|" /etc/default/grub
+    else
+      echo "GRUB_DEFAULT=\"$target\"" | $sudo tee -a /etc/default/grub >/dev/null
+    fi
+    $sudo grub-mkconfig -o /boot/grub/grub.cfg
+  fi
+
+  # Prove the default resolves to an entry that can actually boot: the path
+  # must be written out, and that entry must carry both a kernel and an initrd.
+  # A vmlinuz-* in /boot with no matching initramfs generates an entry with no
+  # initrd line at all, which hangs before it can mount root.
+  $sudo grep -qF "set default=\"$target\"" /boot/grub/grub.cfg ||
+    die "GRUB's default entry is not linux-aurora. Not leaving this Mac pointing at an unbootable default: pick 'Omarchy Linux, with Linux linux-aurora' from the menu, or run --uninstall."
+  $sudo awk -v id="$entry" '
+    /^[\t ]*menuentry/ && index($0, id) { found = 1 }
+    found && /vmlinuz-linux-aurora/ { k = 1 }
+    found && /initramfs-linux-aurora\.img/ { i = 1 }
+    found && /^[\t ]*}/ { exit }
+    END { exit !(k && i) }' /boot/grub/grub.cfg ||
+    die "the linux-aurora GRUB entry is missing its kernel or initramfs line; refusing to make it the default"
+
+  # Stray hand-installed kernels poison the auto-generated top entry.
+  local stray="" k n
+  for k in /boot/vmlinuz-*; do
+    n=${k#/boot/vmlinuz-}
+    [[ -e /boot/initramfs-$n.img ]] || stray+=" $n"
+  done
+  [[ -z $stray ]] ||
+    warn "these kernels in /boot have no initramfs and boot to a black screen if picked:$stray"
+}
+
+calibration() {
+  local node name="" out board dtb
+  # The driver reads firmware-name from the device tree it boots, which is the
+  # aurora one installed above. When this runs from linux-asahi, the running
+  # tree has no sensor node at all, so ask the installed aurora DTB first.
+  board=$(tr '\0' '\n' </proc/device-tree/compatible 2>/dev/null | sed -n '1s/^apple,//p')
+  if [[ -n $board ]]; then
+    dtb=$(pacman -Qlq linux-aurora 2>/dev/null | grep -m1 "/dtbs/t[0-9]*-$board\.dtb$" || true)
+    [[ -n $dtb && -f $dtb ]] &&
+      name=$(grep -aoE -m1 'apple/mesacal-[A-Za-z0-9_-]+\.bin' "$dtb" | head -1 || true)
+  fi
+  if [[ -z $name ]]; then
+    for node in /proc/device-tree/soc*/spi*/*/ /proc/device-tree/*/spi*/*/; do
+      [[ -f $node/compatible ]] && grep -qa mesa "$node/compatible" || continue
+      [[ -f $node/firmware-name ]] && name=$(tr -d '\0' <"$node/firmware-name")
+      break
+    done
+  fi
+  name=${name:-apple/mesa_calibration.bin}
+  out=/usr/lib/firmware/$name
+  if [[ -s $out ]]; then
+    say "Touch ID calibration already present: $out"
+    return 0
+  fi
+  say "Extracting this Mac's Touch ID calibration (read-only) to $out"
+  $sudo install -d -m 755 "$(dirname "$out")"
+  $sudo /usr/lib/aurora-touchid/extract-mesa-calibration -o "$out" ||
+    warn "could not extract the calibration; Touch ID will not work until it is present at $out"
+}
+
+# The first line in modprobe.d that blacklists or redirects apple_sep, other
+# than our own file. Either spelling is the owner saying "do not load this".
+sep_block_line() {
+  local f
+  for f in /etc/modprobe.d/*.conf /run/modprobe.d/*.conf /usr/lib/modprobe.d/*.conf; do
+    [[ -f $f && $f != "$MODPROBE_CONF" ]] || continue
+    grep -m1 -HnE '^[[:space:]]*(blacklist|install)[[:space:]]+apple[-_]sep([[:space:]]|$)' "$f" 2>/dev/null &&
+      return 0
+  done
+  return 0
+}
+
+# With its defaults the driver provisions an identity keybag and writes to the
+# enclave's anti-replay store (xART) on the first boot of a Mac that has a
+# Touch ID profile -- no enrolment needed. That is the intended behaviour, but
+# the owner has to be able to opt out, and a block they already set must win.
+sep_policy() {
+  local block
+  block=$(sep_block_line)
+  if [[ -n $block ]]; then
+    warn "apple_sep is blocked on this Mac ($block).
+    Leaving it that way: the SEP service is not enabled. Note that a plain
+    'blacklist' line would NOT have stopped the service, which loads the driver
+    by name; that is why this script checks for it."
+    $sudo systemctl disable apple-sep.path apple-sep.service 2>/dev/null || true
+    return 0
+  fi
+  if (( READ_ONLY )); then
+    printf '%s\n' \
+      "# aurora-sep --read-only: the driver attaches and reports, but never writes" \
+      "# to the enclave. Delete this file to allow enrolment." \
+      "options apple_sep xart_writes=0 provision_keybag=0" |
+      $sudo tee "$MODPROBE_CONF" >/dev/null
+    say "Read-only: the SEP driver will attach but not write to the enclave ($MODPROBE_CONF)"
+  elif [[ -f $MODPROBE_CONF ]]; then
+    # Re-running to update must never quietly turn writes back on.
+    say "Still read-only from an earlier --read-only install; delete $MODPROBE_CONF to allow enrolment"
+  fi
+  $sudo systemctl enable apple-sep.path apple-sep.service
+}
+
+sep_write_notice() {
+  (( READ_ONLY )) && return 0
+  [[ -f $MODPROBE_CONF || -n $(sep_block_line) ]] && return 0
+  warn "on the first boot of a Mac with a Touch ID profile, the SEP driver creates
+    an identity keybag and writes to the enclave's anti-replay store. Use a Mac
+    you can DFU-restore. If you cannot, press Ctrl-C now and run with --read-only:
+      curl -fsSL $LATEST_URL | bash -s -- --read-only"
+  return 0
+}
+
+# omarchy-ane-dkms builds its own Neural Engine modules into updates/dkms,
+# which modprobe prefers over the ones this kernel ships. Say so rather than
+# remove it: it also carries the M2 firmware fetch its owner may rely on.
+ane_dkms_notice() {
+  pacman -Q omarchy-ane-dkms >/dev/null 2>&1 || return 0
+  warn "omarchy-ane-dkms is installed. Its Neural Engine modules take precedence
+    over the driver built into this kernel, so a test would exercise that
+    package's driver instead. To test this kernel's driver, remove it first:
+      sudo pacman -R omarchy-ane-dkms
+    Removing it also removes the Neural Engine firmware it fetched on an M2
+    Pro/Max."
+}
+
+install_all() {
+  local entry file sha kernel chain
+  version_notice
+  sep_write_notice
+  ane_dkms_notice
+  kernel=$(current_kernel)
+  chain=$(boot_chain)
+  if [[ $chain == grub ]]; then boot_space "$kernel"; fi
+  work=$(mktemp -d)
+  trap 'rm -rf "${work:-}"' EXIT
+  for entry in "${PACKAGES[@]}"; do
+    read -r file sha <<<"$entry"
+    if [[ $file == m1n1-aurora-* ]] && is_neo; then
+      say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"
+      continue
+    fi
+    say "Downloading $file"
+    curl -fL --retry 3 --progress-bar -o "$work/$file" "$RELEASE_URL/$file" ||
+      die "could not download $file from $TAG.
+    The release is missing a file this script expects, which is a packaging
+    mistake rather than anything wrong with this Mac. Nothing was installed.
+    Please report it with the file name above."
+    [[ $(sha256sum "$work/$file" | cut -d' ' -f1) == "$sha" ]] || die "$file does not match its published checksum"
+  done
+
+  snapshot "aurora-sep $VERSION"
+  # Before pacman's update-m1n1 hook rebuilds boot.bin below.
+  is_neo || unproven_board_backup
+  $sudo install -d "$STATE"
+  if [[ ! -f $STATE/previous && $chain == grub ]]; then
+    keep_grub_fallback "$kernel"
+  fi
+  pacman -Q "$kernel" | $sudo tee "$STATE/previous-package" >/dev/null
+
+  # linux-aurora-headers pulls in pahole, and fprintd below comes from the
+  # repositories. On a Mac whose package database has gone stale, pacman
+  # resolves those to versions the mirror no longer carries and the whole
+  # transaction dies with a 404 after the packages are already downloaded.
+  say "Refreshing the package database"
+  $sudo pacman -Sy --noconfirm || warn "could not refresh the package database; continuing"
+
+  say "Installing the aurora-sep kernel, libfprint with the Apple SEP driver, fprintd and aurora-touchid"
+  # --ask 4 accepts replacing linux-asahi (and its headers), which linux-aurora conflicts with.
+  $sudo pacman -U --noconfirm --ask 4 "$work"/*.pkg.tar.zst
+  $sudo pacman -S --needed --noconfirm fprintd
+  # linux-aurora carries the Apple video decoder, whose firmware linux-asahi
+  # installs never needed; without it the decoder fails to load at boot.
+  $sudo pacman -S --needed --noconfirm avd-fw ||
+    warn "could not install avd-fw; hardware video decode will not work until it is installed"
+  # The VA-API bridge to that decoder. Without it, players fall back to
+  # software decode with no error (reported on a 16" M1 Pro installed from the
+  # Omarchy Mac ISO). Leave any other build of the bridge alone: the AUR
+  # libva-v4l2_request packages conflict with it.
+  if ! pacman -Qq libva-v4l2_request-avd libva-v4l2_request >/dev/null 2>&1 &&
+    [[ ! -e /usr/lib/dri/v4l2_request_drv_video.so ]]; then
+    $sudo pacman -S --needed --noconfirm libva-v4l2_request-avd ||
+      warn "could not install libva-v4l2_request-avd; video players will decode in software until it is installed"
+  fi
+  add_pin
+  # Both boot chains boot through m1n1, and both need the aurora device trees
+  # in boot.bin: update-m1n1 otherwise takes the DTBs of the highest-versioned
+  # kernel directory, which on a Mac with an older hand-installed test kernel
+  # is not this one -- and those DTBs lack the Touch ID sensor node. pacman's
+  # own hook already ran update-m1n1 during the install above, before this
+  # configuration existed, so run it again now that it is in place.
+  m1n1_update
+  if [[ $chain == grub ]]; then
+    grub_update
+  fi
+
+  calibration
+  $sudo systemctl daemon-reload
+  sep_policy
+  pacman -Q linux-aurora libfprint aurora-touchid
+  echo
+  if [[ -f $MODPROBE_CONF ]]; then
+    say "Done, read-only. Reboot; the SEP driver will attach and report without writing."
+    echo "   Enrolling a finger needs writes: delete $MODPROBE_CONF, reboot, then run aurora-touchid-setup."
+  else
+    say "Done. Reboot, then run:  aurora-touchid-setup"
+  fi
+  echo "   Testing this build? The plan and reporting format:"
+  echo "      curl -fsSL $RELEASE_URL/install-aurora-sep.sh | bash -s -- --agent-prompt"
+  if [[ $chain == grub ]]; then
+    echo "   The previous kernel stays in the GRUB menu as 'Previous kernel … before aurora-sep'."
+  fi
+  echo "   To undo everything:    curl -fsSL $RELEASE_URL/install-aurora-sep.sh | bash -s -- --uninstall"
+}
+
+uninstall_all() {
+  local previous=linux-asahi
+  [[ -f $STATE/previous-package ]] && read -r previous _ <"$STATE/previous-package"
+  command -v aurora-touchid-setup >/dev/null && aurora-touchid-setup --remove || true
+  $sudo systemctl disable apple-sep.path apple-sep.service 2>/dev/null || true
+  remove_pin
+  snapshot "removing aurora-sep"
+  local m1n1=m1n1
+  if is_neo; then
+    m1n1=
+    say "Reinstalling $previous and the stock libfprint; this MacBook Neo keeps its own m1n1"
+  else
+    say "Reinstalling $previous, the stock m1n1 and the stock libfprint"
+  fi
+  $sudo pacman -Rdd --noconfirm aurora-touchid 2>/dev/null || true
+  $sudo pacman -Sy --noconfirm --ask 4 "$previous" "$previous-headers" libfprint $m1n1
+  # Restore the stock update-m1n1 configuration on either chain before the
+  # rebuild below, so boot.bin goes back to the packaged m1n1 and DTBs.
+  if [[ $(boot_chain) != grub ]]; then
+    if [[ -f $STATE/update-m1n1.default.saved ]]; then
+      $sudo cp "$STATE/update-m1n1.default.saved" /etc/default/update-m1n1
+    else
+      $sudo rm -f /etc/default/update-m1n1
+    fi
+    $sudo update-m1n1 || warn "update-m1n1 failed; boot.bin still has the aurora m1n1"
+  fi
+
+  if [[ $(boot_chain) == grub ]]; then
+    [[ -f $STATE/linux-asahi.preset.saved && ! -f /etc/mkinitcpio.d/linux-asahi.preset ]] &&
+      $sudo mv "$STATE/linux-asahi.preset.saved" /etc/mkinitcpio.d/linux-asahi.preset
+    [[ -f $STATE/grub.default.saved ]] && $sudo cp "$STATE/grub.default.saved" /etc/default/grub
+    if [[ -f $STATE/update-m1n1.default.saved ]]; then
+      $sudo cp "$STATE/update-m1n1.default.saved" /etc/default/update-m1n1
+    else
+      $sudo rm -f /etc/default/update-m1n1
+    fi
+    $sudo update-m1n1
+    $sudo systemctl disable aurora-sep-fallback-modules.service 2>/dev/null || true
+    $sudo rm -f /etc/systemd/system/aurora-sep-fallback-modules.service
+    $sudo rm -f /etc/grub.d/42_aurora_sep_previous /boot/vmlinuz-aurora-sep-previous /boot/initramfs-aurora-sep-previous.img
+    $sudo grub-mkconfig -o /boot/grub/grub.cfg
+  fi
+  $sudo rm -f "$MODPROBE_CONF"
+  $sudo rm -rf "$STATE"
+  say "Done. Reboot to run $previous."
+}
+
+# Printed by --agent-prompt, and pointed at from the end of a successful
+# install. This is written for an agent driving the test on a real Mac: it says
+# what to establish, what counts as a pass, and how to write it up.
+agent_prompt() {
+  cat <<'PROMPT'
+You are testing an experimental Secure Enclave / Touch ID kernel on an Apple
+Silicon Mac. Work through this in order and report at the end. Do not skip the
+identification step: nearly every past report was unusable because the machine
+was not pinned down.
+
+SAFETY, NON-NEGOTIABLE
+  - This touches the Secure Enclave. Confirm the owner can DFU-restore this Mac
+    before you start.
+  - A default install is NOT read-only. On the first boot of a Mac with a
+    Touch ID profile, the SEP driver loads automatically, creates an identity
+    keybag and writes to the enclave's anti-replay store (xART) -- before
+    anyone enrols a finger. If the owner cannot DFU-restore, install with
+    --read-only instead, before the first reboot:
+      curl -fsSL https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh | bash -s -- --read-only
+    A 'blacklist apple_sep' line does not prevent this on its own; the
+    installer detects one and leaves the driver off.
+  - Do not run any enrol/delete/re-provision loop unless the owner asks for
+    it in writing: repeated cycles drift a device-wide counter.
+  - Do not paste key material, serial numbers, or the contents of
+    mesa_calibration.bin into a report.
+
+0. CONFIRM YOU HAVE THE CURRENT BUILD
+   Results against a superseded build waste everyone's time, and a saved copy
+   of this script installs its own packages forever. This script checks on
+   every install and prints either "<tag> is the current release" or a warning
+   naming the newer one. To check without installing:
+
+     curl -fsSL https://api.github.com/repos/iconidentify/aurora-linux/releases/latest \
+       | grep -m1 '"tag_name"'
+
+   Always fetch the script from the "latest" URL rather than a tag you were
+   handed, so you get the current one automatically:
+
+     curl -fsSL https://github.com/iconidentify/aurora-linux/releases/latest/download/install-aurora-sep.sh | bash
+
+   State the tag you installed in your report. If you were given a specific
+   older tag on purpose, say so and say why.
+
+1. IDENTIFY THE MACHINE
+     tr -d '\0' < /proc/device-tree/compatible; echo
+     for p in os-fw-version system-fw-version iboot2-version; do
+       printf '%s = ' "$p"
+       tr -d '\0' < /proc/device-tree/chosen/asahi,$p 2>/dev/null; echo
+     done
+     uname -r; pacman -Q linux-aurora m1n1-aurora libfprint aurora-touchid
+   asahi,system-fw-version is the sepOS the enclave actually runs and is the
+   single most useful line in the whole report. asahi,os-fw-version is only the
+   stub. Report both; they are often different.
+
+2. CONFIRM THE BOOTLOADER GUARD (M2 and later)
+   In the m1n1 stage 2 boot log, expect:
+     SEP: Preserving iBoot warm registration; seeding RNG from ADT
+   and expect NO line reading "SEP: couldn't get enough random bytes".
+   You should also see the OS identity forwarded:
+     FDT: apfs-preboot-uuid = '<uuid>'
+   On M1 neither line is expected: the enclave is cold and m1n1 talks to it
+   normally. If you see the "couldn't get enough random bytes" line on any
+   machine, the stock m1n1 is still in boot.bin - say so and stop, because every
+   later result is then measuring the wrong thing.
+
+3. DRIVER ATTACH
+   The driver is already loaded at boot by apple-sep.service; do not reload
+   it. Its write mode was fixed at install time. Read what it did:
+     sudo dmesg | grep -iE 'apple_sep|apple-mesa'
+   The xART line ends "writes ENABLED" or "writes disabled" -- quote it, and
+   say which you expected.
+   PASS:  "attach: N endpoints advertised in M messages" with N >= 7, and
+          /dev/sep-bio exists.
+   FAIL:  "attach: 0 messages received but no endpoint advertised", or no
+          apple_sep lines at all. Capture the whole block either way.
+   If the profile line says a SoC you did not expect, report that verbatim.
+   On every MacBook Pro M2 Pro/Max (J414s, J414c, J416s, J416c) it reads
+   "T6020/J414s", on the MacBook Pro 14"/16" M1 Max (J314c, J316c)
+   "T6000/J316s", and on the MacBook Air 13" M2 (J413) "T8112/J415"; those are
+   expected.
+   If "CREATE_KEYBAG" fails with status -13, quote your system-fw-version.
+   Every M2-family Mac that has created its keybag was on 26.6.x; on an older
+   one, update macOS to 26.6.x, boot back into Linux, re-run the installer and
+   report again. If it still fails on 26.6.x, that is the report we need.
+   The sensor itself: "sudo dmesg | grep apple-mesa" should say the power line
+   came "from the device node". Quote it if it says anything else.
+
+4. IF ATTACH FAILED, GET THE MAILBOX STATE
+     sudo busybox devmem 0x396408110 32   # A2I control (t600x/t602x)
+     sudo busybox devmem 0x396408114 32   # I2A control
+     grep -i mbox /proc/interrupts
+   Those addresses are for t600x and t602x. The mailbox base differs per SoC,
+   so take it from the device tree rather than a table:
+
+     sudo cat /proc/device-tree/soc/mbox@*/reg 2>/dev/null | xxd | head -2
+     # or read the sep_mbox node address from your board's dtsi:
+     #   t8103            0x242408000  -> 0x242408110 / 0x242408114
+     #   t8112            0x25e408000  -> 0x25e408110 / 0x25e408114
+     #   t600x, t602x     0x396408000  -> 0x396408110 / 0x396408114
+     #   t8140 (Neo)      0x282608000  (a v4 mailbox: report the base and
+     #                    the /proc/interrupts lines, not these offsets)
+
+   Bit 0 is the enable; a non-zero FIFO count with an unchanged read pointer
+   means the enclave never took the message. Report the raw values, not your
+   reading of them.
+
+5. TOUCH ID END TO END (only if step 3 passed)
+     aurora-touchid-setup
+   Enrol one finger, then:
+     fprintd-verify
+   Then REBOOT and run fprintd-verify again without re-enrolling. Matching
+   right after enrolment and matching after a reboot are different paths (the
+   second restores the enrolment from disk), so report them separately.
+   If a verify fails, the driver logs the step that ended it:
+     sudo dmesg | grep -E 'verify:|scrd:|Touch ID|catacomb|matching unavailable'
+   fprintd's "verify-unknown-error" is not a result on its own; quote those
+   lines with it.
+   Then check the consumers the owner actually cares about: sudo, polkit, and
+   the lock screen. Report each as pass/fail separately - partial success here
+   is the normal outcome and is worth knowing precisely.
+
+6. THUNDERBOLT AND DISPLAYPORT - TEST THIS EVEN IF YOU CAME FOR TOUCH ID
+   This build carries the Thunderbolt/USB4 display and PCIe work, and it needs
+   hardware reports as much as the enclave does. Do not skip it because the
+   machine has no dock: "no dock available" is itself a useful answer, and
+   step 6a still applies.
+
+   6a. The controllers (no dock needed)
+         ls /sys/bus/platform/devices/ | grep cio
+         sudo dmesg | grep -iE 'thunderbolt|usb4|acio|tunnel' | head -30
+       Expect one *.cio device per controller, bound to thunderbolt-apple-acio.
+       An EMPTY /sys/bus/thunderbolt/devices/ with nothing plugged in is
+       normal: routers only appear when a device is attached. Do not report
+       that as a failure.
+       Also normal, on every Mac except the M1 Air and 13" M1 MacBook Pro:
+         PCIe-C tunnel disabled: m1n1 handoff is not initialized
+       Anything behind a dock's PCIe controller -- ethernet, storage, and on
+       Thunderbolt 3 docks such as the CalDigit TS3 the USB ports too -- only
+       works on t8103 so far. Displays, and USB on USB4 docks, do not need the
+       PCIe tunnel. Report the line only if you see it on a t8103.
+
+   6b. With a dock or a DisplayPort monitor, in this order:
+         - attached at boot: does the display come up, and at what resolution
+           and refresh rate
+         - hot unplug: does the tunnel tear down cleanly, no hang, no stuck
+           compositor
+         - hot replug: does the display come back, same mode as before
+         - repeat both of the above on the SECOND USB-C port, not just the
+           first: the ports are separate controllers and have behaved
+           differently
+         - two displays or a dual-output dock, if you have one
+         - M2 Pro/Max: two monitors plugged straight into two USB-C ports
+           (no dock), attached at boot. Does each come up at its own native
+           resolution? Quote "hyprctl monitors" (name, mode, and the port each
+           is on). Then log out and back in, and repeat.
+         - PCIe behind the dock: ethernet, USB storage, card readers - do they
+           enumerate and still work after a replug
+
+   6c. Across suspend:
+         systemctl suspend
+       Then wake and re-check: display back, dock devices back, and
+       /dev/sep-bio still present. Report anything that needed a replug to
+       recover.
+
+7. HARDWARE VIDEO DECODE
+   Play an H.264 file and an HEVC file and confirm it is not silently falling
+   back to software:
+     sudo dmesg | grep -iE 'avd|apple-vpu' | tail -20
+   Report which codecs you exercised and at what resolution.
+
+8. ONE SUSPEND/RESUME CYCLE AT THE END
+   Ask the owner to lock the screen and, while it waits for a fingerprint,
+   close the lid. Then open it and unlock with the finger. Report whether
+   the Mac woke and whether the finger unlocked it, and quote:
+     sudo dmesg | grep -E 'Touch ID: ending|still running|PM: suspend'
+   Re-check /dev/sep-bio, the display and the dock after resume.
+
+9. NEURAL ENGINE
+   This build carries the in-tree Apple Neural Engine driver
+   (aurora-silicon/linux#155), switched on only for the M1 Max and the M2 Max.
+   On every other Mac no Neural Engine lines are expected, and that is a pass.
+     pacman -Q omarchy-ane-dkms 2>/dev/null   # if installed, say so: its modules replace this kernel's
+     modinfo -F filename ane ane_t6021
+     ls -l /dev/accel/ 2>/dev/null
+     sudo dmesg | grep -iE '\bane\b|ane_t6021|neural' | head -40
+   M1 Max PASS: the ane module is bound, /dev/accel/accel0 exists, and the
+   module path is under kernel/drivers/accel/ane (not updates/dkms).
+   M2 Max: without the Neural Engine firmware, expect a firmware load error and
+   nothing else broken. With it (fetched by Joshua Warren's
+   omarchy-ane-firmware-fetch), expect ane_t6021 bound and /dev/accel/accel0.
+   If omarchy-ane's tools are installed, also run omarchy-ane-check, and on an
+   M2 Max omarchy-ane-check --smoke; quote their result lines.
+   Report any kernel log line at emergency or alert level, and whether idle
+   battery drain changed against the previous build. If the Mac does not finish
+   booting, add module_blacklist=ane,ane_t6021 to the kernel command line from
+   the boot menu, and report that.
+
+   Report "not tested" honestly rather than guessing, for any of the above.
+
+HOW TO REPORT
+  Open one issue per Mac at https://github.com/iconidentify/aurora-linux/issues
+  (not on omacom/linux#7 any more), with the first line of the report as its
+  title. Post later results for the same Mac as comments on that issue.
+  Structure it exactly like this:
+
+    # <board> (<marketing name>): <one-line outcome>
+    **Machine:** apple,jXXX / apple,tXXXX, <model>
+    **Firmware:** asahi,os-fw-version = X, asahi,system-fw-version = Y
+    **Build:** <release tag>, linux-aurora <ver>, m1n1-aurora <ver>
+    **m1n1 guard:** fired / did not fire / stock m1n1 still installed
+    **Touch ID:** enrol <pass/fail>, verify <pass/fail>, verify after reboot <pass/fail>
+    **Thunderbolt:** <dock model, or "no dock"> on port <1 / 2 / both>
+
+    ## What worked
+    ## What did not
+    ## Logs
+    (fenced blocks, trimmed to the relevant lines - never a whole dmesg)
+
+  Rules for the write-up:
+    - Lead with the outcome, not the narrative.
+    - Quote log lines exactly; do not paraphrase an error.
+    - Say explicitly what you did NOT test. "No dock available" and "only
+      tested port 1" are useful answers; silence is not.
+    - Name the dock and the display mode. "CalDigit TS3 Plus, 3840x2160 @ 60"
+      is actionable; "external display worked" is not.
+    - If something failed, give the last known-good state and the first bad one.
+    - Do not claim a fix works because it compiled or because the module
+      loaded. Only step 3's endpoint line and step 5's verify-match count.
+PROMPT
+}
+
+preflight_needed() { case ${1:-} in --agent-prompt) return 1 ;; *) return 0 ;; esac; }
+
+if preflight_needed "${1:-}"; then preflight; fi
+case ${1:-} in
+  "") install_all ;;
+  --read-only) READ_ONLY=1; install_all ;;
+  --uninstall) uninstall_all ;;
+  --agent-prompt) t=$(newer_release); [[ -n $t ]] && warn "the current release is $t; this plan is for $TAG"; agent_prompt ;;
+  *) die "unknown option $1 (--read-only, --uninstall or --agent-prompt)" ;;
+esac

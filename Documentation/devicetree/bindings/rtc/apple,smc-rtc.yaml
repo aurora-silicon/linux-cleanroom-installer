@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/rtc/apple,smc-rtc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SMC RTC
+
+description:
+  Apple Silicon Macs (M1, etc.) have an RTC that is part of the PMU IC,
+  but most of the PMU functionality is abstracted out by the SMC.
+  An additional RTC offset stored inside NVMEM is required to compute
+  the current date/time.
+
+maintainers:
+  - Sven Peter <sven@kernel.org>
+
+properties:
+  compatible:
+    const: apple,smc-rtc
+
+  nvmem-cells:
+    items:
+      - description:
+          RTC offset. By default a 48bit value, specified in 32768 (2^15) Hz
+          clock ticks. With apple,rtc-offset-seconds, a 64bit little-endian
+          count of whole seconds.
+
+  nvmem-cell-names:
+    items:
+      - const: rtc_offset
+
+  apple,rtc-offset-seconds:
+    type: boolean
+    description:
+      The RTC offset cell holds whole seconds rather than 32768 Hz ticks. The
+      current time is the SMC RTC counter's integer seconds plus the offset.
+      Used where the system firmware keeps the offset in a PMU scratchpad
+      register in this format, such as on the t8140 (A18 Pro).
+
+required:
+  - compatible
+  - nvmem-cells
+  - nvmem-cell-names
+
+additionalProperties: false

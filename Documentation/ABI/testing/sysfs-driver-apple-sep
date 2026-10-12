@@ -1,0 +1,212 @@
+What:		/sys/bus/platform/devices/<unit>.sep/diag/abi
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) Version of the diag interface: "1" for the attributes
+		and values described in this file.
+
+		The diag directory holds passive diagnostics of the Apple
+		SEP (Secure Enclave Processor) driver, apple_sep, for
+		unattended test tools that need to know how far the
+		bring-up got without reading the kernel log. It exists while
+		the driver is bound to the SEP: it is created at probe and
+		removed at unbind. Every attribute in it is read-only and
+		reads as one ASCII token followed by a newline.
+
+		Each value is the state the driver recorded when it made the
+		corresponding decision. Reading an attribute sends nothing
+		to the SEP, waits for nothing and starts nothing. No value
+		identifies a user, an enrolled finger or a key.
+
+		Touch ID is activated by the first open of /dev/sep-bio, not
+		by the boot-time bring-up, so the sensor and touchid
+		attributes only move on once something has opened it.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/profile
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) The platform profile the driver selected for this
+		machine, as SoC and board, for example "T6020/J414s". Fixed
+		at probe.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/boot
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) How the driver hands its shared memory to the SEP, as
+		the platform profile sets it. Fixed at probe.
+
+		====	=====================================================
+		cold	The driver boots the SEP and hands the memory over
+			during that boot.
+		warm	The boot firmware left the SEP running, and the
+			driver registers the memory with it in one message.
+		====	=====================================================
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/protocol
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) The key-store protocol the driver speaks to the SEP, as
+		the platform profile sets it. It is not read from the SEP,
+		and it does not identify a sepOS build. Fixed at probe.
+
+		========	=============================================
+		sepos13		The sepOS 13.5 key store, whose endpoint the
+				driver initialises before first use.
+		variant5	The newer key store, which creates keybags
+				with the variant-5 request.
+		========	=============================================
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/xart
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) Whether the SEP's writes to the shared xART store reach
+		the disk. Fixed at probe, when the driver opens the store.
+
+		========	=============================================
+		enabled		Writes reach the store (xart_writes=1, and
+				the store validated for writing).
+		disabled	Writes are refused. Touch ID enrol and verify
+				are refused too, since the SEP must save
+				state after each.
+		========	=============================================
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/attach
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) Whether the SEP answered the driver's attach.
+
+		========	=============================================
+		pending		No outcome yet.
+		attached	The SEP advertised at least one endpoint.
+		failed		The SEP advertised no endpoint; the xART
+				exchange and the key store cannot run this
+				boot.
+		========	=============================================
+
+		The driver decides once about three seconds have passed
+		without an endpoint and the SEP has gone quiet. With boot
+		"warm" that wait starts at probe, so a SEP that never answers
+		ends in "failed". With boot "cold" it starts at the first
+		message from the SEP, so a SEP that never answers the boot
+		request leaves this at "pending" for the rest of the boot.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/endpoints
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) The number of distinct endpoints the SEP has
+		advertised, as an unsigned decimal. It reads "0" until
+		attach reads "attached". Discovery goes on after the attach,
+		so the number can still grow afterwards, and can exceed the
+		count the attach message in the kernel log reports.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/keystore
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) Whether the boot-time bring-up opened the key store.
+
+		=======	==============================================
+		unknown	The bring-up has not decided yet.
+		open	The key-store endpoint is enabled and, where the
+			protocol needs it, initialised.
+		closed	The bring-up ended without opening it. Keybag and
+			Touch ID operations are unavailable this boot.
+		=======	==============================================
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/keybag
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) The identity keybag that Touch ID uses.
+
+		=======	==============================================
+		unknown	Not determined yet.
+		present	An identity keybag exists: one was already
+			persisted, or the bring-up created one. This does
+			not say that it loads; Touch ID activation loads
+			it, and changes this to "failed" if that fails.
+		missing	None is persisted and none was provisioned.
+		failed	Provisioning, reading or loading it failed.
+		=======	==============================================
+
+		With provision_keybag=1, the default, the boot-time bring-up
+		decides it once the key store is open, and it stays
+		"unknown" if the key store never opens. With
+		provision_keybag=0, Touch ID activation decides it when it
+		reads the keybag, and it stays "unknown" if activation fails
+		before that point.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/sensor
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) The fingerprint sensor on its SPI bus. The driver
+		creates the sensor device when Touch ID is activated, and
+		brings the sensor up then and again before each enrol or
+		verify capture.
+
+		=======	==============================================
+		unbound	No SPI sensor device is bound.
+		bound	The sensor is bound and has not been brought up
+			since it bound.
+		online	The most recent bring-up succeeded.
+		failed	The most recent bring-up failed.
+		=======	==============================================
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/touchid
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Chris Kearney <chris@kearneymail.com>
+Description:
+		(RO) Whether Touch ID is ready to enrol and verify.
+
+		=========	============================================
+		unknown		Still in progress: the boot-time bring-up has
+				not finished, or /dev/sep-bio is published
+				but has not been opened yet, or activation
+				is still running.
+		ready		/dev/sep-bio is published, Touch ID was
+				activated, and the most recent sensor
+				bring-up succeeded.
+		not-ready	Touch ID was activated, but the sensor is not
+				online: it is not bound, has not been brought
+				up since it bound, or its most recent
+				bring-up failed. A later bring-up, which
+				each enrol and verify runs, can still make
+				it ready.
+		failed		Touch ID cannot work this boot: the bring-up
+				ended without publishing /dev/sep-bio, or
+				activation failed. Neither is retried before
+				the next boot.
+		=========	============================================
+
+		"failed" can be intentional. With provision_keybag=0, as on
+		a read-only install (xart_writes=0, provision_keybag=0), the
+		bring-up still publishes /dev/sep-bio when no identity
+		keybag exists yet, and its first open then fails activation
+		because there is none: keybag reads "missing" and touchid
+		reads "failed". Read touchid "failed" together with keybag
+		"missing" (and, on a read-only install, xart "disabled") as
+		not provisioned rather than broken. Every other way to reach
+		"failed" is a real failure.
+
+		Because the first open of /dev/sep-bio activates Touch ID, a
+		tool waiting for "ready" has to open it, or let its client
+		do so, first. Enrol and verify also need xart to read
+		"enabled".
