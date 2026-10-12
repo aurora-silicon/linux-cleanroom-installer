@@ -26,4 +26,18 @@ int apple_pmp_j713_gpu_prepare(struct device *consumer); /* During probe only. *
 int apple_pmp_j713_gpu_get(struct device *consumer);
 int apple_pmp_j713_gpu_check(struct device *consumer);
 
+/*
+ * J514S (T6030) display power. pre_run seeds the PTD DISP|ANS request before
+ * the PMP CPU runs (called by pmp-core.rs; a no-op on other boards). prepare
+ * holds the display PMGR chain and requires the bound PMP; get/check require
+ * the PMP to have acknowledged the DISP request.
+ */
+int apple_pmp_display_pre_run(struct device *dev);
+int apple_pmp_j514s_display_prepare(struct device *consumer);
+int apple_pmp_j514s_display_get(struct device *consumer);
+int apple_pmp_j514s_display_check(struct device *consumer);
+int apple_pmp_j514s_gpu_prepare(struct device *consumer); /* During probe only. */
+int apple_pmp_j514s_gpu_get(struct device *consumer);
+int apple_pmp_j514s_gpu_check(struct device *consumer);
+
 #endif

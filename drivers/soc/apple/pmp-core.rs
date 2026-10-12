@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
 use kernel::{
     bindings,
+    error::to_result,
     device::{
         self,
         Core, //
@@ -961,6 +962,9 @@ impl platform::Driver for PmpDriver {
             return Ok(owner);
         }
         *data.rtkit.lock() = Some(rtkit);
+        // SAFETY: `dev` is the live device being probed; the C hook only reads
+        // its OF node and seeds J514S PMP state before the CPU runs.
+        to_result(unsafe { bindings::apple_pmp_display_pre_run(dev.as_raw()) })?;
         data.start_cpu(pdev)?;
         data.start()?;
         Ok(PmpDriver {

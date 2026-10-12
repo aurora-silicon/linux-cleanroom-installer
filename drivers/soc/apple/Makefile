@@ -30,6 +30,8 @@ apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
 		pm_shim.o diag_shim.o
 
 obj-$(CONFIG_APPLE_PMP) += pmp.o
+# Must run before devices are populated, so built in even when pmp is a module.
+obj-$(if $(CONFIG_APPLE_PMP),y) += j514s-pmp-handoff.o
 pmp-y := pmp-core.o pmp-display.o
 
 obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
