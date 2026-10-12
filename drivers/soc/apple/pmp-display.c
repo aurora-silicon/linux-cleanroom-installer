@@ -40,13 +40,13 @@ static DEFINE_MUTEX(j713_display_registration);
 bool apple_pmp_display_retained_board(void)
 {
 	return of_machine_is_compatible("apple,j713") ||
-		of_machine_is_compatible("apple,j514s");
+		apple_pmp_t6030_board();
 }
 
 /* The board's PMP node: J713 by alias and path, J514S by path (no aliases). */
 static struct device_node *pmp_bridge_node(void)
 {
-	if (of_machine_is_compatible("apple,j514s"))
+	if (apple_pmp_t6030_board())
 		return of_find_node_by_path("/soc/pmp@350500000");
 	return of_find_node_by_path("pmp");
 }
@@ -60,7 +60,7 @@ struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
 	int size;
 	bool match;
 
-	bool j514s = of_machine_is_compatible("apple,j514s");
+	bool j514s = apple_pmp_t6030_board();
 
 	if (!dev->of_node ||
 	    !(j514s ? of_device_is_compatible(dev->of_node, "apple,t6030-pmp-v2") :
@@ -138,7 +138,7 @@ static struct apple_pmp_display *j713_display_consumer(struct device *consumer,
 	struct device_node *dcp, *supplier;
 	bool match;
 
-	bool j514s = of_machine_is_compatible("apple,j514s");
+	bool j514s = apple_pmp_t6030_board();
 
 	if (j514s) {
 		/* J514S: the AGX vote only, for the GPU node linked to the PMP. */
@@ -364,7 +364,7 @@ EXPORT_SYMBOL_GPL(apple_pmp_j514s_gpu_check);
 
 static bool j514s_display_board(void)
 {
-	return of_machine_is_compatible("apple,j514s");
+	return apple_pmp_t6030_board();
 }
 
 /* SYS, FE and CPU of the display power chain, parents first. */

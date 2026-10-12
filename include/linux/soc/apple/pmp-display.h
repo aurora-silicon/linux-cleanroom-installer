@@ -2,7 +2,20 @@
 #ifndef _LINUX_SOC_APPLE_PMP_DISPLAY_H
 #define _LINUX_SOC_APPLE_PMP_DISPLAY_H
 
+#include <linux/of.h>
 #include <linux/types.h>
+
+/*
+ * The T6030 (M3 Pro) MacBook Pros, 14-inch J514S and 16-inch J516S: one SoC,
+ * one PMP and GPU path. Board-specific data (PMP tunables, GPU performance
+ * states) comes from the running machine's ADT, not from this match.
+ */
+static inline bool apple_pmp_t6030_board(void)
+{
+	return of_machine_is_compatible("apple,t6030") &&
+	       (of_machine_is_compatible("apple,j514s") ||
+		of_machine_is_compatible("apple,j516s"));
+}
 
 struct device;
 struct apple_pmp_display;
