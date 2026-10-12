@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Pro (14-inch, M3 Pro) internal display coprocessor (DCP).
+ *
+ * Node structure and values match the cleanroom J514S live device tree.
+ * The DCP and its mailbox are live when Linux starts; the DCP driver
+ * (apple-dcp-m4-ready) only acts on explicit sysfs triggers, and the
+ * J514S PMP handoff borrows the AIC phandle from dcp_mbox.
+ *
+ * The boot loader completes these nodes. On dcp it publishes
+ * apple,firmware-uuid, -version and -compat and the memory-region list of
+ * DCP firmware reservations (apple,asc-mem, no-map, with iommu-addresses,
+ * plus one apple,dcp-os-log region). After validating the inherited
+ * frontend mappings it adds memory-region and apple,j514s-inherited-mappings
+ * to piodma and display-subsystem and enables them and both DARTs.
+ * apple,j514s-native-piodma and apple,j514s-native-scanout opt in to that.
+ * The DCP driver also reads the ADT through the loader's phram "adt"
+ * region. Without that handoff the DARTs stay disabled and the DCP and
+ * frontend are refused, leaving the firmware framebuffer in place.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/ {
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+		disp0_piodma = &disp0_piodma;
+	};
+};
+
+&soc {
+	dcp_mbox: mailbox@28ec08000 {
+		compatible = "apple,t6030-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x8ec08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 589 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 590 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 591 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 592 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_disp_cpu>;
+		#mbox-cells = <0>;
+	};
+
+	/* DCP firmware DART: SID5. */
+	dcp_dart: iommu@28d30c000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x2 0x8d30c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 609 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled"; /* Enabled by the loader. */
+	};
+
+	/* Display frontend DART: SID0 scanout, SID4 PIODMA. */
+	disp0_dart: iommu@28d304000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x2 0x8d304000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 609 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled"; /* Enabled by the loader. */
+	};
+
+	dcp: dcp@28ec00000 {
+		compatible = "apple,t6030-dcp";
+		reg = <0x2 0x8ec00000 0x0 0x4000>,
+		      <0x2 0x8c000000 0x0 0x690000>,
+		      <0x2 0x8c800000 0x0 0x690000>,
+		      <0x2 0x8d320000 0x0 0x4000>,
+		      <0x2 0x8d344000 0x0 0x4000>,
+		      <0x2 0x8e800000 0x0 0x800000>,
+		      <0x3 0x503d0000 0x0 0x4000>,
+		      <0x2 0x8e850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4", "disp-5", "iop-vbar";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 5>;
+		power-domains = <&ps_disp_cpu>;
+		apple,j514s-native-piodma;
+		apple,j514s-native-scanout;
+		/* Full 3024x1964 panel including the notch rows, 254 ppi. */
+		apple,panel-width-mm = <302>;
+		apple,panel-height-mm = <196>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 4>;
+			status = "disabled"; /* Enabled by the loader. */
+		};
+	};
+
+	display: display-subsystem {
+		compatible = "apple,t6030-display-diagnostics";
+		iommus = <&disp0_dart 0>;
+		status = "disabled"; /* Enabled by the loader. */
+	};
+};
+
+/* The display domains stay firmware-owned and on. */
+&ps_disp_sys {
+	apple,inherited-on;
+};
+
+&ps_disp_fe {
+	apple,inherited-on;
+};
+
+&ps_disp_cpu {
+	apple,inherited-on;
+};
