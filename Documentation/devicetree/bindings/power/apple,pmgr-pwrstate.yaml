@@ -79,6 +79,13 @@ properties:
       Forces this power domain to always be powered up.
     type: boolean
 
+  apple,firmware-owned:
+    description:
+      The boot loader hands over the coprocessor in this domain running, and its
+      firmware owns the domain's power state; writing it faults. The OS keeps the
+      domain on and never changes its power target, automatic gating or reset.
+    type: boolean
+
   apple,min-state:
     description:
       Specifies the minimum power state for auto-PM.

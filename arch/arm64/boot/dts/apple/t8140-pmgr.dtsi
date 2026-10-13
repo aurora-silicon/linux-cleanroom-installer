@@ -397,6 +397,7 @@
 		 * firmware owns this state; writing it faults.
 		 */
 		apple,always-on;
+		apple,firmware-owned;
 	};
 
 
