@@ -89,6 +89,7 @@ struct gpu_m4_initdata_input {
 	u64 channel_state[12], channel_ring[12];
 	u64 loader_va[GPU_M4_LOADER_COUNT];
 	u64 scratch, lower_uma, lower_parameter;
+	u32 ktrace_mask; /* Control+0: firmware Ktrace class mask */
 };
 
 static inline bool gpu_m4_bootstrap_alias(u64 va)
@@ -171,7 +172,7 @@ static inline int gpu_m4_encode_initdata(const struct gpu_m4_initdata_input *in,
 	put_unaligned_le64(in->va[GPU_M4_FWCTL], fw + 0x4f88);
 	put_unaligned_le64(in->va[GPU_M4_FWCTL] + 0x40, fw + 0x4f90);
 	put_unaligned_le32(1, fw + 0x4fd4);
-	put_unaligned_le32(0x33, in->object[GPU_M4_CONTROL]);
+	put_unaligned_le32(in->ktrace_mask, in->object[GPU_M4_CONTROL]);
 	put_unaligned_le32(0xffffffff, in->object[GPU_M4_ACTIVITY_FRAGMENT] + 0xc18);
 	put_unaligned_le32(0xffffffff, in->object[GPU_M4_ACTIVITY_FRAGMENT] + 0xc30);
 	for (unsigned int i = 0; i < sizeof(globals) / sizeof(globals[0]); i++)

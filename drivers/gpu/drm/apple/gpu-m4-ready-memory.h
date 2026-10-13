@@ -58,6 +58,16 @@ MODULE_PARM_DESC(upper_alias_trial, "Fresh first-store alias trial: 0 off, 1 exi
 static unsigned int pstate_max = GPU_M4_PSTATE_MAX;
 module_param(pstate_max, uint, 0400);
 MODULE_PARM_DESC(pstate_max, "Configured GPU maximum performance state S, 1..9 (9 = 1470 MHz)");
+/* Firmware Ktrace class mask, Control+0, imported once at initdata: bit n
+ * enables tag class 0x100*n. Every enabled record is written synchronously
+ * by the scheduling, completion and notifier paths that emit it (mutex,
+ * 0x48-byte ring store, DSB, producer publish, and a spin when the ring is
+ * full), roughly 26 per render and 12 per compute. Native publishes 0 unless
+ * kdebug tracing is active; 0x33 (classes 0,1,4,5) is the diagnostic set.
+ */
+static unsigned int ktrace_mask;
+module_param(ktrace_mask, uint, 0400);
+MODULE_PARM_DESC(ktrace_mask, "Firmware Ktrace class mask published at initdata (default 0 as native; 0x33 diagnostic)");
 
 struct m4_ready_buffer {
 	void *cpu;
@@ -368,6 +378,7 @@ static int m4_ready_prepare(struct m4_gpu_hello *h)
 	r->pstate.configured = pstate_max;
 	r->pstate.user = GPU_M4_PSTATE_MAX;
 	gpu_m4_thermal_init(&r->pstate.thermal);
+	in->ktrace_mask = ktrace_mask & 0x3ff;
 	ret = gpu_m4_encode_initdata(in, r->pstate.configured);
 	if (ret)
 		return ret;
