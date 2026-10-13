@@ -193,8 +193,7 @@ static int gpu_m4_drm_vm_owner_extra_check(const struct gpu_m4_drm_cache_access 
 	struct gpu_m4_drm_bo_pin *pin = a->pin;
 	struct drm_gem_object *object;
 	enum gpu_m4_drm_cpu_policy policy;
-	u64 length, end, actual;
-	int ret;
+	u64 length;
 
 	if (IS_ERR_OR_NULL(pin))
 		return pin ? PTR_ERR(pin) : -ENOENT;
@@ -208,14 +207,7 @@ static int gpu_m4_drm_vm_owner_extra_check(const struct gpu_m4_drm_cache_access 
 	if (!gpu_m4_drm_aligned(length) || !gpu_m4_drm_vm_leaf_attrs(a->access) ||
 	    !a->size || a->offset >= length || a->size > length - a->offset)
 		return -EINVAL;
-	end = a->offset + a->size;
-	for (u64 page = a->offset & ~(GPU_M4_DRM_PAGE_SIZE - 1); page < end;
-	     page += GPU_M4_DRM_PAGE_SIZE) {
-		ret = gpu_m4_drm_bo_pin_page(pin, page, &actual);
-		if (ret)
-			return ret;
-	}
-	return 0;
+	return gpu_m4_drm_bo_pin_range(pin, a->offset, a->size);
 }
 
 /*
@@ -231,19 +223,13 @@ static int gpu_m4_drm_vm_owner_join(struct gpu_m4_drm_cache_access *a,
 	u64 end = x->offset + x->size;
 
 	if (x->pin != a->pin) {
+		int ret;
+
 		if (gpu_m4_drm_bo_pin_size(x->pin) != gpu_m4_drm_bo_pin_size(a->pin))
 			return -EPROTO;
-		for (u64 page = x->offset & ~(GPU_M4_DRM_PAGE_SIZE - 1); page < end;
-		     page += GPU_M4_DRM_PAGE_SIZE) {
-			u64 first, actual;
-			int ret = gpu_m4_drm_bo_pin_page(a->pin, page, &first);
-
-			if (ret)
-				return ret;
-			ret = gpu_m4_drm_bo_pin_page(x->pin, page, &actual);
-			if (ret || first != actual)
-				return ret ? ret : -EPROTO;
-		}
+		ret = gpu_m4_drm_bo_pin_same_range(a->pin, x->pin, x->offset, x->size);
+		if (ret)
+			return ret;
 	}
 	end = max(end, a->offset + a->size);
 	a->offset = min(x->offset, a->offset);

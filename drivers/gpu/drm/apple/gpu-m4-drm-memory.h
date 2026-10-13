@@ -21,6 +21,9 @@ void gpu_m4_drm_bo_pin_put(struct gpu_m4_drm_bo_pin *pin);
 struct drm_gem_object *gpu_m4_drm_bo_pin_object(struct gpu_m4_drm_bo_pin *pin);
 u64 gpu_m4_drm_bo_pin_size(struct gpu_m4_drm_bo_pin *pin);
 int gpu_m4_drm_bo_pin_page(struct gpu_m4_drm_bo_pin *pin, u64 offset, u64 *pa);
+int gpu_m4_drm_bo_pin_range(struct gpu_m4_drm_bo_pin *pin, u64 offset, u64 size);
+int gpu_m4_drm_bo_pin_same_range(struct gpu_m4_drm_bo_pin *a, struct gpu_m4_drm_bo_pin *b,
+	u64 offset, u64 size);
 
 struct gpu_m4_drm_cache_access {
 	struct gpu_m4_drm_bo_pin *pin;

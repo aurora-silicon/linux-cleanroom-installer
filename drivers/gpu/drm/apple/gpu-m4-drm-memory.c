@@ -165,6 +165,63 @@ int gpu_m4_drm_bo_pin_page(struct gpu_m4_drm_bo_pin *pin, u64 offset, u64 *pa)
 }
 EXPORT_SYMBOL_GPL(gpu_m4_drm_bo_pin_page);
 
+/* gpu_m4_drm_bo_pin_page() would succeed for every GPU page that
+ * [offset, offset + size) touches. An admitted pin proved all of its pages at
+ * acquisition, so only the bounds remain to check; an unadmitted pin is still
+ * checked page by page.
+ */
+int gpu_m4_drm_bo_pin_range(struct gpu_m4_drm_bo_pin *pin, u64 offset, u64 size)
+{
+	u64 page, end, pa;
+	int ret;
+
+	if (!pin || !size || !gpu_m4_drm_aligned(pin->size) || offset >= pin->size ||
+	    size > pin->size - offset)
+		return -EINVAL;
+	if (pin->admitted)
+		return 0;
+	end = offset + size;
+	for (page = offset & ~(GPU_M4_DRM_PAGE_SIZE - 1); page < end;
+	     page += GPU_M4_DRM_PAGE_SIZE) {
+		ret = gpu_m4_drm_bo_pin_page(pin, page, &pa);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(gpu_m4_drm_bo_pin_range);
+
+/* Two pins of equal size name the same physical page at every GPU page that
+ * [offset, offset + size) touches. Admitted pins compare their proven page
+ * vectors directly; otherwise each page is re-proved through both pins.
+ */
+int gpu_m4_drm_bo_pin_same_range(struct gpu_m4_drm_bo_pin *a, struct gpu_m4_drm_bo_pin *b,
+	u64 offset, u64 size)
+{
+	u64 page, end, first, actual;
+	int ret;
+
+	if (!a || !b || a->size != b->size || !size || !gpu_m4_drm_aligned(a->size) ||
+	    offset >= a->size || size > a->size - offset)
+		return -EINVAL;
+	end = offset + size;
+	for (page = offset & ~(GPU_M4_DRM_PAGE_SIZE - 1); page < end;
+	     page += GPU_M4_DRM_PAGE_SIZE) {
+		if (a->admitted && b->admitted) {
+			if (a->pages[page / PAGE_SIZE] != b->pages[page / PAGE_SIZE])
+				return -EPROTO;
+			continue;
+		}
+		ret = gpu_m4_drm_bo_pin_page(a, page, &first);
+		if (!ret)
+			ret = gpu_m4_drm_bo_pin_page(b, page, &actual);
+		if (ret || first != actual)
+			return ret ? ret : -EPROTO;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(gpu_m4_drm_bo_pin_same_range);
+
 static int gpu_m4_drm_cache_validate(const struct gpu_m4_drm_cache_access *a)
 {
 	u32 allowed = DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE;
