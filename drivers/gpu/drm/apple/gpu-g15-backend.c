@@ -333,6 +333,12 @@ struct g15_backend {
 	 */
 	u64 pub_ns, idle_from_ns, starve_from_ns, prep_from_ns;
 	u64 st_starved_ns, st_prep_ns;	/* idle with nothing ready; prefix preparation */
+	/*
+	 * Internal stage timestamps of retired prefixes (24 MHz ticks): summed
+	 * TA, FS and compute durations, and the span from the earliest start
+	 * to the latest end of each prefix.
+	 */
+	u64 st_ta_ticks, st_fs_ticks, st_cdm_ticks, st_span_ticks;
 	u64 st_count[3], st_prefixes[3], st_busy_ns[3], st_max_ns[3];	/* [2]: mixed commands */
 	u64 st_gap_ns, st_gaps, st_yields;
 	u64 st_first_ns[3], st_last_ns[3];	/* publish to first / last stage event */
@@ -1371,10 +1377,33 @@ static void g15_stat_publish(struct g15_backend *be)
 	be->starve_from_ns = 0;
 }
 
+/* Add one stage interval read from internal timestamp cells (start, end). */
+static void g15_stat_stage(const struct g15_buf *b, u64 off, u64 *sum, u64 *lo, u64 *hi)
+{
+	u64 start = (u64)g15_buf_r32(b, off + 4) << 32 | g15_buf_r32(b, off);
+	u64 end = (u64)g15_buf_r32(b, off + 12) << 32 | g15_buf_r32(b, off + 8);
+
+	if (!start || end < start)
+		return;
+	*sum += end - start;
+	*lo = min(*lo, start);
+	*hi = max(*hi, end);
+}
+
 static void g15_stat_retire(struct g15_backend *be)
 {
 	u64 now = ktime_get_ns(), d = now - be->pub_ns, first = U64_MAX, last = 0;
 	u32 kind = be->active_compute && be->active_render ? 2 : be->active_render;
+	u64 lo = U64_MAX, hi = 0;
+
+	for (u32 k = 0; k < be->active_renders; k++) {
+		g15_stat_stage(&be->r.pass[k].its, 0, &be->st_ta_ticks, &lo, &hi);
+		g15_stat_stage(&be->r.pass[k].its, 0x10, &be->st_fs_ticks, &lo, &hi);
+	}
+	for (u32 k = 0; k < be->active_computes; k++)
+		g15_stat_stage(&be->g.slot[k].its, 0, &be->st_cdm_ticks, &lo, &hi);
+	if (hi > lo)
+		be->st_span_ticks += hi - lo;
 
 	for (u32 b = 0; b < 3; b++) {
 		u64 t = READ_ONCE(be->gpu->event_ns[b]);
@@ -2935,6 +2964,9 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 		   be->st_hang_kills, be->st_clustered);
 	seq_printf(m, "ct_sync %llu starved_us %llu prep_us %llu\n", be->st_ct_sync,
 		   div_u64(be->st_starved_ns, 1000), div_u64(be->st_prep_ns, 1000));
+	seq_printf(m, "stage: ta_us %llu fs_us %llu cdm_us %llu span_us %llu\n",
+		   div_u64(be->st_ta_ticks, 24), div_u64(be->st_fs_ticks, 24),
+		   div_u64(be->st_cdm_ticks, 24), div_u64(be->st_span_ticks, 24));
 	mutex_unlock(&be->lock);
 	return 0;
 }
