@@ -4,6 +4,7 @@
 #include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/export.h>
+#include <linux/interval_tree_generic.h>
 #include <linux/ioport.h>
 #include <linux/list.h>
 #include <linux/mm.h>
@@ -105,6 +106,7 @@ struct gpu_m4_drm_provider_vm {
 	struct list_head link, garbage, objects, versions;
 	struct gpu_m4_drm_provider_vm *member_next; /* p->member_vm while on p->vms */
 	struct list_head private_leases;
+	struct rb_root_cached private_tree; /* the same leases by [start, end) */
 	struct gpu_m4_drm_provider *provider;
 	struct gpu_m4_drm_vm *frontend;
 	struct gpu_m4_drm_provider_context context;
@@ -186,12 +188,23 @@ struct gpu_m4_drm_provider_vm {
 
 struct gpu_m4_drm_provider_private_lease {
 	struct list_head link, garbage;
+	struct rb_node rb;	/* vm->private_tree while linked */
+	u64 subtree_last;
 	struct gpu_m4_drm_provider_vm *vm;
 	refcount_t refs;
 	u64 va, size, start, end;
 	/* Scratch of one locked baseline build: already listed in it. */
 	u64 baseline_stamp;
 };
+
+/* Guarded claims [start, end) of one VM, for overlap queries in O(log n):
+ * the private VA search otherwise rescans every claim per candidate.
+ */
+#define GPU_M4_PRIVATE_LEASE_START(l) ((l)->start)
+#define GPU_M4_PRIVATE_LEASE_LAST(l) ((l)->end - 1)
+INTERVAL_TREE_DEFINE(struct gpu_m4_drm_provider_private_lease, rb, u64, subtree_last,
+		     GPU_M4_PRIVATE_LEASE_START, GPU_M4_PRIVATE_LEASE_LAST, static,
+		     gpu_m4_private_lease)
 
 /* Page-legitimacy admission of ONE retained native pin: every PA of exactly
  * this pin/PA vector passed config.validate_page once under the provider lock.
@@ -829,7 +842,7 @@ struct gpu_m4_drm_provider_private_lease *gpu_m4_drm_provider_private_reserve_lo
 	struct gpu_m4_drm_provider_vm *vm, u64 va, u64 size,
 	u64 guard_before, u64 guard_after)
 {
-	struct gpu_m4_drm_provider_private_lease *lease, *other;
+	struct gpu_m4_drm_provider_private_lease *lease;
 	struct gpu_m4_drm_provider *p;
 	u64 start, end;
 	int ret;
@@ -849,9 +862,8 @@ struct gpu_m4_drm_provider_private_lease *gpu_m4_drm_provider_private_reserve_lo
 		return ERR_PTR(-ENOSPC);
 	start = va - guard_before;
 	end = va + size + guard_after;
-	list_for_each_entry(other, &vm->private_leases, link)
-		if (start < other->end && other->start < end)
-			return ERR_PTR(-EADDRINUSE);
+	if (gpu_m4_private_lease_iter_first(&vm->private_tree, start, end - 1))
+		return ERR_PTR(-EADDRINUSE);
 	ret = gpu_m4_drm_provider_charge(p, sizeof(*lease));
 	if (ret)
 		return ERR_PTR(ret);
@@ -869,6 +881,7 @@ struct gpu_m4_drm_provider_private_lease *gpu_m4_drm_provider_private_reserve_lo
 	INIT_LIST_HEAD(&lease->garbage);
 	gpu_m4_drm_provider_vm_get_locked(vm);
 	list_add_tail(&lease->link, &vm->private_leases);
+	gpu_m4_private_lease_insert(lease, &vm->private_tree);
 	vm->private_lease_count++;
 	return lease;
 }
@@ -896,9 +909,8 @@ struct gpu_m4_drm_provider_private_lease *gpu_m4_drm_provider_private_adopt_lock
 		return ERR_PTR(p->error ? p->error : -ENOENT);
 	start = va - guard_before;
 	end = va + size + guard_after;
-	list_for_each_entry(other, &vm->private_leases, link) {
-		if (!(start < other->end && other->start < end))
-			continue;
+	for (other = gpu_m4_private_lease_iter_first(&vm->private_tree, start, end - 1); other;
+	     other = gpu_m4_private_lease_iter_next(other, start, end - 1)) {
 		if (found || other->va != va || other->size != size || other->start != start ||
 		    other->end != end || !refcount_read(&other->refs))
 			return ERR_PTR(-EADDRINUSE);
@@ -933,18 +945,18 @@ int gpu_m4_drm_provider_private_find_locked(struct gpu_m4_drm_provider_vm *vm,
 		return -ENOSPC;
 	limit = high - size - guard_after;
 	candidate = ALIGN(max(minimum_va, low + guard_before), alignment);
-	/* Each advance passes the end of at least one distinct held interval.
-	 * The list is deliberately not assumed sorted; guards are claim bounds.
+	/* Each advance passes the end of at least one distinct held interval;
+	 * guards are claim bounds.
 	 */
 	for (u32 skipped = 0; skipped <= vm->private_lease_count; skipped++) {
-		u64 next = candidate;
+		u64 next = candidate, first = candidate - guard_before;
+		u64 last = candidate + size + guard_after - 1;
 
 		if (candidate > limit)
 			return -ENOSPC;
-		list_for_each_entry(other, &vm->private_leases, link)
-			if (candidate - guard_before < other->end &&
-			    other->start < candidate + size + guard_after)
-				next = max(next, ALIGN(other->end + guard_before, alignment));
+		for (other = gpu_m4_private_lease_iter_first(&vm->private_tree, first, last); other;
+		     other = gpu_m4_private_lease_iter_next(other, first, last))
+			next = max(next, ALIGN(other->end + guard_before, alignment));
 		if (next == candidate) {
 			*va = candidate;
 			return 0;
@@ -986,6 +998,7 @@ void gpu_m4_drm_provider_private_put_locked(struct gpu_m4_drm_provider_private_l
 	lockdep_assert_held(vm->provider->lock);
 	if (refcount_dec_and_test(&lease->refs)) {
 		list_del_init(&lease->link);
+		gpu_m4_private_lease_remove(lease, &vm->private_tree);
 		vm->private_lease_count--;
 		list_add_tail(&lease->garbage, &vm->provider->garbage_private);
 	}
@@ -5052,6 +5065,7 @@ static struct gpu_m4_drm_provider_vm *gpu_m4_drm_provider_vm_create_owned(
 	INIT_LIST_HEAD(&vm->objects);
 	INIT_LIST_HEAD(&vm->versions);
 	INIT_LIST_HEAD(&vm->private_leases);
+	vm->private_tree = RB_ROOT_CACHED;
 	INIT_LIST_HEAD(&vm->garbage);
 	spin_lock_init(&vm->capture_lock);
 	mutex_lock(p->lock);
