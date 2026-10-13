@@ -120,13 +120,34 @@ static const struct gpu_m4_compute_ts_ops m4_user_compute_ts_ops = {
 	.put = m4_user_compute_ts_put,
 };
 
+/* Reuse a compute range proof while the version's tree/graph is unchanged
+ * for that range: the same span cache (kind 4, range) render attachment and
+ * backing checks use. Every publish re-proves the command's seven private
+ * regions, whose 32 MiB USC pool alone is a 2048-page tree walk (a third
+ * of a trivial compute's ~30 us publication). 0: walk every time.
+ */
+static bool compute_range_memo = true;
+#ifdef MODULE
+module_param(compute_range_memo, bool, 0644);
+MODULE_PARM_DESC(compute_range_memo, "Reuse compute private/stream range proofs while the VM range is unchanged (default 1)");
+#endif
+
 static int m4_user_compute_range(void *cookie, u64 va, u64 size, bool write)
 {
 	struct m4_user_compute_packet *out = cookie;
+	struct gpu_m4_drm_uat_span_key key = {
+		.kind = GPU_M4_RENDER_NATIVE_SPAN_RANGE, .va = va, .size = size,
+		.access = DRM_ASAHI_BIND_READ | (write ? DRM_ASAHI_BIND_WRITE : 0),
+	};
+	bool memo = READ_ONCE(compute_range_memo);
+	int ret;
 
-	return M4_USER_WHY(m4_user_compute_status(gpu_m4_drm_provider_version_range_locked(
-		out->input.version, va, size, DRM_ASAHI_BIND_READ |
-		(write ? DRM_ASAHI_BIND_WRITE : 0))), "compute %u range %#llx+%#llx write=%d",
+	if (memo && gpu_m4_drm_provider_version_span_cached_locked(out->input.version, &key))
+		return 0;
+	ret = gpu_m4_drm_provider_version_range_locked(out->input.version, va, size, key.access);
+	if (!ret && memo)
+		gpu_m4_drm_provider_version_span_remember_locked(out->input.version, &key);
+	return M4_USER_WHY(m4_user_compute_status(ret), "compute %u range %#llx+%#llx write=%d",
 		out->command_index, M4_WHY64(va), M4_WHY64(size), write);
 }
 
