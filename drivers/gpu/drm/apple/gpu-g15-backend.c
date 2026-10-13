@@ -184,6 +184,10 @@ static bool slot_rotate = true;
 module_param(slot_rotate, bool, 0644);
 MODULE_PARM_DESC(slot_rotate, "Give each prefix's computes the slots after the previous prefix's, so slots are scrubbed in the background while the next prefix runs; 0: always from slot 0");
 
+static bool pass_full_reset = true;
+module_param(pass_full_reset, bool, 0644);
+MODULE_PARM_DESC(pass_full_reset, "Also zero a pass slot's auxiliary, heap-metadata and scene-user buffers on every use (per-use reset contract)");
+
 static bool early_tiling = true;
 module_param(early_tiling, bool, 0444);
 MODULE_PARM_DESC(early_tiling, "Advertise fragment-only render dependencies: a flagged render's tiling may overlap the previous pass's fragments within a prefix");
@@ -2379,6 +2383,16 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	g15_buf_fill(&p->its, 0, 0, 32);
 	g15_buf_fill(&p->tpc, 0, 0, geo.tpc_bytes);
 	g15_buf_fill(&p->tilemap, 0, 0, geo.tilemap_bytes);
+	/*
+	 * The rest of the slot's firmware/GPU-written storage, as the per-use
+	 * reset contract (b) requires: auxiliary, heap metadata (logical span)
+	 * and scene-user, all zeroed.
+	 */
+	if (READ_ONCE(pass_full_reset)) {
+		g15_buf_fill(&p->aux, 0, 0, 0x20000);
+		g15_buf_fill(&p->heap, 0, 0, 0x1000);
+		g15_buf_fill(&p->scene_user, 0, 0, 0x10000);
+	}
 	/* Preemption save areas start zeroed on every use (clustering contract 5). */
 	g15_buf_fill(&p->pre[0], 0, 0, r->pre_records * 0x540);
 	g15_buf_fill(&p->pre[1], 0, 0, r->pre_records * 0x280);
