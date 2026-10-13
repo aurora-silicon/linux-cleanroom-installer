@@ -176,6 +176,10 @@ static bool ct_async = true;
 module_param(ct_async, bool, 0644);
 MODULE_PARM_DESC(ct_async, "Zero a retired pass's clustering buffer in the background while the next prefix runs; 0: zero it when it is next claimed");
 
+static bool slot_rotate = true;
+module_param(slot_rotate, bool, 0644);
+MODULE_PARM_DESC(slot_rotate, "Give each prefix's computes the slots after the previous prefix's, so slots are scrubbed in the background while the next prefix runs; 0: always from slot 0");
+
 static bool early_tiling = true;
 module_param(early_tiling, bool, 0444);
 MODULE_PARM_DESC(early_tiling, "Advertise fragment-only render dependencies: a flagged render's tiling may overlap the previous pass's fragments within a prefix");
@@ -240,6 +244,7 @@ struct g15_buf {
 struct g15_slot {
 	struct g15_buf work, seq, preempt, tail, its, uts, scratch[5];
 	struct g15_buf barrier;	/* mixed prefix: wait on the previous render's FS */
+	u32 state;		/* G15_CT_* scrub state of its mutable storage (be->ct_lock) */
 };
 
 struct g15_graph {
@@ -248,16 +253,20 @@ struct g15_graph {
 	struct g15_buf qinfo, qstate, ring, qscratch, user_stamp, fw_stamp;
 	struct g15_slot slot[G15_COMPUTE_SLOTS];
 	u32 slots;
+	u32 cursor;				/* next slot to try */
+	bool rotating;				/* slot_rotate of the prefix in preparation/active */
+	u32 used[G15_COMPUTE_SLOTS], used_count;	/* slots of the prefix in preparation/active */
 };
 
 /* One render pass slot (slot 0 only in this version). */
 /*
- * A clustering buffer is all zero while CLEAN. A prefix claims it (USED,
- * dirty: the span its pass may write); after the prefix retires it is DIRTY
- * until the clear worker (CLEARING) or a claim with no CLEAN buffer left
- * zeroes that span. States change under be->ct_lock.
+ * A clustering buffer is all zero while CLEAN (a compute slot: its runtime
+ * storage scrubbed). A prefix claims it (USED; dirty: the span its pass may
+ * write); after the prefix retires it is DIRTY until the scrub worker
+ * (CLEARING) or a claim with no CLEAN one left resets it. States change under
+ * be->ct_lock.
  */
-enum { G15_CT_CLEAN, G15_CT_USED, G15_CT_DIRTY, G15_CT_CLEARING };
+enum { G15_CT_CLEAN, G15_CT_USED, G15_CT_DIRTY, G15_CT_CLEARING, G15_CT_STALE };
 
 struct g15_ct {
 	struct g15_buf b;
@@ -346,6 +355,7 @@ struct g15_backend {
 	u64 st_early;				/* early-tiled render members */
 	u64 st_clustered;			/* clustered render members */
 	u64 st_ct_sync;				/* clustering buffers zeroed at claim */
+	u64 st_slot_sync;			/* compute slots scrubbed at claim */
 	spinlock_t ct_lock;
 	struct work_struct ct_clear;
 	struct dentry *debugfs;
@@ -576,6 +586,20 @@ static int g15_graph_alloc(struct g15_backend *be)
 	return ret;
 }
 
+/*
+ * Per-use reset of a retired compute slot's runtime storage (scheduling
+ * contract 2, per-use reset contract a): timestamp cells, tail and sequence
+ * scratch zeroed, preemption poisoned with 0xcc.
+ */
+static void g15_slot_scrub(struct g15_slot *s)
+{
+	g15_buf_fill(&s->its, 0, 0, 16);
+	g15_buf_fill(&s->tail, 0, 0, 0x10000);
+	for (u32 k = 0; k < 5; k++)
+		g15_buf_fill(&s->scratch[k], 0, 0, 0x10000);
+	g15_buf_fill(&s->preempt, 0, 0xcc, 0x10000);
+}
+
 /* Initial contents (contract section 3); firmware owns them afterwards. */
 static void g15_graph_init(struct g15_backend *be)
 {
@@ -626,6 +650,10 @@ static void g15_graph_init(struct g15_backend *be)
 
 	g15_buf_w32(&g->user_stamp, 0, G15_STAMP_SEED);
 	g15_buf_w32(&g->fw_stamp, 0, 0);
+	for (u32 k = 0; k < g->slots; k++) {
+		g15_slot_scrub(&g->slot[k]);
+		g->slot[k].state = G15_CT_CLEAN;
+	}
 	wmb();
 }
 
@@ -1400,8 +1428,8 @@ static void g15_stat_retire(struct g15_backend *be)
 		g15_stat_stage(&be->r.pass[k].its, 0, &be->st_ta_ticks, &lo, &hi);
 		g15_stat_stage(&be->r.pass[k].its, 0x10, &be->st_fs_ticks, &lo, &hi);
 	}
-	for (u32 k = 0; k < be->active_computes; k++)
-		g15_stat_stage(&be->g.slot[k].its, 0, &be->st_cdm_ticks, &lo, &hi);
+	for (u32 k = 0; k < be->g.used_count; k++)
+		g15_stat_stage(&be->g.slot[be->g.used[k]].its, 0, &be->st_cdm_ticks, &lo, &hi);
 	if (hi > lo)
 		be->st_span_ticks += hi - lo;
 
@@ -1553,14 +1581,9 @@ static int g15_encode_compute(struct g15_backend *be, struct g15_slot *s,
 	put_unaligned_le64(W + 0x860, q + 0x238 + 0x6d);
 	put_unaligned_le32(0x40000002, q + 0x2b4);
 
-	/* Reset the mutable slot after the previous retirement, then publish. */
+	/* Rewrite the slot's images (its runtime storage is already scrubbed). */
 	g15_buf_fill(&s->work, 0, 0, G15_WORK_SIZE);
 	g15_buf_fill(&s->seq, 0, 0, 0x1000);
-	g15_buf_fill(&s->its, 0, 0, 16);
-	g15_buf_fill(&s->tail, 0, 0, 0x10000);
-	for (u32 k = 0; k < 5; k++)
-		g15_buf_fill(&s->scratch[k], 0, 0, 0x10000);
-	g15_buf_fill(&s->preempt, 0, 0xcc, 0x10000);
 	g15_buf_write(&s->work, 0, w, G15_WORK_SIZE);
 	g15_buf_write(&s->seq, 0, q, G15_SEQ_SIZE);
 	kfree(w);
@@ -1988,12 +2011,34 @@ static void g15_encode_fs(struct g15_backend *be, struct g15_pass *p, const stru
 	put_unaligned_le32(0x40000002, q + 0x30c);
 }
 
-/* Zero retired clustering buffers (their written span) outside be->lock. */
+/*
+ * Reset retired storage outside be->lock: compute slots' runtime storage and
+ * clustering buffers (their written span).
+ */
 static void g15_ct_clear_work(struct work_struct *work)
 {
 	struct g15_backend *be = container_of(work, struct g15_backend, ct_clear);
+	struct g15_graph *g = &be->g;
 	struct g15_render *r = &be->r;
 
+	for (;;) {
+		struct g15_slot *s = NULL;
+
+		spin_lock(&be->ct_lock);
+		for (u32 k = 0; !s && k < g->slots; k++)
+			if (g->slot[k].state == G15_CT_DIRTY)
+				s = &g->slot[k];
+		if (s)
+			s->state = G15_CT_CLEARING;
+		spin_unlock(&be->ct_lock);
+		if (!s)
+			break;
+		g15_slot_scrub(s);
+		wmb();	/* scrubbed before the slot can be claimed */
+		spin_lock(&be->ct_lock);
+		s->state = G15_CT_CLEAN;
+		spin_unlock(&be->ct_lock);
+	}
 	for (;;) {
 		struct g15_ct *c = NULL;
 
@@ -2056,20 +2101,87 @@ static struct g15_ct *g15_ct_claim(struct g15_backend *be, u64 bytes)
 }
 
 /*
- * The clustering buffers of the retired (or never published) prefix: zero
- * them in the background while the next prefix runs.
+ * A scrubbed compute slot for a member of the prefix being prepared
+ * (be->lock held): the first clean slot from the cursor, which follows the
+ * previous prefix's slots, so they can be scrubbed while this one runs. With
+ * none clean, a retired slot is scrubbed here.
+ */
+static struct g15_slot *g15_slot_claim(struct g15_backend *be, u32 *index)
+{
+	struct g15_graph *g = &be->g;
+	struct g15_slot *s = NULL;
+	bool scrub = false;
+	u32 k = 0;
+
+	if (!g->used_count)
+		g->rotating = READ_ONCE(slot_rotate);
+	if (!g->rotating) {
+		/* Member j in slot j, scrubbed here unless still clean. */
+		k = g->used_count;
+		s = &g->slot[k];
+		spin_lock(&be->ct_lock);
+		while (s->state == G15_CT_CLEARING) {
+			spin_unlock(&be->ct_lock);
+			flush_work(&be->ct_clear);
+			spin_lock(&be->ct_lock);
+		}
+		scrub = s->state != G15_CT_CLEAN;
+		s->state = G15_CT_USED;
+		spin_unlock(&be->ct_lock);
+	}
+	for (u32 attempt = 0; !s && attempt < 2; attempt++) {
+		spin_lock(&be->ct_lock);
+		for (u32 i = 0; !s && i < g->slots; i++) {
+			k = (g->cursor + i) % g->slots;
+			if (g->slot[k].state == G15_CT_CLEAN)
+				s = &g->slot[k];
+		}
+		for (u32 i = 0; !s && i < g->slots; i++) {
+			k = (g->cursor + i) % g->slots;
+			if (g->slot[k].state == G15_CT_DIRTY || g->slot[k].state == G15_CT_STALE)
+				s = &g->slot[k];
+		}
+		if (s) {
+			scrub = s->state != G15_CT_CLEAN;
+			s->state = G15_CT_USED;
+		}
+		spin_unlock(&be->ct_lock);
+		if (!s)
+			flush_work(&be->ct_clear);	/* the rest are being scrubbed */
+	}
+	if (!s)
+		return NULL;
+	if (scrub) {
+		g15_slot_scrub(s);
+		be->st_slot_sync++;
+	}
+	g->cursor = (k + 1) % g->slots;
+	g->used[g->used_count++] = k;
+	*index = k;
+	return s;
+}
+
+/*
+ * The compute slots and clustering buffers of the retired (or never
+ * published) prefix: reset them in the background while the next prefix
+ * runs.
  */
 static void g15_ct_release(struct g15_backend *be)
 {
+	struct g15_graph *g = &be->g;
 	struct g15_render *r = &be->r;
 
-	if (!r->ct_used_count)
+	if (!r->ct_used_count && !g->used_count)
 		return;
 	spin_lock(&be->ct_lock);
 	for (u32 k = 0; k < r->ct_used_count; k++)
 		r->ct_used[k]->state = G15_CT_DIRTY;
+	/* Without rotation the next claim of a slot scrubs it (STALE). */
+	for (u32 k = 0; k < g->used_count; k++)
+		g->slot[g->used[k]].state = g->rotating ? G15_CT_DIRTY : G15_CT_STALE;
 	spin_unlock(&be->ct_lock);
 	r->ct_used_count = 0;
+	g->used_count = 0;
 	if (READ_ONCE(ct_async))
 		queue_work(system_unbound_wq, &be->ct_clear);
 }
@@ -2096,12 +2208,14 @@ static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
 			      const struct g15_cmd *cmd, struct g15_prefix *pf)
 {
 	struct g15_graph *g = &be->g;
-	struct g15_slot *s = &g->slot[pf->computes];
 	const struct drm_asahi_cmd_compute *c = &cmd->c;
 	u64 n = pf->n + 1;
-	u32 T = g15_stamp(n);
+	u32 T = g15_stamp(n), index;
+	struct g15_slot *s = g15_slot_claim(be, &index);
 	int ret;
 
+	if (!s)
+		return -EBUSY;	/* nothing published yet */
 	ret = g15_encode_compute(be, s, cmd, job->vm->asid, n);
 	if (ret)
 		return ret;	/* nothing published yet */
@@ -2114,7 +2228,7 @@ static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
 	pf->c_head = (pf->c_head + 1) % G15_QUEUE_CAP;
 	if (n <= 4) {
 		dev_info(be->gpu->dev, "compute n=%llu slot %u ctx=%u cdm %#llx..%#llx flags=%#x att=%u ts=%#llx/%#llx\n",
-			 n, pf->computes, job->vm->asid, c->cdm_ctrl_stream_base,
+			 n, index, job->vm->asid, c->cdm_ctrl_stream_base,
 			 c->cdm_ctrl_stream_end, c->flags, cmd->att_count, cmd->ts_va[0],
 			 cmd->ts_va[1]);
 		g15_dump_client(be, job->vm, "  cdm", c->cdm_ctrl_stream_base,
@@ -2826,7 +2940,6 @@ static void g15_poll_work(struct work_struct *work)
 			mutex_unlock(&gpu->lock);
 		}
 		be->active = NULL;
-		g15_ct_release(be);
 		if (be->preempt_global) {
 			/*
 			 * Retired only after the hang preemption: the firmware ended
@@ -2834,6 +2947,7 @@ static void g15_poll_work(struct work_struct *work)
 			 * failed and its client's VM lost, like a hang reset.
 			 */
 			g15_preempt_disarm(be);
+			g15_ct_release(be);
 			be->st_hang_kills++;
 			if (be->active_render)
 				be->r.reinit = true;	/* aborted scene: PB state untrusted */
@@ -2846,6 +2960,7 @@ static void g15_poll_work(struct work_struct *work)
 			goto next;
 		}
 		g15_stat_retire(be);
+		g15_ct_release(be);	/* after the stats read its timestamp cells */
 		job->next += be->active_cmds;
 		if (job->next < job->count) {
 			/* Command boundary: another queue may take its turn first. */
@@ -2962,8 +3077,8 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "jobs %llu job_cmds %llu job_max %llu early %llu recoveries %llu hang_kills %llu clustered %llu\n",
 		   be->st_jobs, be->st_job_cmds, be->st_job_max, be->st_early, be->st_recoveries,
 		   be->st_hang_kills, be->st_clustered);
-	seq_printf(m, "ct_sync %llu starved_us %llu prep_us %llu\n", be->st_ct_sync,
-		   div_u64(be->st_starved_ns, 1000), div_u64(be->st_prep_ns, 1000));
+	seq_printf(m, "ct_sync %llu slot_sync %llu starved_us %llu prep_us %llu\n", be->st_ct_sync,
+		   be->st_slot_sync, div_u64(be->st_starved_ns, 1000), div_u64(be->st_prep_ns, 1000));
 	seq_printf(m, "stage: ta_us %llu fs_us %llu cdm_us %llu span_us %llu\n",
 		   div_u64(be->st_ta_ticks, 24), div_u64(be->st_fs_ticks, 24),
 		   div_u64(be->st_cdm_ticks, 24), div_u64(be->st_span_ticks, 24));
