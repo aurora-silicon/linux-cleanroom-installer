@@ -458,6 +458,13 @@ static int m4_user_render_prepare_locked(struct m4_user_job *j, u32 index,
 		.uuid = res->chronology.target_stamp, .owner_cookie = out,
 		.check_owner = m4_user_render_owner_locked, .admission = &out->span_admission,
 	};
+	if (READ_ONCE(pb_fit)) {
+		struct gpu_m4_exec_geometry geometry;
+		struct gpu_m4_render_pb_layout pb;
+
+		if (m4_user_native_render_need(&view.batch->commands[index], &geometry, &pb, j->queue))
+			out->input.pb_heap_limit = pb.heap_size;
+	}
 	ret = gpu_m4_render_native_validate(&out->scratch.state, &out->input);
 	if (ret)
 		return M4_USER_WHY(ret, "render %u native validate", index);

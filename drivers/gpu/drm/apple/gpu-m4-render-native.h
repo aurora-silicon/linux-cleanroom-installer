@@ -128,6 +128,11 @@ struct gpu_m4_render_native_input {
 	gpu_m4_render_check_native_owner check_owner;
 	/* Optional; NULL performs the complete span admission at every call. */
 	struct gpu_m4_render_native_admission *admission;
+	/* Optional PB heap to declare (0: the unit's whole parameter heap). A
+	 * smaller declaration keeps the larger backing but initializes only the
+	 * pages this command's geometry policy asks for.
+	 */
+	u64 pb_heap_limit;
 };
 
 /* Exact command remains borrowed and preserves all raw UAPI selection tags,
@@ -571,7 +576,10 @@ static inline int gpu_m4_render_native_private(const struct gpu_m4_render_native
 	}
 	if (o->parameter_heap.span.size < state->pb.heap_size)
 		return -EINVAL;
-	ret = gpu_m4_render_pb_capacity(&state->pb, o->parameter_heap.span.size);
+	ret = gpu_m4_render_pb_capacity(&state->pb,
+		in->pb_heap_limit && in->pb_heap_limit >= state->pb.heap_size &&
+		in->pb_heap_limit < o->parameter_heap.span.size ?
+		in->pb_heap_limit : o->parameter_heap.span.size);
 	if (ret)
 		return ret;
 	ret = gpu_m4_render_native_backing(in, &o->parameter_heap,

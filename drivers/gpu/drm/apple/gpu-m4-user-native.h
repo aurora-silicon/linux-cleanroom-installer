@@ -244,6 +244,15 @@ MODULE_PARM_DESC(pb_scale, "PB heap multiplier for new render units of a queue t
 /* 1: pb_scale only after a partial render (pb_grow_area); 0: always. */
 static bool pb_grow_on_partial = true;
 module_param(pb_grow_on_partial, bool, 0644);
+/* Declare each render's PB at its own geometry need (pb_scale included)
+ * instead of the whole unit heap, which unit_highwater sizes to the largest
+ * render seen: the firmware InitBuffer before every TA initializes every
+ * declared block (~0.33 us per 128 KiB), so a tiny pass on a large reused
+ * unit paid for the full-screen heap.
+ */
+static bool pb_fit = true;
+module_param(pb_fit, bool, 0644);
+MODULE_PARM_DESC(pb_fit, "Declare each render's PB at its geometry need rather than the unit's whole heap (default 1)");
 
 static int m4_user_render_pb_layout(struct gpu_m4_render_pb_layout *pb,
 	const struct gpu_m4_render_geometry *key, const struct m4_user_queue *q)
