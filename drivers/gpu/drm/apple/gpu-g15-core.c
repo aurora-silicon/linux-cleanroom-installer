@@ -681,6 +681,28 @@ static void g15_crashed(void *cookie, const void *log, size_t size)
 	g15_fail(gpu, -EIO);
 }
 
+static bool early_wake = true;
+module_param(early_wake, bool, 0644);
+MODULE_PARM_DESC(early_wake, "Queue ring draining and the backend's completion check from the mailbox interrupt instead of the RTKit receive worker");
+
+/*
+ * EP 0x20 ring-service request, in the mailbox interrupt: wake only. The
+ * drain work and the backend's completion check run in worker context; the
+ * gpu and backend outlive the mailbox.
+ */
+static bool g15_recv_early(void *cookie, u8 endpoint, u64 message)
+{
+	struct g15_gpu *gpu = cookie;
+
+	if (!READ_ONCE(early_wake) || endpoint != 0x20 || message != 0x0042000000000000ULL ||
+	    !READ_ONCE(gpu->started))
+		return false;
+	queue_work(system_highpri_wq, &gpu->drain);
+	if (READ_ONCE(gpu->be))
+		g15_backend_kick(gpu);
+	return true;
+}
+
 static void g15_recv(void *cookie, u8 endpoint, u64 message)
 {
 	struct g15_gpu *gpu = cookie;
@@ -697,6 +719,7 @@ static void g15_recv(void *cookie, u8 endpoint, u64 message)
 static const struct apple_rtkit_ops g15_rtkit_ops = {
 	.crashed = g15_crashed,
 	.recv_message = g15_recv,
+	.recv_message_early = g15_recv_early,
 	.shmem_setup = g15_shmem_setup,
 	.shmem_destroy = g15_shmem_destroy,
 };
