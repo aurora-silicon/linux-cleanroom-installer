@@ -176,6 +176,10 @@ static bool ct_async = true;
 module_param(ct_async, bool, 0644);
 MODULE_PARM_DESC(ct_async, "Zero a retired pass's clustering buffer in the background while the next prefix runs; 0: zero it when it is next claimed");
 
+static unsigned int max_inflight = 2;
+module_param(max_inflight, uint, 0644);
+MODULE_PARM_DESC(max_inflight, "Prefixes of one VM published at once, 1..2: the next is appended to the running queues and starts when the previous one's work ends; 1: publish only after full retirement");
+
 static bool slot_rotate = true;
 module_param(slot_rotate, bool, 0644);
 MODULE_PARM_DESC(slot_rotate, "Give each prefix's computes the slots after the previous prefix's, so slots are scrubbed in the background while the next prefix runs; 0: always from slot 0");
@@ -254,8 +258,6 @@ struct g15_graph {
 	struct g15_slot slot[G15_COMPUTE_SLOTS];
 	u32 slots;
 	u32 cursor;				/* next slot to try */
-	bool rotating;				/* slot_rotate of the prefix in preparation/active */
-	u32 used[G15_COMPUTE_SLOTS], used_count;	/* slots of the prefix in preparation/active */
 };
 
 /* One render pass slot (slot 0 only in this version). */
@@ -291,14 +293,37 @@ struct g15_render {
 	u32 pre_records;	/* preemption records per buffer: 2, 3 with clustering */
 	struct g15_ct ct[G15_CT_BUFS];
 	u32 ct_count;
-	struct g15_ct *ct_used[G15_RENDER_SLOTS];	/* claimed by the prefix being published/active */
-	u32 ct_used_count;
+	u32 pass_busy;		/* pass slots held by published or prepared prefixes */
+	u32 pass_cursor;	/* next small pass slot (1..slots-1) to try */
 	bool reinit;		/* re-initialize allocators + InitBM before the next render */
 	u64 draw;		/* cumulative host draw ordinal of the last publication */
 	bool registered, c1_written;
 };
 
 struct g15_job;
+
+/*
+ * One published prefix (scheduling contract 2; two-prefix contract 4): its
+ * job and commands, its own receipts (final targets, exclusive ring ends and
+ * the ring positions before it, channel producers after its records) and the
+ * storage it holds until its own retirement.
+ */
+struct g15_flight {
+	struct g15_job *job;
+	u32 count, computes, renders;
+	u32 target, head, c_start;
+	u32 ta_target, fs_target, ta_head, fs_head, ta_start, fs_start;
+	u32 rec[3];
+	u32 slot[G15_COMPUTE_SLOTS], slot_count;	/* compute slot of compute member j */
+	u32 pass[G15_RENDER_SLOTS], pass_mask;		/* pass slot of render member j */
+	struct g15_ct *ct[G15_RENDER_SLOTS];
+	u32 ct_count;
+	bool rotating;
+	u64 pub_ns;
+	unsigned long published_at;
+};
+
+#define G15_FLIGHTS	2
 
 struct g15_backend {
 	struct g15_gpu *gpu;
@@ -318,22 +343,23 @@ struct g15_backend {
 	DECLARE_BITMAP(asids, 64);
 	DECLARE_BITMAP(ts_pages, G15_TS_PAGES);
 	/*
-	 * Engine: one published command at a time. Ready jobs are taken by queue
-	 * priority, then the least recently served queue (turn), at command
-	 * boundaries.
+	 * Engine: published prefixes in order (fl, oldest first); a later one
+	 * only for the same VM, appended to the running queues. Ready jobs are
+	 * taken by queue priority, then the least recently served queue (turn),
+	 * at prefix boundaries. pending holds jobs with unpublished commands.
 	 */
 	struct list_head pending, retained;
-	struct g15_job *active;
-	u32 active_cmds;	/* commands of active in the published prefix */
-	u32 active_computes, active_renders;
+	struct g15_flight fl[G15_FLIGHTS];
+	u32 fl_first, fl_count;
+	u32 tail_prev, tail_ct, tail_fs;	/* last member of the newest prefix */
 	u64 turn;
 	u64 ordinal;		/* host command ordinal n of the last publication */
+	/* Newest published receipts (the tail); event counts at its publication. */
 	u32 target, head, events;
-	/* Render receipts of the active prefix; stage event count at publication. */
 	u32 ta_target, fs_target, ta_head, fs_head, stage_seen;
 	u32 producer[3];	/* host channels 0 TA, 1 FS, 2 compute */
-	bool active_compute, active_render;
-	unsigned long deadline, published_at;
+	unsigned long deadline;	/* of the oldest published prefix */
+	u64 st_overlaps;	/* prefixes published while another ran */
 	/*
 	 * Statistics (be->lock): commands per engine (0 compute, 1 render);
 	 * prefixes and publish-to-retire-observed time per prefix kind (0
@@ -1252,8 +1278,9 @@ struct g15_job {
 	struct g15_vm *vm;
 	struct g15_cmd *cmds;
 	u32 count, next;		/* next: first command not yet retired */
+	u32 sent;			/* first command not yet published */
 	struct dma_fence *fence;
-	bool guard;
+	bool guard, signaled;
 };
 
 static void g15_queue_release(struct kref *ref)
@@ -1390,10 +1417,10 @@ static int g15_channel_post(struct g15_backend *be, u32 ch, u64 queue, u32 kind,
 	return 0;
 }
 
-/* Build and publish compute command i of job (be->lock held). */
-static void g15_stat_publish(struct g15_backend *be)
+static void g15_stat_publish(struct g15_backend *be, struct g15_flight *f)
 {
 	be->pub_ns = ktime_get_ns();
+	f->pub_ns = be->pub_ns;
 	be->st_prep_ns += be->pub_ns - be->prep_from_ns;
 	if (be->idle_from_ns) {
 		be->st_gap_ns += be->pub_ns - be->idle_from_ns;
@@ -1418,41 +1445,44 @@ static void g15_stat_stage(const struct g15_buf *b, u64 off, u64 *sum, u64 *lo, 
 	*hi = max(*hi, end);
 }
 
-static void g15_stat_retire(struct g15_backend *be)
+/*
+ * A retired prefix: publication to retirement (including any wait behind its
+ * predecessor), event times, internal stage times of its members.
+ */
+static void g15_stat_retire(struct g15_backend *be, struct g15_flight *f)
 {
-	u64 now = ktime_get_ns(), d = now - be->pub_ns, first = U64_MAX, last = 0;
-	u32 kind = be->active_compute && be->active_render ? 2 : be->active_render;
+	u64 now = ktime_get_ns(), d = now - f->pub_ns, first = U64_MAX, last = 0;
+	u32 kind = f->computes && f->renders ? 2 : !!f->renders;
 	u64 lo = U64_MAX, hi = 0;
 
-	for (u32 k = 0; k < be->active_renders; k++) {
-		g15_stat_stage(&be->r.pass[k].its, 0, &be->st_ta_ticks, &lo, &hi);
-		g15_stat_stage(&be->r.pass[k].its, 0x10, &be->st_fs_ticks, &lo, &hi);
+	for (u32 k = 0; k < f->renders; k++) {
+		g15_stat_stage(&be->r.pass[f->pass[k]].its, 0, &be->st_ta_ticks, &lo, &hi);
+		g15_stat_stage(&be->r.pass[f->pass[k]].its, 0x10, &be->st_fs_ticks, &lo, &hi);
 	}
-	for (u32 k = 0; k < be->g.used_count; k++)
-		g15_stat_stage(&be->g.slot[be->g.used[k]].its, 0, &be->st_cdm_ticks, &lo, &hi);
+	for (u32 k = 0; k < f->computes; k++)
+		g15_stat_stage(&be->g.slot[f->slot[k]].its, 0, &be->st_cdm_ticks, &lo, &hi);
 	if (hi > lo)
 		be->st_span_ticks += hi - lo;
 
 	for (u32 b = 0; b < 3; b++) {
 		u64 t = READ_ONCE(be->gpu->event_ns[b]);
 
-		if (b == 2 ? !be->active_compute : !be->active_render)
+		if (b == 2 ? !f->computes : !f->renders)
 			continue;
 		first = min(first, t);
 		last = max(last, t);
 	}
-	if (first > be->pub_ns && last <= now) {
-		be->st_first_ns[kind] += first - be->pub_ns;
-		be->st_last_ns[kind] += last - be->pub_ns;
+	if (first > f->pub_ns && last <= now) {
+		be->st_first_ns[kind] += first - f->pub_ns;
+		be->st_last_ns[kind] += last - f->pub_ns;
 	}
-	be->st_count[0] += be->active_computes;
-	be->st_count[1] += be->active_renders;
+	be->st_count[0] += f->computes;
+	be->st_count[1] += f->renders;
 	if (kind == 2)
-		be->st_count[2] += be->active_cmds;
+		be->st_count[2] += f->count;
 	be->st_prefixes[kind]++;
 	be->st_busy_ns[kind] += d;
 	be->st_max_ns[kind] = max(be->st_max_ns[kind], d);
-	be->idle_from_ns = now;
 }
 
 /*
@@ -2064,7 +2094,7 @@ static void g15_ct_clear_work(struct work_struct *work)
  * A zeroed clustering buffer of at least bytes for a pass of the prefix
  * being prepared (be->lock held), or NULL: none provisioned or too small.
  */
-static struct g15_ct *g15_ct_claim(struct g15_backend *be, u64 bytes)
+static struct g15_ct *g15_ct_claim(struct g15_backend *be, struct g15_flight *f, u64 bytes)
 {
 	struct g15_render *r = &be->r;
 	struct g15_ct *c = NULL;
@@ -2096,40 +2126,45 @@ static struct g15_ct *g15_ct_claim(struct g15_backend *be, u64 bytes)
 		be->st_ct_sync++;
 	}
 	c->dirty = bytes;
-	r->ct_used[r->ct_used_count++] = c;
+	f->ct[f->ct_count++] = c;
 	return c;
 }
 
 /*
- * A scrubbed compute slot for a member of the prefix being prepared
+ * A scrubbed compute slot for compute member j of the prefix f being prepared
  * (be->lock held): the first clean slot from the cursor, which follows the
- * previous prefix's slots, so they can be scrubbed while this one runs. With
- * none clean, a retired slot is scrubbed here.
+ * previous prefix's slots, so they can be scrubbed while this one runs; with
+ * none clean, a retired slot is scrubbed here. Slots of published prefixes
+ * are never taken. Without rotation member j takes slot j when it is free.
  */
-static struct g15_slot *g15_slot_claim(struct g15_backend *be, u32 *index)
+static struct g15_slot *g15_slot_claim(struct g15_backend *be, struct g15_flight *f, u32 j,
+				       u32 *index)
 {
 	struct g15_graph *g = &be->g;
 	struct g15_slot *s = NULL;
 	bool scrub = false;
 	u32 k = 0;
 
-	if (!g->used_count)
-		g->rotating = READ_ONCE(slot_rotate);
-	if (!g->rotating) {
-		/* Member j in slot j, scrubbed here unless still clean. */
-		k = g->used_count;
-		s = &g->slot[k];
+	if (!j)
+		f->rotating = READ_ONCE(slot_rotate);
+	if (!f->rotating && j < g->slots) {
 		spin_lock(&be->ct_lock);
-		while (s->state == G15_CT_CLEARING) {
+		while (g->slot[j].state == G15_CT_CLEARING) {
 			spin_unlock(&be->ct_lock);
 			flush_work(&be->ct_clear);
 			spin_lock(&be->ct_lock);
 		}
-		scrub = s->state != G15_CT_CLEAN;
-		s->state = G15_CT_USED;
+		if (g->slot[j].state != G15_CT_USED) {
+			k = j;
+			s = &g->slot[k];
+			scrub = s->state != G15_CT_CLEAN;
+			s->state = G15_CT_USED;
+		}
 		spin_unlock(&be->ct_lock);
 	}
 	for (u32 attempt = 0; !s && attempt < 2; attempt++) {
+		bool clearing = false;
+
 		spin_lock(&be->ct_lock);
 		for (u32 i = 0; !s && i < g->slots; i++) {
 			k = (g->cursor + i) % g->slots;
@@ -2140,12 +2175,15 @@ static struct g15_slot *g15_slot_claim(struct g15_backend *be, u32 *index)
 			k = (g->cursor + i) % g->slots;
 			if (g->slot[k].state == G15_CT_DIRTY || g->slot[k].state == G15_CT_STALE)
 				s = &g->slot[k];
+			clearing |= g->slot[k].state == G15_CT_CLEARING;
 		}
 		if (s) {
 			scrub = s->state != G15_CT_CLEAN;
 			s->state = G15_CT_USED;
 		}
 		spin_unlock(&be->ct_lock);
+		if (!s && !clearing)
+			break;		/* all held by published prefixes */
 		if (!s)
 			flush_work(&be->ct_clear);	/* the rest are being scrubbed */
 	}
@@ -2156,41 +2194,76 @@ static struct g15_slot *g15_slot_claim(struct g15_backend *be, u32 *index)
 		be->st_slot_sync++;
 	}
 	g->cursor = (k + 1) % g->slots;
-	g->used[g->used_count++] = k;
+	f->slot[f->slot_count++] = k;
 	*index = k;
 	return s;
 }
 
+/* Compute slots a new prefix can still claim: not held by a published one. */
+static u32 g15_slots_free(struct g15_backend *be)
+{
+	u32 n = 0;
+
+	spin_lock(&be->ct_lock);
+	for (u32 k = 0; k < be->g.slots; k++)
+		n += be->g.slot[k].state != G15_CT_USED;
+	spin_unlock(&be->ct_lock);
+	return n;
+}
+
 /*
- * The compute slots and clustering buffers of the retired (or never
- * published) prefix: reset them in the background while the next prefix
- * runs.
+ * A pass slot for a render of the given geometry, not held and not already
+ * picked: the next small slot after the previous prefix's, else slot 0
+ * (which holds any admitted geometry); -1 if none is free.
  */
-static void g15_ct_release(struct g15_backend *be)
+static int g15_pass_pick(struct g15_render *r, const struct g15_geom *geo, u32 picked)
+{
+	u32 busy = r->pass_busy | picked;
+
+	for (u32 j = 0; r->slots > 1 && j < r->slots - 1; j++) {
+		u32 k = 1 + (r->pass_cursor + j) % (r->slots - 1);
+
+		if (!(busy & BIT(k)) && geo->tpc_bytes <= r->pass[k].tpc.size &&
+		    geo->tilemap_bytes <= r->pass[k].tilemap.size)
+			return k;
+	}
+	if (!(busy & BIT(0)) && geo->tpc_bytes <= r->pass[0].tpc.size &&
+	    geo->tilemap_bytes <= r->pass[0].tilemap.size)
+		return 0;
+	return -1;
+}
+
+/*
+ * The storage of a retired (or never published) prefix: compute slots and
+ * clustering buffers are reset in the background while later prefixes run;
+ * its pass slots become free again.
+ */
+static void g15_flight_release(struct g15_backend *be, struct g15_flight *f)
 {
 	struct g15_graph *g = &be->g;
-	struct g15_render *r = &be->r;
 
-	if (!r->ct_used_count && !g->used_count)
+	be->r.pass_busy &= ~f->pass_mask;
+	f->pass_mask = 0;
+	if (!f->ct_count && !f->slot_count)
 		return;
 	spin_lock(&be->ct_lock);
-	for (u32 k = 0; k < r->ct_used_count; k++)
-		r->ct_used[k]->state = G15_CT_DIRTY;
+	for (u32 k = 0; k < f->ct_count; k++)
+		f->ct[k]->state = G15_CT_DIRTY;
 	/* Without rotation the next claim of a slot scrubs it (STALE). */
-	for (u32 k = 0; k < g->used_count; k++)
-		g->slot[g->used[k]].state = g->rotating ? G15_CT_DIRTY : G15_CT_STALE;
+	for (u32 k = 0; k < f->slot_count; k++)
+		g->slot[f->slot[k]].state = f->rotating ? G15_CT_DIRTY : G15_CT_STALE;
 	spin_unlock(&be->ct_lock);
-	r->ct_used_count = 0;
-	g->used_count = 0;
+	f->ct_count = 0;
+	f->slot_count = 0;
 	if (READ_ONCE(ct_async))
 		queue_work(system_unbound_wq, &be->ct_clear);
 }
 
 /*
  * A prefix under preparation (scheduling contract 2): members in API order,
- * compute member j in compute slot j, render member j in pass slot j. prev is
- * the engine of the previous member of this prefix (0 none, 1 compute, 2
- * render); last_ct/last_fs its compute/FS target.
+ * each in a claimed compute or pass slot. prev is the engine of the previous
+ * member (0 none, 1 compute, 2 render), of this prefix or else the last
+ * member of the newest published one; last_ct/last_fs its compute/FS target.
  */
 struct g15_prefix {
 	u32 computes, renders, prev;
@@ -2205,13 +2278,14 @@ struct g15_prefix {
  * contract 2, render -> compute): a distinct barrier entry ahead of the work.
  */
 static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
-			      const struct g15_cmd *cmd, struct g15_prefix *pf)
+			      const struct g15_cmd *cmd, struct g15_prefix *pf,
+			      struct g15_flight *f)
 {
 	struct g15_graph *g = &be->g;
 	const struct drm_asahi_cmd_compute *c = &cmd->c;
 	u64 n = pf->n + 1;
 	u32 T = g15_stamp(n), index;
-	struct g15_slot *s = g15_slot_claim(be, &index);
+	struct g15_slot *s = g15_slot_claim(be, f, pf->computes, &index);
 	int ret;
 
 	if (!s)
@@ -2250,21 +2324,21 @@ static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
  */
 static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 			      const struct g15_cmd *cmd, struct g15_prefix *pf,
-			      u8 *ta, u8 *fs, u8 *tas, u8 *fss)
+			      struct g15_flight *f, u8 *ta, u8 *fs, u8 *tas, u8 *fss)
 {
 	struct g15_render *r = &be->r;
 	const struct drm_asahi_cmd_render *u = &cmd->r;
-	struct g15_pass *p = &r->pass[pf->renders];
+	struct g15_pass *p = &r->pass[f->pass[pf->renders]];
 	u64 n = pf->draw + 1, usc = job->q->usc_base;
 	u32 ctx = job->vm->asid;
 	u32 Tta = g15_stamp_seed(G15_TA_SEED, n), Tfs = g15_stamp_seed(G15_FS_SEED, n);
 	/*
 	 * Early tiling (early-tiling addendum): a later render member after a
-	 * render that asks for a fragment-only dependency and no start
-	 * timestamps lets its TA wait for the previous TA; its FS still waits
-	 * for the previous FS, then its own TA.
+	 * render of the same prefix that asks for a fragment-only dependency
+	 * and no start timestamps lets its TA wait for the previous TA; its FS
+	 * still waits for the previous FS, then its own TA.
 	 */
-	bool early = pf->prev == 2 && READ_ONCE(early_tiling) &&
+	bool early = pf->computes + pf->renders && pf->prev == 2 && READ_ONCE(early_tiling) &&
 		(u->flags & DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY) &&
 		!cmd->ts_va[0] && !cmd->ts_va[2];
 	struct g15_ct *ct = NULL;
@@ -2283,7 +2357,7 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 		!(u->flags & DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING);
 	if (cluster) {
 		g15_cluster_layout(&geo, 0, &cl);
-		ct = g15_ct_claim(be, cl.bytes);
+		ct = g15_ct_claim(be, f, cl.bytes);
 		cluster = ct;
 	}
 	if (cluster)
@@ -2371,7 +2445,7 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	pf->fs_head = (pf->fs_head + 1) % G15_QUEUE_CAP;
 	if (n <= 4) {
 		dev_info(be->gpu->dev, "render n=%llu slot %u ctx=%u %ux%u L%u s%u utile %ux%u ss%u flags=%#x vdm %#llx ta/fs head %u/%u tpc %#llx tilemap %#llx\n",
-			 n, pf->renders, ctx, u->width_px, u->height_px, u->layers, u->samples,
+			 n, f->pass[pf->renders], ctx, u->width_px, u->height_px, u->layers, u->samples,
 			 u->utile_width_px, u->utile_height_px, u->sample_size_B,
 			 u->flags, u->vdm_ctrl_stream_base, pf->ta_head, pf->fs_head,
 			 geo.tpc_bytes, geo.tilemap_bytes);
@@ -2384,59 +2458,69 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 }
 
 /*
- * Publish the prefix of submission job starting at command i (be->lock
- * held). Members: consecutive commands of one engine, or with mixed_prefix
- * of both engines in API order, up to the slots of each engine; a later
- * render larger than its pass slot ends the prefix (slot 0 holds any
- * admitted geometry). All images and ring entries precede one WRITE per
- * participating queue and the kicks (compute, FS, TA); host thresholds and
- * counters name the final ordinals. The prefix retires as a whole (final
- * stamps, heads and stage events of every participating queue).
+ * Publish the next prefix of submission job, from its first unpublished
+ * command (be->lock held). Members: consecutive commands of one engine, or
+ * with mixed_prefix of both engines in API order, each in a free compute or
+ * pass slot. All images and ring entries precede one WRITE per participating
+ * queue and the kicks (compute, FS, TA); host thresholds and counters name
+ * the final ordinals.
+ *
+ * With prefixes already published (same VM only; two-prefix contract), the
+ * new one is appended behind them on the running queues: it takes only slots
+ * they do not hold, its first member waits on their last member like any
+ * member on its predecessor, and its SubmitQueue records extend the queues'
+ * horizons (new_queue 0). Returns -EAGAIN when it cannot be appended yet
+ * (no free slot, or a channel record still unconsumed).
  */
-static int g15_publish(struct g15_backend *be, struct g15_job *job, u32 i)
+static int g15_publish(struct g15_backend *be, struct g15_job *job)
 {
 	struct g15_gpu *gpu = be->gpu;
 	struct g15_graph *g = &be->g;
 	struct g15_render *r = &be->r;
+	struct g15_flight *f = &be->fl[(be->fl_first + be->fl_count) % G15_FLIGHTS];
+	bool overlap = be->fl_count, mixed = READ_ONCE(mixed_prefix);
 	struct g15_prefix pf = { .n = be->ordinal, .draw = r->draw };
-	bool mixed = READ_ONCE(mixed_prefix), render0 = job->cmds[i].render;
-	u32 ctx = job->vm->asid, computes = 0, renders = 0, end;
+	u32 i = job->sent, ctx = job->vm->asid, computes = 0, renders = 0, end, free_c;
+	bool render0 = job->cmds[i].render;
 	u8 *ta = NULL, *fs = NULL, *tas = NULL, *fss = NULL;
 	struct g15_geom geo;
 	int ret = 0;
 
 	be->prep_from_ns = ktime_get_ns();
+	memset(f, 0, sizeof(*f));
+	free_c = g15_slots_free(be);
 	for (end = i; end < job->count; end++) {
 		const struct g15_cmd *cmd = &job->cmds[end];
+		int k;
 
 		if (cmd->render != render0 && !mixed)
 			break;
 		if (!cmd->render) {
-			if (computes == g->slots)
+			if (computes == free_c)
 				break;
 			computes++;
 			continue;
 		}
-		if (renders == r->slots)
+		g15_geometry(&cmd->r, 0, &geo);
+		k = g15_pass_pick(r, &geo, f->pass_mask);
+		if (k < 0)
 			break;
-		g15_geometry(&cmd->r, r->pass[renders].heap.gva, &geo);
-		if (geo.tpc_bytes > r->pass[renders].tpc.size ||
-		    geo.tilemap_bytes > r->pass[renders].tilemap.size) {
-			if (renders)
-				break;
-			return -E2BIG;
-		}
-		renders++;
+		f->pass_mask |= BIT(k);
+		f->pass[renders++] = k;
 	}
-	/* Participating channels must be idle: the previous prefix fully retired. */
+	if (end == i)
+		return overlap ? -EAGAIN : -E2BIG;	/* idle: every slot is free */
+	/* Participating channels: every earlier record consumed. */
 	for (u32 ch = 0; ch < 3; ch++) {
 		if (ch == G15_COMPUTE_CHANNEL ? !computes : !renders)
 			continue;
 		if (g15_r32(gpu, G15_CH_STATE(ch)) != be->producer[ch] ||
 		    g15_r32(gpu, G15_CH_STATE(ch) + 0x20) != be->producer[ch])
-			return -EBUSY;
+			return overlap ? -EAGAIN : -EBUSY;
 	}
+	r->pass_busy |= f->pass_mask;
 	if (renders) {
+		r->pass_cursor = (f->pass[renders - 1] ?: r->pass_cursor) % max(r->slots - 1, 1U);
 		ta = kzalloc(G15_TA_WORK_SIZE, GFP_KERNEL);
 		fs = kzalloc(G15_FS_WORK_SIZE, GFP_KERNEL);
 		tas = kzalloc(G15_TA_SEQ_SIZE, GFP_KERNEL);
@@ -2451,17 +2535,25 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job, u32 i)
 				 r->draw + 1);
 		}
 	}
+	if (overlap) {
+		pf.prev = be->tail_prev;
+		pf.last_ct = be->tail_ct;
+		pf.last_fs = be->tail_fs;
+	}
 	pf.c_head = g15_buf_r32(&g->qstate, 0x40) % G15_QUEUE_CAP;
 	pf.ta_head = g15_buf_r32(&r->qstate[0], 0x40) % G15_QUEUE_CAP;
 	pf.fs_head = g15_buf_r32(&r->qstate[1], 0x40) % G15_QUEUE_CAP;
+	f->c_start = pf.c_head;
+	f->ta_start = pf.ta_head;
+	f->fs_start = pf.fs_head;
 	for (u32 k = i; k < end; k++) {
 		const struct g15_cmd *cmd = &job->cmds[k];
 
 		if (cmd->render) {
-			g15_prefix_render(be, job, cmd, &pf, ta, fs, tas, fss);
+			g15_prefix_render(be, job, cmd, &pf, f, ta, fs, tas, fss);
 			continue;
 		}
-		ret = g15_prefix_compute(be, job, cmd, &pf);
+		ret = g15_prefix_compute(be, job, cmd, &pf, f);
 		if (ret)
 			goto out;	/* nothing published yet */
 	}
@@ -2496,30 +2588,37 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job, u32 i)
 	wmb();
 	g15_wb_sweep(job->vm);
 
-	be->active_compute = computes;
-	be->active_render = renders;
-	be->active_computes = computes;
-	be->active_renders = renders;
-	be->active_cmds = end - i;
+	f->job = job;
+	f->count = end - i;
+	f->computes = computes;
+	f->renders = renders;
 	if (computes) {
 		be->ordinal = pf.n;
-		be->target = pf.last_ct;
-		be->head = pf.c_head;
+		f->target = be->target = pf.last_ct;
+		f->head = be->head = pf.c_head;
 	}
 	if (renders) {
-		be->ta_target = g15_stamp_seed(G15_TA_SEED, pf.draw);
-		be->fs_target = pf.last_fs;
-		be->ta_head = pf.ta_head;
-		be->fs_head = pf.fs_head;
+		f->ta_target = be->ta_target = g15_stamp_seed(G15_TA_SEED, pf.draw);
+		f->fs_target = be->fs_target = pf.last_fs;
+		f->ta_head = be->ta_head = pf.ta_head;
+		f->fs_head = be->fs_head = pf.fs_head;
 		r->draw = pf.draw;
 		be->fs_resync = false;
 		r->reinit = false;
 	}
+	be->tail_prev = pf.prev;
+	be->tail_ct = pf.last_ct;
+	be->tail_fs = pf.last_fs;
 	be->events = atomic_read(&gpu->compute_events);
 	be->stage_seen = atomic_read(&gpu->stage_events);
-	be->published_at = jiffies;
-	g15_stat_publish(be);
-	be->deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(deadline_ms), 100U));
+	f->published_at = jiffies;
+	g15_stat_publish(be, f);
+	if (overlap)
+		be->st_overlaps++;
+	else
+		be->deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(deadline_ms), 100U));
+	job->sent = end;
+	be->fl_count++;
 	/* Compute on channel 2, then FS on channel 1, then TA on channel 0 (R8). */
 	if (computes) {
 		ret = g15_channel_post(be, G15_COMPUTE_CHANNEL, g->qinfo.va, 2, pf.c_head,
@@ -2544,18 +2643,26 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job, u32 i)
 						       false);
 		r->registered = true;
 	}
-	dev_dbg(gpu->dev, "prefix ctx=%u computes %u (n=%llu head %u) renders %u (draw %llu ta/fs head %u/%u): %d\n",
-		ctx, computes, pf.n, pf.c_head, renders, pf.draw, pf.ta_head, pf.fs_head, ret);
+	for (u32 ch = 0; ch < 3; ch++)
+		f->rec[ch] = be->producer[ch];
+	dev_dbg(gpu->dev, "prefix ctx=%u computes %u (n=%llu head %u) renders %u (draw %llu ta/fs head %u/%u) behind %u: %d\n",
+		ctx, computes, pf.n, pf.c_head, renders, pf.draw, pf.ta_head, pf.fs_head,
+		be->fl_count - 1, ret);
 	/* A queue WRITE already advanced: any later failure is uncertain. */
 	ret = ret ? -EIO : 0;
 out:
 	if (ret && ret != -EIO)
-		g15_ct_release(be);	/* never published */
+		g15_flight_release(be, f);	/* never published */
 	kfree(ta);
 	kfree(fs);
 	kfree(tas);
 	kfree(fss);
 	return ret;
+}
+
+static struct g15_flight *g15_oldest(struct g15_backend *be)
+{
+	return be->fl_count ? &be->fl[be->fl_first] : NULL;
 }
 
 /*
@@ -2579,7 +2686,7 @@ static void g15_engine_state(struct g15_backend *be, u64 *busy, u64 *fault)
 	*fault = f[0] | f[1];
 	for (u32 bank = 0; bank < 2 && *fault; bank++) {
 		struct gpu_m4_drm_vm_leaf leaf = {};
-		struct g15_job *job = be->active;
+		struct g15_job *job = be->fl_count ? g15_oldest(be)->job : NULL;
 		int ret = -ENODEV;
 
 		if (!f[bank])
@@ -2601,9 +2708,11 @@ static void g15_report(struct g15_backend *be, const char *what)
 	struct g15_graph *g = &be->g;
 	u64 ch = G15_CH_STATE(G15_COMPUTE_CHANNEL), busy, fault;
 
+	struct g15_flight *f = g15_oldest(be);
+
 	g15_engine_state(be, &busy, &fault);
-	dev_info(gpu->dev, "%s: ctx=%u n=%llu target=%#x user=%#x fw=%#x done=%u read=%u write=%u head=%u ch=%u/%u/%u events=%d/%u errors=%d ready=%#x/%u c020=%#llx c120=%#llx busy=%llu fault=%#llx %ums\n",
-		 what, be->active ? be->active->vm->asid : 0, be->ordinal, be->target,
+	dev_info(gpu->dev, "%s: ctx=%u prefixes=%u n=%llu target=%#x user=%#x fw=%#x done=%u read=%u write=%u head=%u ch=%u/%u/%u events=%d/%u errors=%d ready=%#x/%u c020=%#llx c120=%#llx busy=%llu fault=%#llx %ums\n",
+		 what, f ? f->job->vm->asid : 0, be->fl_count, be->ordinal, be->target,
 		 g15_buf_r32(&g->user_stamp, 0),
 		 g15_buf_r32(&g->fw_stamp, 0), g15_buf_r32(&g->qstate, 0),
 		 g15_buf_r32(&g->qstate, 0x30), g15_buf_r32(&g->qstate, 0x40), be->head,
@@ -2612,8 +2721,8 @@ static void g15_report(struct g15_backend *be, const char *what)
 		 atomic_read(&gpu->event_errors), g15_r32(gpu, G15_RUNTIME + 0x314),
 		 g15_r32(gpu, G15_FLAGS + 4), readq(gpu->sgx_status + 0x20),
 		 readq(gpu->sgx_status + 0x120), busy, fault,
-		 jiffies_to_msecs(jiffies - be->published_at));
-	if (be->active_render) {
+		 f ? jiffies_to_msecs(jiffies - f->published_at) : 0);
+	if (f && f->renders) {
 		struct g15_render *r = &be->r;
 
 		dev_info(gpu->dev, "  render: draw=%llu ta %#x/%#x/%#x done=%u read=%u write=%u head=%u ch0=%u/%u; fs %#x/%#x/%#x done=%u read=%u write=%u head=%u ch1=%u/%u; stage events=%d/%u pb counter=%u block ctl=%u/%u\n",
@@ -2631,17 +2740,78 @@ static void g15_report(struct g15_backend *be, const char *what)
 	}
 }
 
-/* 1: every retirement receipt (contract 6.5); 0: not yet; -EIO: fault. */
-static int g15_retired(struct g15_backend *be)
+/* Stamp cell obs reached own target, bounded by the newest published target tail. */
+static bool g15_stamp_reached(u32 obs, u32 own, u32 tail)
+{
+	return obs && !(obs & 0xff) && obs - own <= tail - own;
+}
+
+/* Cursor c of a ring of m entries passed end h of entries from b, within tail t. */
+static bool g15_ring_passed(u32 c, u32 b, u32 h, u32 t, u32 m)
+{
+	u32 dc = (c + m - b) % m, dh = (h + m - b) % m, dt = (t + m - b) % m;
+
+	return dh <= dc && dc <= dt;
+}
+
+/*
+ * The oldest published prefix while later ones may run (two-prefix contract
+ * 4): its own stamp targets reached within the published interval, DONE past
+ * its saved ring ends, its channel records consumed. Engine idle is not
+ * required; faults still are checked.
+ */
+static int g15_flight_retired(struct g15_backend *be, struct g15_flight *f)
 {
 	struct g15_gpu *gpu = be->gpu;
 	struct g15_graph *g = &be->g;
 	struct g15_render *r = &be->r;
 	u64 busy, fault;
 
+	if (f->computes &&
+	    (!g15_stamp_reached(g15_buf_r32(&g->user_stamp, 0), f->target, be->target) ||
+	     !g15_stamp_reached(g15_buf_r32(&g->fw_stamp, 0), f->target, be->target) ||
+	     !g15_ring_passed(g15_buf_r32(&g->qstate, 0), f->c_start, f->head, be->head,
+			      G15_QUEUE_CAP) ||
+	     !g15_ring_passed(g15_r32(gpu, G15_CH_STATE(G15_COMPUTE_CHANNEL)),
+			      (f->rec[2] + 255) % 256, f->rec[2], be->producer[2], 256)))
+		return 0;
+	if (f->renders &&
+	    (!g15_stamp_reached(g15_buf_r32(&r->user_stamp[0], 0), f->ta_target, be->ta_target) ||
+	     !g15_stamp_reached(g15_buf_r32(&r->fw_stamp[0], 0), f->ta_target, be->ta_target) ||
+	     !g15_stamp_reached(g15_buf_r32(&r->user_stamp[1], 0), f->fs_target, be->fs_target) ||
+	     !g15_stamp_reached(g15_buf_r32(&r->fw_stamp[1], 0), f->fs_target, be->fs_target) ||
+	     !g15_ring_passed(g15_buf_r32(&r->qstate[0], 0), f->ta_start, f->ta_head, be->ta_head,
+			      G15_QUEUE_CAP) ||
+	     !g15_ring_passed(g15_buf_r32(&r->qstate[1], 0), f->fs_start, f->fs_head, be->fs_head,
+			      G15_QUEUE_CAP) ||
+	     !g15_ring_passed(g15_r32(gpu, G15_CH_STATE(G15_TA_CHANNEL)),
+			      (f->rec[0] + 255) % 256, f->rec[0], be->producer[0], 256) ||
+	     !g15_ring_passed(g15_r32(gpu, G15_CH_STATE(G15_FS_CHANNEL)),
+			      (f->rec[1] + 255) % 256, f->rec[1], be->producer[1], 256)))
+		return 0;
+	g15_engine_state(be, &busy, &fault);
+	return fault ? -EIO : 1;
+}
+
+/*
+ * Retirement of the oldest published prefix: 1 retired, 0 not yet, -EIO
+ * fault. The last published one needs every receipt exactly (contract 6.5):
+ * final stamps, DONE/READ at the tail heads, consumed pipes, new firing bits
+ * and idle engines.
+ */
+static int g15_retired(struct g15_backend *be)
+{
+	struct g15_gpu *gpu = be->gpu;
+	struct g15_graph *g = &be->g;
+	struct g15_render *r = &be->r;
+	struct g15_flight *f = g15_oldest(be);
+	u64 busy, fault;
+
 	rmb();
+	if (be->fl_count > 1)
+		return g15_flight_retired(be, f);
 	/* Render R8 / contract 8: both stamp pairs, both queues, both pipes. */
-	if (be->active_render &&
+	if (f->renders &&
 	    (g15_buf_r32(&r->user_stamp[0], 0) != be->ta_target ||
 	     g15_buf_r32(&r->fw_stamp[0], 0) != be->ta_target ||
 	     g15_buf_r32(&r->user_stamp[1], 0) != be->fs_target ||
@@ -2653,7 +2823,7 @@ static int g15_retired(struct g15_backend *be)
 	     g15_r32(gpu, G15_CH_STATE(G15_TA_CHANNEL)) != be->producer[G15_TA_CHANNEL] ||
 	     g15_r32(gpu, G15_CH_STATE(G15_FS_CHANNEL)) != be->producer[G15_FS_CHANNEL]))
 		return 0;
-	if (be->active_compute &&
+	if (f->computes &&
 	    (g15_buf_r32(&g->user_stamp, 0) != be->target ||
 	     g15_buf_r32(&g->fw_stamp, 0) != be->target ||
 	     g15_buf_r32(&g->qstate, 0) != be->head ||
@@ -2662,8 +2832,8 @@ static int g15_retired(struct g15_backend *be)
 	     atomic_read(&gpu->compute_events) == be->events))
 		return 0;
 	/* New firing bits: at least one per participating stage (1, 2 or 3). */
-	if (be->active_render &&
-	    atomic_read(&gpu->stage_events) - be->stage_seen < (be->active_compute ? 3 : 2))
+	if (f->renders &&
+	    atomic_read(&gpu->stage_events) - be->stage_seen < (f->computes ? 3 : 2))
 		return 0;
 	g15_engine_state(be, &busy, &fault);
 	if (fault)
@@ -2673,6 +2843,9 @@ static int g15_retired(struct g15_backend *be)
 
 static void g15_signal(struct g15_job *job, int error)
 {
+	if (job->signaled)
+		return;
+	job->signaled = true;
 	if (error)
 		dma_fence_set_error(job->fence, error);
 	dma_fence_signal(job->fence);
@@ -2695,30 +2868,63 @@ static struct g15_job *g15_pick(struct g15_backend *be)
 }
 
 /*
- * Publish the next command (be->lock held). Jobs whose first publication
- * failed before any visible record complete with an error; done collects jobs
- * whose engine reference the caller drops after unlocking.
+ * The engine failed with published prefixes: their jobs fail (each once) and,
+ * with every owner the firmware may still reference, are retained.
+ */
+static void g15_fail_flights(struct g15_backend *be, int error)
+{
+	for (u32 k = 0; k < be->fl_count; k++) {
+		struct g15_job *job = be->fl[(be->fl_first + k) % G15_FLIGHTS].job;
+
+		gpu_m4_drm_vm_error(job->vm->frontend, error);
+		g15_signal(job, error);
+		if (list_empty(&job->link))
+			list_add_tail(&job->link, &be->retained);
+	}
+	be->fl_count = 0;
+}
+
+/*
+ * Publish further prefixes (be->lock held): with nothing published any ready
+ * job; behind published prefixes only the next job of the same VM, up to
+ * max_inflight, and not while recovery state is pending. Jobs whose first
+ * publication failed before any visible record complete with an error; done
+ * collects jobs whose engine reference the caller drops after unlocking.
  */
 static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 {
 	struct g15_job *job;
 	int ret;
 
-	while (!be->active && !be->failed && !list_empty(&be->pending)) {
+	while (!be->failed && !list_empty(&be->pending)) {
+		struct g15_flight *tail = be->fl_count ?
+			&be->fl[(be->fl_first + be->fl_count - 1) % G15_FLIGHTS] : NULL;
+
 		job = g15_pick(be);
-		list_del_init(&job->link);
-		be->active = job;
-		job->q->turn = ++be->turn;
-		ret = g15_publish(be, job, job->next);
-		if (!ret)
+		if (tail && (be->fl_count >= clamp(READ_ONCE(max_inflight), 1U, (u32)G15_FLIGHTS) ||
+			     job->vm != tail->job->vm || be->r.reinit || be->fs_resync ||
+			     be->preempt_global))
 			break;
-		be->active = NULL;
-		if (ret == -EIO || job->next) {
+		if (tail && tail->job != job && !list_empty(&tail->job->link))
+			be->st_yields++;	/* another queue's turn at a prefix boundary */
+		job->q->turn = ++be->turn;
+		ret = g15_publish(be, job);
+		if (!ret) {
+			if (job->sent == job->count)
+				list_del_init(&job->link);	/* fully published */
+			continue;
+		}
+		if (ret == -EAGAIN)
+			break;		/* storage or channel still held: on a later retirement */
+		list_del_init(&job->link);
+		if (ret == -EIO || job->sent) {
 			/* Uncertain, or earlier commands ran: retain, stop the engine. */
 			be->failed = -EIO;
 			g15_fail(be->gpu, -EIO);
+			g15_fail_flights(be, -EIO);
 			gpu_m4_drm_vm_error(job->vm->frontend, -EIO);
-			list_add_tail(&job->link, &be->retained);
+			if (list_empty(&job->link))
+				list_add_tail(&job->link, &be->retained);
 			g15_signal(job, -EIO);
 			break;
 		}
@@ -2730,10 +2936,10 @@ static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 		while (!list_empty(&be->pending)) {
 			job = list_first_entry(&be->pending, struct g15_job, link);
 			list_del_init(&job->link);
-			/* A paused job already ran commands: its owners stay retained. */
+			/* A partly published job already ran commands: its owners stay retained. */
 			gpu_m4_drm_vm_error(job->vm->frontend, -EIO);
 			g15_signal(job, -EIO);
-			list_add_tail(&job->link, job->next ? &be->retained : done);
+			list_add_tail(&job->link, job->sent ? &be->retained : done);
 		}
 	}
 }
@@ -2802,13 +3008,13 @@ static void g15_preempt_disarm(struct g15_backend *be)
 	}
 }
 
-/* Firmware DONE/READ reached the published end of the active prefix, pipes consumed. */
+/* Firmware DONE/READ reached the newest published ends, pipes consumed, engines idle. */
 static bool g15_prefix_drained(struct g15_backend *be)
 {
 	struct g15_gpu *gpu = be->gpu;
 	u64 busy, fault;
 
-	if (be->active_render) {
+	{
 		struct g15_render *r = &be->r;
 
 		if (g15_buf_r32(&r->qstate[0], 0) != be->ta_head ||
@@ -2819,11 +3025,9 @@ static bool g15_prefix_drained(struct g15_backend *be)
 		    g15_r32(gpu, G15_CH_STATE(G15_FS_CHANNEL)) != be->producer[G15_FS_CHANNEL])
 			return false;
 	}
-	if (be->active_compute &&
-	    (g15_buf_r32(&be->g.qstate, 0) != be->head ||
-	     g15_buf_r32(&be->g.qstate, 0x30) != be->head ||
-	     g15_r32(gpu, G15_CH_STATE(G15_COMPUTE_CHANNEL)) !=
-	     be->producer[G15_COMPUTE_CHANNEL]))
+	if (g15_buf_r32(&be->g.qstate, 0) != be->head ||
+	    g15_buf_r32(&be->g.qstate, 0x30) != be->head ||
+	    g15_r32(gpu, G15_CH_STATE(G15_COMPUTE_CHANNEL)) != be->producer[G15_COMPUTE_CHANNEL])
 		return false;
 	g15_engine_state(be, &busy, &fault);
 	return !busy;
@@ -2908,18 +3112,61 @@ static void g15_rearm(struct g15_backend *be)
 	mod_delayed_work(system_highpri_wq, &be->poll, 1);
 }
 
+/*
+ * The oldest published prefix retired (be->lock held): its storage is
+ * released, its job completes when this was its last published prefix and
+ * nothing of it is left to publish. A hang-killed job fails and drops its
+ * unpublished commands.
+ */
+static void g15_flight_done(struct g15_backend *be, struct g15_flight *f, int error,
+			    struct list_head *done)
+{
+	struct g15_job *job = f->job;
+
+	if (!error)
+		g15_stat_retire(be, f);
+	g15_flight_release(be, f);	/* after the stats read its timestamp cells */
+	be->fl_first = (be->fl_first + 1) % G15_FLIGHTS;
+	be->fl_count--;
+	if (!be->fl_count)
+		be->idle_from_ns = ktime_get_ns();	/* drained: a gap until the next publication */
+	/* The next prefix starts executing about now. */
+	be->deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(deadline_ms), 100U));
+	job->next += f->count;
+	if (error) {
+		gpu_m4_drm_vm_error(job->vm->frontend, error);
+		g15_signal(job, error);
+		if (!list_empty(&job->link)) {
+			list_del_init(&job->link);	/* drop its unpublished commands */
+			job->count = job->sent;
+		}
+	}
+	if (job->next < job->sent || job->sent < job->count)
+		return;		/* more of it published or still to publish */
+	if (!error) {
+		be->st_jobs++;
+		be->st_job_cmds += job->count;
+		be->st_job_max = max_t(u64, be->st_job_max, job->count);
+		dma_rmb();
+		g15_wb_sweep(job->vm);
+	}
+	g15_guard_put(job);
+	g15_signal(job, 0);
+	list_add_tail(&job->link, done);
+}
+
 static void g15_poll_work(struct work_struct *work)
 {
 	struct g15_backend *be = container_of(to_delayed_work(work), struct g15_backend, poll);
 	struct g15_gpu *gpu = be->gpu;
-	struct g15_job *job, *tmp, *parked = NULL;
+	struct g15_job *job, *tmp;
+	struct g15_flight *f;
 	LIST_HEAD(done);
 	bool again = false;
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&be->lock);
-	job = be->active;
-	if (!job)
+	if (!be->fl_count || be->failed)
 		goto out;
 	/* After an event, a few short trailing polls catch the final receipts. */
 	for (u32 tail = atomic_xchg(&be->evented, 0) ? 4 : 0; ; tail--) {
@@ -2927,65 +3174,50 @@ static void g15_poll_work(struct work_struct *work)
 		g15_drain_rings(gpu);
 		mutex_unlock(&gpu->lock);
 		ret = g15_retired(be);
-		if (ret || !tail)
+		while (ret > 0) {
+			f = g15_oldest(be);
+			if (be->ordinal <= 2 && be->r.draw <= 2) {
+				g15_report(be, "prefix retired");
+				mutex_lock(&gpu->lock);
+				g15_dump_events(gpu, 2);
+				mutex_unlock(&gpu->lock);
+			}
+			if (be->preempt_global) {
+				/*
+				 * Retired only after the hang preemption: the firmware
+				 * ended it (stamps written, work abandoned). Report the
+				 * submission failed and its client's VM lost, like a hang
+				 * reset.
+				 */
+				g15_preempt_disarm(be);
+				be->st_hang_kills++;
+				if (f->renders)
+					be->r.reinit = true;	/* aborted scene: PB state untrusted */
+				dev_warn(gpu->dev, "hung submission of ctx %u killed by firmware preemption\n",
+					 f->job->vm->asid);
+				g15_flight_done(be, f, -ETIMEDOUT, &done);
+			} else {
+				g15_flight_done(be, f, 0, &done);
+			}
+			ret = be->fl_count ? g15_retired(be) : 0;
+		}
+		if (ret || !tail || !be->fl_count)
 			break;
 		udelay(5);
 	}
-	if (ret > 0) {
-		if ((be->active_render && be->r.draw <= 2) ||
-		    (be->active_compute && be->ordinal <= 2)) {
-			g15_report(be, "compute retired");
-			mutex_lock(&gpu->lock);
-			g15_dump_events(gpu, 2);
-			mutex_unlock(&gpu->lock);
-		}
-		be->active = NULL;
-		if (be->preempt_global) {
-			/*
-			 * Retired only after the hang preemption: the firmware ended
-			 * it (stamps written, work abandoned). Report the submission
-			 * failed and its client's VM lost, like a hang reset.
-			 */
-			g15_preempt_disarm(be);
-			g15_ct_release(be);
-			be->st_hang_kills++;
-			if (be->active_render)
-				be->r.reinit = true;	/* aborted scene: PB state untrusted */
-			dev_warn(gpu->dev, "hung submission of ctx %u killed by firmware preemption\n",
-				 job->vm->asid);
-			gpu_m4_drm_vm_error(job->vm->frontend, -ETIMEDOUT);
-			g15_guard_put(job);
-			g15_signal(job, -ETIMEDOUT);
-			list_add_tail(&job->link, &done);
-			goto next;
-		}
-		g15_stat_retire(be);
-		g15_ct_release(be);	/* after the stats read its timestamp cells */
-		job->next += be->active_cmds;
-		if (job->next < job->count) {
-			/* Command boundary: another queue may take its turn first. */
-			list_add(&job->link, &be->pending);
-			parked = job;
-		} else {
-			be->st_jobs++;
-			be->st_job_cmds += job->count;
-			be->st_job_max = max_t(u64, be->st_job_max, job->count);
-			dma_rmb();
-			g15_wb_sweep(job->vm);
-			g15_guard_put(job);
-			g15_signal(job, 0);
-			list_add_tail(&job->link, &done);
-		}
-	} else if (!ret && !READ_ONCE(gpu->error) &&
-		   atomic_read(&gpu->event_errors) == be->errors_seen &&
-		   time_after(jiffies, be->deadline) && !be->preempt_global &&
-		   READ_ONCE(hang_preempt) && READ_ONCE(gpu_recovery)) {
+	if (!be->fl_count)
+		goto next;
+	f = g15_oldest(be);
+	if (!ret && !READ_ONCE(gpu->error) &&
+	    atomic_read(&gpu->event_errors) == be->errors_seen &&
+	    time_after(jiffies, be->deadline) && !be->preempt_global &&
+	    READ_ONCE(hang_preempt) && READ_ONCE(gpu_recovery)) {
 		/* Host deadline, no firmware event: let the firmware kill it. */
 		g15_report(be, "hung, requesting preemption");
-		/* The compute divisor while the prefix's computes are not done. */
-		be->preempt_global = be->active_compute &&
-			g15_buf_r32(&be->g.fw_stamp, 0) != be->target ? 0x1c :
-			be->active_render ? 0x24 : 0x1c;
+		/* The compute divisor while the oldest prefix's computes are not done. */
+		be->preempt_global = f->computes &&
+			!g15_stamp_reached(g15_buf_r32(&be->g.fw_stamp, 0), f->target, be->target) ?
+			0x1c : f->renders ? 0x24 : 0x1c;
 		if (g15_preempt_set(be, be->preempt_global, 1))
 			be->deadline = jiffies;	/* fail on the next pass */
 		else
@@ -2994,17 +3226,20 @@ static void g15_poll_work(struct work_struct *work)
 	} else if (ret < 0 || READ_ONCE(gpu->error) ||
 		   atomic_read(&gpu->event_errors) != be->errors_seen ||
 		   time_after(jiffies, be->deadline)) {
-		bool recovered = false;
+		bool recovered = false, render = false;
 		int err;
 
-		g15_report(be, "compute FAILED");
+		g15_report(be, "prefix FAILED");
 		mutex_lock(&gpu->lock);
 		g15_dump_events(gpu, 4);
 		mutex_unlock(&gpu->lock);
+		for (u32 k = 0; k < be->fl_count; k++)
+			render |= be->fl[(be->fl_first + k) % G15_FLIGHTS].renders;
 		/*
 		 * A firmware error event, or a receipt fault (the fault banks can
 		 * be seen before the firmware's event is drained), with a live
-		 * transport: recovery waits for the firmware's own halt.
+		 * transport: recovery waits for the firmware's own halt. Every
+		 * published prefix fails with it.
 		 */
 		if (READ_ONCE(gpu_recovery) && !READ_ONCE(gpu->error) &&
 		    (atomic_read(&gpu->event_errors) != be->errors_seen || ret == -EIO)) {
@@ -3013,43 +3248,34 @@ static void g15_poll_work(struct work_struct *work)
 			if (recovered) {
 				be->errors_seen = atomic_read(&gpu->event_errors);
 				be->st_recoveries++;
-				if (be->active_render) {
+				if (render) {
 					be->fs_resync = true;
 					be->r.reinit = true;
 				}
 				dev_warn(gpu->dev, "recovered: ctx %u submission failed with %d\n",
-					 job->vm->asid, err);
-				be->active = NULL;
-				g15_ct_release(be);
+					 f->job->vm->asid, err);
 				/* The failing client's VM is lost; other clients continue. */
-				gpu_m4_drm_vm_error(job->vm->frontend, err);
-				g15_guard_put(job);
-				g15_signal(job, err);
-				list_add_tail(&job->link, &done);
+				while (be->fl_count)
+					g15_flight_done(be, g15_oldest(be), err, &done);
 				goto next;
 			}
 		}
 		g15_preempt_disarm(be);
 		be->failed = ret ?: READ_ONCE(gpu->error) ?: -ETIMEDOUT;
 		g15_fail(gpu, be->failed);
-		gpu_m4_drm_vm_error(job->vm->frontend, be->failed);
-		be->active = NULL;
-		/* Published and uncertain: never release its owners. */
-		list_add_tail(&job->link, &be->retained);
-		g15_signal(job, be->failed);
+		/* Published and uncertain: never release their owners. */
+		g15_fail_flights(be, be->failed);
 	} else {
 		again = true;
 	}
 next:
 	g15_engine_next(be, &done);
-	if (parked && be->active && be->active != parked)
-		be->st_yields++;
-	if (!be->active && be->idle_from_ns) {
+	if (!be->fl_count && be->idle_from_ns) {
 		/* Idle with nothing ready is not a gap: the clients are late. */
 		be->starve_from_ns = be->idle_from_ns;
 		be->idle_from_ns = 0;
 	}
-	again |= !!be->active;
+	again |= !!be->fl_count;
 out:
 	if (again)
 		g15_rearm(be);
@@ -3072,8 +3298,8 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 			   be->st_prefixes[e], div_u64(be->st_busy_ns[e], 1000),
 			   div_u64(be->st_max_ns[e], 1000), div_u64(be->st_first_ns[e], 1000),
 			   div_u64(be->st_last_ns[e], 1000));
-	seq_printf(m, "gaps %llu gap_us %llu yields %llu\n", be->st_gaps,
-		   div_u64(be->st_gap_ns, 1000), be->st_yields);
+	seq_printf(m, "gaps %llu gap_us %llu yields %llu overlaps %llu\n", be->st_gaps,
+		   div_u64(be->st_gap_ns, 1000), be->st_yields, be->st_overlaps);
 	seq_printf(m, "jobs %llu job_cmds %llu job_max %llu early %llu recoveries %llu hang_kills %llu clustered %llu\n",
 		   be->st_jobs, be->st_job_cmds, be->st_job_max, be->st_early, be->st_recoveries,
 		   be->st_hang_kills, be->st_clustered);
@@ -3477,7 +3703,7 @@ static struct dma_fence *g15_run(void *owner, void *cookie)
 	kref_get(&job->ref);	/* engine */
 	list_add_tail(&job->link, &be->pending);
 	g15_engine_next(be, &done);
-	if (be->active)
+	if (be->fl_count)
 		g15_rearm(be);
 	mutex_unlock(&be->lock);
 	list_for_each_entry_safe(j, tmp, &done, link) {
