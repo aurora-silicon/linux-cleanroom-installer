@@ -366,6 +366,7 @@ enum gpu_m4_trace_kind {
 	GPU_M4_TRACE_RENDER,		/* a=ta0 b=ta1 c=fs0 d=fs1, arg=w|h<<16 */
 	GPU_M4_TRACE_COMPUTE,		/* a=start b=end */
 	GPU_M4_TRACE_PHASE,		/* a=queue b=item c=phase d=ns */
+	GPU_M4_TRACE_FWRING,		/* arg=channel<<28|tag a=+4 b=+0xc c=+0x14 d=+0x30|+0x1c<<32 */
 	GPU_M4_TRACE_KINDS,
 };
 /* Call sites stay inside #ifdef CONFIG_DEBUG_FS (host selftests build none). */

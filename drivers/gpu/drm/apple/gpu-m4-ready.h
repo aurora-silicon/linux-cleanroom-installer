@@ -580,6 +580,15 @@ static int m4_ready_drain_once(struct m4_gpu_hello *h)
 		while (consumer != producer) {
 			memcpy(record, object[state_id + 1] + consumer * 0x48, sizeof(record));
 			type = get_unaligned_le32(record);
+#ifdef CONFIG_DEBUG_FS
+			/* REMOVE-DEBUG: raw firmware record words in the host timeline. */
+			gpu_m4_trace(GPU_M4_TRACE_FWRING, channel << 28 |
+				(get_unaligned_le32(record + 0x2c) & 0xfffffff),
+				get_unaligned_le64(record + 4), get_unaligned_le64(record + 0xc),
+				get_unaligned_le64(record + 0x14),
+				(u64)get_unaligned_le32(record + 0x30) |
+				(u64)get_unaligned_le32(record + 0x1c) << 32);
+#endif
 			if (!channel) {
 				if (type != 5) {
 					dev_err(h->gpu->dev, "GPU unknown trace record: %*ph\n", 72, record);

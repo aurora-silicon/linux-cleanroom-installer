@@ -4268,7 +4268,7 @@ static int gpu_m4_trace_show(struct seq_file *m, void *unused)
 	u64 head = atomic64_read(&gpu_m4_trace_head), first;
 	static const char *const name[GPU_M4_TRACE_KINDS] = {
 		"submit", "run", "activate", "started", "publish", "retire", "done", "signal",
-		"render", "compute", "phase",
+		"render", "compute", "phase", "fwring",
 	};
 
 	seq_printf(m, "# cntpct=%llu cntfrq=%u boottime_ns=%llu monotonic_ns=%llu head=%llu\n",
