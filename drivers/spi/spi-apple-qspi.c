@@ -594,6 +594,7 @@ static int apple_qspi_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_qspi_of_match[] = {
+	{ .compatible = "apple,t8132-qspi" },
 	{ .compatible = "apple,t8140-qspi" },
 	{}
 };
