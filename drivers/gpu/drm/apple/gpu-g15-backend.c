@@ -3771,10 +3771,18 @@ static void g15_session_put(void *owner)
 {
 }
 
+/*
+ * GET_TIME in the command timestamp timebase: the firmware writes requested
+ * timestamps as nanoseconds of the CPU counter (CNTPCT), so scale CNTPCT by
+ * its actual frequency (1 GHz on this kernel), not the GPU's 24 MHz clock.
+ */
 static int g15_read_time(void *owner, u64 *timestamp_ns)
 {
-	/* CNTPCT scaled by the 24 MHz GPU base clock. */
-	*timestamp_ns = mul_u64_u32_div(__arch_counter_get_cntpct(), NSEC_PER_SEC, 24000000);
+	u32 frequency = arch_timer_get_cntfrq();
+
+	if (!frequency)
+		return -EIO;
+	*timestamp_ns = mul_u64_u32_div(__arch_counter_get_cntpct(), NSEC_PER_SEC, frequency);
 	return 0;
 }
 
