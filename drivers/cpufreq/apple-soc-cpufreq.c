@@ -13,6 +13,7 @@
 #include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/pm_qos.h>
+#include <linux/soc/apple/cpufreq-thermal.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/spinlock.h>
 #include <linux/tick.h>
@@ -189,6 +190,7 @@ struct apple_soc_cpufreq_info {
 	bool verify_transition;
 	bool needs_thermal_policy;
 	bool needs_firmware_thermal_control;
+	bool needs_thermal_owner;
 	u32 transition_timeout_us;
 	u32 max_unmanaged_pstate;
 	u64 min_pstate;
@@ -206,6 +208,7 @@ struct apple_cpu_priv {
 	const struct apple_soc_cpufreq_info *info;
 	bool transition_failed;
 	unsigned int expected_pstate;
+	struct freq_qos_request unmanaged_cap;
 };
 
 static struct cpufreq_driver apple_soc_cpufreq_driver;
@@ -285,6 +288,21 @@ static const struct apple_soc_cpufreq_info soc_t6050_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
+/*
+ * T8132 uses 5-bit PS1 state IDs and no PS2. The command register reads back
+ * the last request: the status register's current-state field is not
+ * established on this SoC. States above 4 (P 1800 / E 1860 MHz) are held back
+ * until the board thermal policy takes ownership, see
+ * apple_soc_cpufreq_set_thermal_owner().
+ */
+static const struct apple_soc_cpufreq_info soc_t8132_info = {
+	.needs_thermal_owner = true,
+	.max_unmanaged_pstate = 4,
+	.max_pstate = 31,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
 static const struct apple_soc_cpufreq_info soc_default_info = {
 	.has_ps2 = false,
 	.max_pstate = 15,
@@ -305,6 +323,10 @@ static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
 	{
 		.compatible = "apple,t8112-cluster-cpufreq",
 		.data = &soc_t8112_info,
+	},
+	{
+		.compatible = "apple,t8132-cluster-cpufreq",
+		.data = &soc_t8132_info,
 	},
 	{
 		.compatible = "apple,cluster-cpufreq",
@@ -801,6 +823,72 @@ static void apple_fast_die_exit(struct apple_cpu_priv *priv)
 	kfree(fd);
 }
 
+/*
+ * Board thermal ownership of the higher states
+ *
+ * A SoC with needs_thermal_owner has no firmware limit known to Linux, so
+ * without a board thermal policy every cluster is held at or below
+ * max_unmanaged_pstate by a FREQ_QOS_MAX request.  The thermal driver releases
+ * that cap once its own protection limits the cluster, and restores it before
+ * that protection goes away.  Ownership is global: a policy that is set up
+ * again, for instance after CPU hotplug, follows the current owner.
+ *
+ * Lock order: policy->rwsem, then apple_soc_thermal_owner_lock.
+ */
+static DEFINE_MUTEX(apple_soc_thermal_owner_lock);
+static bool apple_soc_thermal_owned;
+
+static unsigned int apple_soc_cpufreq_unmanaged_max(struct cpufreq_policy *policy)
+{
+	struct apple_cpu_priv *priv = policy->driver_data;
+	struct cpufreq_frequency_table *p;
+	unsigned int cap = 0, low = UINT_MAX;
+
+	cpufreq_for_each_valid_entry(p, policy->freq_table) {
+		low = min(low, p->frequency);
+		if (p->driver_data <= priv->info->max_unmanaged_pstate)
+			cap = max(cap, p->frequency);
+	}
+
+	return cap ?: low;
+}
+
+static s32 apple_soc_cpufreq_owner_cap(struct cpufreq_policy *policy)
+{
+	lockdep_assert_held(&apple_soc_thermal_owner_lock);
+
+	return apple_soc_thermal_owned ? FREQ_QOS_MAX_DEFAULT_VALUE :
+		apple_soc_cpufreq_unmanaged_max(policy);
+}
+
+/**
+ * apple_soc_cpufreq_set_thermal_owner() - hand the higher states to a thermal policy
+ * @policy: policy of a cluster whose SoC needs a board thermal policy
+ * @owned: true once the caller's own protection limits @policy, false before
+ *	   that protection goes away
+ *
+ * Return: 0 on success, -ENODEV if this driver does not hold back @policy.
+ */
+int apple_soc_cpufreq_set_thermal_owner(struct cpufreq_policy *policy, bool owned)
+{
+	const char *driver = cpufreq_get_current_driver();
+	struct apple_cpu_priv *priv;
+	int ret = -ENODEV;
+
+	guard(cpufreq_policy_read)(policy);
+	guard(mutex)(&apple_soc_thermal_owner_lock);
+	priv = policy->driver_data;
+	if (driver && !strcmp(driver, apple_soc_cpufreq_driver.name) && priv &&
+	    freq_qos_request_active(&priv->unmanaged_cap)) {
+		apple_soc_thermal_owned = owned;
+		ret = freq_qos_update_request(&priv->unmanaged_cap,
+					      apple_soc_cpufreq_owner_cap(policy));
+	}
+
+	return ret < 0 ? ret : 0;
+}
+EXPORT_SYMBOL_GPL(apple_soc_cpufreq_set_thermal_owner);
+
 static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 {
 	struct cpufreq_frequency_table *p;
@@ -913,6 +1001,16 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	policy->driver_data = priv;
 	policy->freq_table = freq_table;
 
+	if (info->needs_thermal_owner) {
+		mutex_lock(&apple_soc_thermal_owner_lock);
+		ret = freq_qos_add_request(&policy->constraints, &priv->unmanaged_cap,
+					   FREQ_QOS_MAX,
+					   apple_soc_cpufreq_owner_cap(policy));
+		mutex_unlock(&apple_soc_thermal_owner_lock);
+		if (ret < 0)
+			goto out_clear_policy;
+	}
+
 	ret = apple_fast_die_init(policy, cluster);
 	if (ret) {
 		dev_err(cpu_dev, "failed to set up the fast die-temperature limit: %d\n", ret);
@@ -936,6 +1034,8 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	return 0;
 
 out_clear_policy:
+	if (freq_qos_request_active(&priv->unmanaged_cap))
+		freq_qos_remove_request(&priv->unmanaged_cap);
 	policy->driver_data = NULL;
 	policy->freq_table = NULL;
 out_free_cpufreq_table:
@@ -954,6 +1054,8 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 {
 	struct apple_cpu_priv *priv = policy->driver_data;
 
+	if (freq_qos_request_active(&priv->unmanaged_cap))
+		freq_qos_remove_request(&priv->unmanaged_cap);
 	dev_pm_opp_free_cpufreq_table(priv->cpu_dev, &policy->freq_table);
 	/*
 	 * The core clears the last CPU from policy->cpus before calling
