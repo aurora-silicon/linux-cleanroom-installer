@@ -36,6 +36,7 @@ thermal_sys-$(CONFIG_PCIE_THERMAL) += pcie_cooling.o
 
 obj-$(CONFIG_K3_THERMAL)	+= k3_bandgap.o k3_j72xx_bandgap.o
 # platform thermal drivers
+obj-$(CONFIG_APPLE_PMP_THERMAL)	+= apple-pmp-thermal.o
 obj-y				+= broadcom/
 obj-$(CONFIG_THERMAL_MMIO)		+= thermal_mmio.o
 obj-$(CONFIG_AIROHA_THERMAL)	+= airoha_thermal.o

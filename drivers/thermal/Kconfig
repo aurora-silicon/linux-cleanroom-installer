@@ -17,6 +17,23 @@ menuconfig THERMAL
 
 if THERMAL
 
+config APPLE_PMP_THERMAL
+	tristate "Apple J713 PMP package CPU thermal policy"
+	depends on ARCH_APPLE && ARM_APPLE_SOC_CPUFREQ && MFD_MACSMC
+	select CPU_THERMAL
+	select THERMAL_GOV_STEP_WISE
+	help
+	  Register a package thermal zone with CPU cooling on the J713
+	  (MacBook Air M4), using read-only PMP die-temperature records and
+	  the SMC CPU rail power readings. Passive trips at 106/110 C, a
+	  progressive 108..115 C backstop and a CPU rail power budget limit
+	  both CPU clusters; three valid >=120 C samples request shutdown.
+	  These are Linux development policy choices, not Apple safety
+	  limits. Sensor or power telemetry errors clamp both clusters to
+	  their minimum frequency. Until this policy runs, the CPU DVFS
+	  driver keeps both clusters at or below 1.8 GHz.
+	  If built as a module, it is named apple-pmp-thermal.
+
 config THERMAL_NETLINK
 	bool "Thermal netlink management"
 	depends on NET
