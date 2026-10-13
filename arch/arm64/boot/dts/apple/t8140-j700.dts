@@ -52,6 +52,8 @@
 			power-domains = <&ps_disp_cpu>;
 			/* Format properties will be added by loader */
 			status = "disabled";
+			panel = <&panel>;
+			post-init-providers = <&panel>;
 		};
 	};
 
