@@ -127,6 +127,16 @@
 #define G15_TILEMAP_SLOT_SIZE	0x100000ULL
 #define G15_TPC_SLOT_STRIDE	0x4000000ULL
 #define G15_PASS_STRIDE		0x118000ULL	/* preemption, heap, scene user, FS scratch */
+/*
+ * Two-cluster vertex clustering (clustering contract 2): per pass slot one
+ * GPU-cached allocation of 64 tilemap segments and four metadata regions,
+ * no lower alias, after the ordinary TPC/tilemap slots. A larger eligible
+ * geometry than the slot holds uses the ordinary encoding.
+ */
+#define G15_CT_GVA		0x7440000000ULL
+#define G15_CT_STRIDE		0x1000000ULL
+#define G15_CT_SIZE		0x400000ULL
+#define G15_CLUSTER_PB_PAGES	0x3c
 #define G15_AUX_STRIDE		0x98000ULL
 #define G15_WORK_STRIDE		0x20000ULL	/* TA/FS lower and client work pages */
 #define G15_FS_WORK_PAGE	0x7200000000ULL
@@ -137,7 +147,7 @@
 #define G15_LEAF_NC		0x00c0000000000c8bULL
 #define G15_LEAF_CACHED		0x00c0000000000c83ULL
 #define G15_LEAF_PB_LIST	0x00e0000000000c03ULL
-#define G15_MAX_CLIENT		256
+#define G15_MAX_CLIENT		320
 
 static bool wb_sweep;
 module_param(wb_sweep, bool, 0644);
@@ -154,6 +164,10 @@ MODULE_PARM_DESC(render_slots, "Render passes of one submission published togeth
 static bool mixed_prefix = true;
 module_param(mixed_prefix, bool, 0644);
 MODULE_PARM_DESC(mixed_prefix, "Publish computes and renders of one submission in one ordered prefix (up to compute_slots + render_slots), cross-engine order kept by firmware barriers; 0: one engine per prefix");
+
+static bool vertex_clustering = true;
+module_param(vertex_clustering, bool, 0644);
+MODULE_PARM_DESC(vertex_clustering, "Tile eligible passes (one layer, one sample, 32x32 utiles) on both clusters; storage is provisioned only if set at load");
 
 static bool early_tiling = true;
 module_param(early_tiling, bool, 0444);
@@ -232,6 +246,7 @@ struct g15_graph {
 /* One render pass slot (slot 0 only in this version). */
 struct g15_pass {
 	struct g15_buf aux, pre[3], tpc, tilemap, heap, scene_user, fs_scratch;
+	struct g15_buf ct;	/* clustering segments + metadata (0 size: none) */
 	struct g15_buf ta_work, fs_work, ta_seq, fs_seq, ta_scratch, scene;
 	struct g15_buf its, uts, own_barrier, prev_barrier, fs_dep;
 };
@@ -244,6 +259,7 @@ struct g15_render {
 	struct g15_buf qinfo[2], qstate[2], ring[2], qscratch[2], user_stamp[2], fw_stamp[2];
 	struct g15_pass pass[G15_RENDER_SLOTS];
 	u32 slots;
+	u32 pre_records;	/* preemption records per buffer: 2, 3 with clustering */
 	bool reinit;		/* re-initialize allocators + InitBM before the next render */
 	u64 draw;		/* cumulative host draw ordinal of the last publication */
 	bool registered, c1_written;
@@ -297,6 +313,7 @@ struct g15_backend {
 	u64 st_first_ns[3], st_last_ns[3];	/* publish to first / last stage event */
 	u64 st_jobs, st_job_cmds, st_job_max;	/* retired jobs and their command counts */
 	u64 st_early;				/* early-tiled render members */
+	u64 st_clustered;			/* clustered render members */
 	struct dentry *debugfs;
 	bool queue_registered;
 	int failed;
@@ -624,6 +641,12 @@ static int g15_render_alloc(struct g15_backend *be)
 	ret = ret ?: __g15_buf_alloc(be, &r->pb_heap, G15_PB_HEAP_SIZE, sh, G15_PB_HEAP_GVA, 0,
 				     false, true);
 	r->slots = clamp(render_slots, 1U, (u32)G15_RENDER_SLOTS);
+	/*
+	 * Clustered tiling needs three records in each preemption buffer (two
+	 * per-cluster plus an aggregate), each buffer then spanning two pages
+	 * from the same payload offset (clustering contract 5).
+	 */
+	r->pre_records = vertex_clustering ? 3 : 2;
 	for (u32 i = 0; !ret && i < r->slots; i++) {
 		struct g15_pass *p = &r->pass[i];
 		u64 ps = i * G15_PASS_STRIDE, ws = i * G15_WORK_STRIDE;
@@ -632,9 +655,12 @@ static int g15_render_alloc(struct g15_backend *be)
 
 		ret = g15_buf_alloc(be, &p->aux, 0x20000, sh, G15_AUX_GVA + i * G15_AUX_STRIDE,
 				    0, false);
-		ret = ret ?: g15_buf_alloc(be, &p->pre[0], 0xa80, sh, G15_PRE0_PAGE + ps, 0x3580, false);
-		ret = ret ?: g15_buf_alloc(be, &p->pre[1], 0x500, sh, G15_PRE1_PAGE + ps, 0x3b00, false);
-		ret = ret ?: g15_buf_alloc(be, &p->pre[2], 0x80, sh, G15_PRE2_PAGE + ps, 0x3f80, false);
+		ret = ret ?: g15_buf_alloc(be, &p->pre[0], r->pre_records * 0x540, sh,
+					   G15_PRE0_PAGE + ps, 0x3580, false);
+		ret = ret ?: g15_buf_alloc(be, &p->pre[1], r->pre_records * 0x280, sh,
+					   G15_PRE1_PAGE + ps, 0x3b00, false);
+		ret = ret ?: g15_buf_alloc(be, &p->pre[2], r->pre_records * 0x40, sh,
+					   G15_PRE2_PAGE + ps, 0x3f80, false);
 		ret = ret ?: g15_buf_alloc(be, &p->tpc, tpc, sh,
 					   G15_TPC_GVA + i * G15_TPC_SLOT_STRIDE, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &p->tilemap, tilemap, sh,
@@ -1536,6 +1562,27 @@ static void g15_geometry(const struct drm_asahi_cmd_render *u, u64 heap, struct 
 		(u64)(g->utile_config & 0xf000) << 28;
 }
 
+/*
+ * Clustered tiling layout from base (clustering contract 2): 64 segments of
+ * 5E bytes, then M2 (0xc00), M3 (0xa00), M4 ((Q+1) x 512 for Q = pages of
+ * the owned PB / 0x1800, rounded up) and the 128-aligned 0x80-byte M1.
+ */
+struct g15_cluster {
+	u64 ct, m1, m2, m3, m4, bytes;
+};
+
+static void g15_cluster_layout(const struct g15_geom *geo, u64 base, struct g15_cluster *c)
+{
+	u64 q = DIV_ROUND_UP(DIV_ROUND_UP(G15_PB_HEAP_SIZE, 0x8000), 0x1800);
+
+	c->ct = base;
+	c->m2 = base + ALIGN(64 * 5 * geo->E, 32);
+	c->m3 = c->m2 + 0xc00;
+	c->m4 = c->m3 + 0xa00;
+	c->m1 = base + ALIGN(c->m4 - base + (q + 1) * 8 * 64, 128);
+	c->bytes = c->m1 + 0x80 - base;
+}
+
 /* Program address and resource word (render addendum R6). */
 static u64 g15_prog_addr(u64 usc_base, const struct drm_asahi_bg_eot *p)
 {
@@ -1603,7 +1650,8 @@ static void g15_barrier(const struct g15_buf *b, u64 stamp, u32 wait, u32 event,
 }
 
 static void g15_encode_ta(struct g15_backend *be, struct g15_pass *p, const struct g15_cmd *cmd,
-			  u32 ctx, u64 usc, u32 Tta, const struct g15_geom *geo, u8 *w, u8 *q)
+			  u32 ctx, u64 usc, u32 Tta, const struct g15_geom *geo,
+			  const struct g15_cluster *cl, u8 *w, u8 *q)
 {
 	struct g15_render *r = &be->r;
 	const struct drm_asahi_cmd_render *u = &cmd->r;
@@ -1642,6 +1690,17 @@ static void g15_encode_ta(struct g15_backend *be, struct g15_pass *p, const stru
 	};
 
 	(void)usc;
+	if (cl) {
+		/* The ten clustered TA values (clustering contract 3), compact form. */
+		val[4] = val[5] = g15_compact(cl->ct);
+		val[22] = g15_compact(cl->m2);
+		val[23] = g15_compact(cl->m3);
+		val[24] = 0x200440;
+		val[25] = 4;
+		val[30] = val[31] = g15_compact(cl->m4);
+		val[32] = G15_CLUSTER_PB_PAGES;
+		val[33] = g15_compact(cl->m1);
+	}
 	/* Work image (render contract 5). */
 	put_unaligned_le32(0, w + 0x0);
 	put_unaligned_le64(1, w + 0x4);
@@ -1947,15 +2006,26 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	bool early = pf->prev == 2 && READ_ONCE(early_tiling) &&
 		(u->flags & DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY) &&
 		!cmd->ts_va[0] && !cmd->ts_va[2];
+	struct g15_cluster cl;
 	struct g15_geom geo;
+	bool cluster;
 	u8 scene[0x80];
 
 	g15_geometry(u, p->heap.gva, &geo);
+	/*
+	 * Clustered tiling (clustering contract 1): one layer, one sample,
+	 * 32x32 utiles, unless the submission asked for single-cluster vertex
+	 * work, and the slot's storage holds this geometry.
+	 */
+	g15_cluster_layout(&geo, p->ct.gva, &cl);
+	cluster = READ_ONCE(vertex_clustering) && p->ct.size && u->layers == 1 &&
+		geo.utile_config == 0xa000 && !(u->flags & DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING) &&
+		cl.bytes <= p->ct.size - p->ct.off;
 	memset(ta, 0, G15_TA_WORK_SIZE);
 	memset(fs, 0, G15_FS_WORK_SIZE);
 	memset(tas, 0, G15_TA_SEQ_SIZE);
 	memset(fss, 0, G15_FS_SEQ_SIZE);
-	g15_encode_ta(be, p, cmd, ctx, usc, Tta, &geo, ta, tas);
+	g15_encode_ta(be, p, cmd, ctx, usc, Tta, &geo, cluster ? &cl : NULL, ta, tas);
 	g15_encode_fs(be, p, cmd, ctx, usc, n, Tfs, &geo, fs, fss);
 
 	/* The slot is unpublished: its previous prefix fully retired. */
@@ -1968,6 +2038,15 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	g15_buf_fill(&p->its, 0, 0, 32);
 	g15_buf_fill(&p->tpc, 0, 0, geo.tpc_bytes);
 	g15_buf_fill(&p->tilemap, 0, 0, geo.tilemap_bytes);
+	/* Preemption save areas start zeroed on every use (clustering contract 5). */
+	g15_buf_fill(&p->pre[0], 0, 0, r->pre_records * 0x540);
+	g15_buf_fill(&p->pre[1], 0, 0, r->pre_records * 0x280);
+	g15_buf_fill(&p->pre[2], 0, 0, r->pre_records * 0x40);
+	if (cluster) {
+		/* Exactly the current segments and metadata, alignment gaps included. */
+		g15_buf_fill(&p->ct, 0, 0, cl.bytes);
+		be->st_clustered++;
+	}
 	g15_buf_write(&p->ta_work, 0, ta, G15_TA_WORK_SIZE);
 	g15_buf_write(&p->fs_work, 0, fs, G15_FS_WORK_SIZE);
 	g15_buf_write(&p->ta_seq, 0, tas, G15_TA_SEQ_SIZE);
@@ -2722,9 +2801,9 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 			   div_u64(be->st_last_ns[e], 1000));
 	seq_printf(m, "gaps %llu gap_us %llu yields %llu\n", be->st_gaps,
 		   div_u64(be->st_gap_ns, 1000), be->st_yields);
-	seq_printf(m, "jobs %llu job_cmds %llu job_max %llu early %llu recoveries %llu hang_kills %llu\n",
+	seq_printf(m, "jobs %llu job_cmds %llu job_max %llu early %llu recoveries %llu hang_kills %llu clustered %llu\n",
 		   be->st_jobs, be->st_job_cmds, be->st_job_max, be->st_early, be->st_recoveries,
-		   be->st_hang_kills);
+		   be->st_hang_kills, be->st_clustered);
 	mutex_unlock(&be->lock);
 	return 0;
 }
@@ -3530,6 +3609,14 @@ int g15_backend_start(struct g15_gpu *gpu)
 	for (u32 k = 0; !ret && k < be->g.slots; k++)
 		ret = g15_buf_alloc(be, &be->g.slot[k].barrier, G15_BARRIER_SIZE, G15_PTE_FW, 0, 0,
 				    false);
+	/* Clustering storage: GPU-cached client view and shared upper alias. */
+	for (u32 k = 0; !ret && be->r.pre_records == 3 && k < be->r.slots; k++) {
+		struct g15_buf *ct = &be->r.pass[k].ct;
+
+		ret = g15_buf_alloc(be, ct, G15_CT_SIZE, G15_PTE_SHARED,
+				    G15_CT_GVA + k * G15_CT_STRIDE, 0, false);
+		ct->client_attrs = G15_LEAF_CACHED;
+	}
 	if (!ret) {
 		g15_graph_init(be);
 		g15_render_init(be);
