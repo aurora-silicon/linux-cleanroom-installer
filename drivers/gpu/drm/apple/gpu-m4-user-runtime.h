@@ -216,14 +216,26 @@ static void m4_user_collect_native(struct m4_gpu_provider_runtime *p)
  */
 #define M4_USER_RENDER_DEPTH GPU_M4_DRM_PROVIDER_WINDOW_MAX_COMMANDS
 
-/* Render packet batching (A/B switch, read once per publication scope): a
- * render-only window's renders published in one scope form ONE packet (all
- * ring entries, one pipe record per engine, one FS then one TA kick; flush
- * requests on its last render only). 0 restores one packet per render.
+/* Render packet batching (A/B switch, read once per publication scope):
+ * consecutive renders published in one scope form packets of at most
+ * render_batch_max members (all ring entries, one pipe record per engine, one
+ * FS then one TA kick; flush requests on the packet's last render only).
+ * 0 restores one packet per render.
+ *
+ * A deferred member is invisible to firmware until its packet closes, and
+ * each render takes the host roughly 0.05-0.15 ms to build. Holding a whole
+ * window back delays its first render by the build of all the others, an idle
+ * bubble whenever the GPU drains the previous work first; native publication
+ * exposes each changed ring horizon at once. One packet per render instead
+ * pays the completion flush between every pair of renders. Pairs keep the
+ * first render of a window visible after one more build and halve the flushes.
  */
 static bool render_batch = true;
 module_param(render_batch, bool, 0644);
-MODULE_PARM_DESC(render_batch, "Batch a render-only window into one firmware packet (default 1)");
+MODULE_PARM_DESC(render_batch, "Batch consecutive renders into shared firmware packets (default 1)");
+static unsigned int render_batch_max = 2;
+module_param(render_batch_max, uint, 0644);
+MODULE_PARM_DESC(render_batch_max, "Renders per batched firmware packet (default 2, at most a window)");
 
 /* Service health cadence (A/B switch for hardware rollback, read per call).
  * 0: one service snapshot per lane-worker pass (m4_user_service_locked()),
@@ -1940,9 +1952,10 @@ static void m4_user_inflight2_observe_locked(struct m4_gpu_provider_runtime *p,
  * the per-command slot leases. A serial (depth one) child publishes exactly
  * its head. A deeper child is homogeneous or (mixed_window) mixed; each
  * command carries its strict prior-command edge. A compute command is its own packet. With render_batch
- * the renders published in this scope form ONE packet (ring entries of every
- * member, one pipe record and one kick per engine, flush requests on its last
- * render); otherwise each render is its own packet. Any failure leaves every
+ * consecutive renders published in this scope form packets of at most
+ * render_batch_max members (ring entries of every member, one pipe record and
+ * one kick per engine, flush requests on its last render); otherwise each
+ * render is its own packet. Any failure leaves every
  * already installed owner retained and reachable (an open packet is closed
  * through its last installed member); nothing later is published.
  */
@@ -1950,6 +1963,7 @@ static int m4_user_publish_window_locked(struct m4_user_job *j)
 {
 	struct gpu_m4_drm_provider_job_view view = { };
 	bool health = false, batch = READ_ONCE(render_batch);
+	u32 batch_max = clamp_t(u32, READ_ONCE(render_batch_max), 1, M4_USER_RENDER_DEPTH);
 	int ret;
 
 	gpu_m4_drm_provider_job_view(j->core_job, &view);
@@ -1970,7 +1984,7 @@ static int m4_user_publish_window_locked(struct m4_user_job *j)
 		bool defer = batch && j->depth > 1 && type == DRM_ASAHI_CMD_RENDER &&
 			index + 1 < j->command_count && index + 1 - j->completed_count < j->depth &&
 			view.batch->commands[index + 1].type == DRM_ASAHI_CMD_RENDER &&
-			j->wire_open + 1 < M4_USER_RENDER_DEPTH;
+			j->wire_open + 1 < batch_max;
 
 		if (j->cmd[index].published || j->cmd[index].receipt ||
 		    (j->depth != 1 && !j->mixed && type != view.batch->commands[0].type))
