@@ -263,11 +263,15 @@ MODULE_PARM_DESC(barrier_relax, "Experiment: opcode-4 +0x3c=0 on waits behind an
 
 /* Publication depth of a compute-only child (read once per acceptance):
  * commands reachable ahead of their receipts, each strictly waiting on its
- * immediate predecessor's FW stamp (as in a mixed window). 2 is the r65 rule.
+ * immediate predecessor's FW stamp (as in a mixed window). 2 is the r65
+ * rule. Depth 2 left every third dependent compute behind a host receipt
+ * and a fresh firmware pickup (~250 us per pair); the whole bounded window,
+ * as render-only and mixed children already publish, keeps the firmware
+ * queue fed. Each command still has its own UMA slot and strict prior edge.
  */
-static unsigned int compute_depth = 2;
+static unsigned int compute_depth = 32;
 module_param(compute_depth, uint, 0644);
-MODULE_PARM_DESC(compute_depth, "Publication depth of a compute-only window (2..32, default 2)");
+MODULE_PARM_DESC(compute_depth, "Publication depth of a compute-only window (2..32, default 32 = the whole window)");
 
 /* inflight2 behind a same-queue window of any class mix (A/B switch, read per
  * admission): the next child window of a queue may start beside its
