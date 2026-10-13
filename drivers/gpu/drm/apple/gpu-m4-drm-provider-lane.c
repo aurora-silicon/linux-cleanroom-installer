@@ -466,8 +466,22 @@ static unsigned int lane_trailing_polls = 4;
 module_param(lane_trailing_polls, uint, 0644);
 MODULE_PARM_DESC(lane_trailing_polls, "Polls 20 us apart after progress before the lane_poll_us fallback (default 4)");
 
+/* Every mailbox interrupt, and so every notification wake, lands on CPU0,
+ * which also serves the other device interrupts. A per-CPU worker queued
+ * there runs there, so publication and retirement compete with that load (and
+ * on a P core, with whatever else the cluster's frequency choice follows).
+ * An unbound worker runs on any idle CPU of the waker's cache domain.
+ */
+static bool lane_unbound = true;
+module_param(lane_unbound, bool, 0644);
+MODULE_PARM_DESC(lane_unbound, "Run the lane worker unbound instead of on the waking CPU (default 1)");
+static struct workqueue_struct *gpu_m4_lane_unbound_highpri;
+
 static struct workqueue_struct *gpu_m4_lane_wq(void)
 {
+	if (READ_ONCE(lane_unbound))
+		return READ_ONCE(lane_highpri) && gpu_m4_lane_unbound_highpri ?
+			gpu_m4_lane_unbound_highpri : system_unbound_wq;
 	return READ_ONCE(lane_highpri) ? system_highpri_wq : system_unbound_wq;
 }
 
@@ -1207,3 +1221,18 @@ EXPORT_SYMBOL_GPL(gpu_m4_drm_provider_lane_fault_locked);
 
 MODULE_DESCRIPTION("Private Apple M4 dependency-ready hardware lane and drain");
 MODULE_LICENSE("GPL");
+
+static int __init gpu_m4_drm_provider_lane_init(void)
+{
+	/* Optional: without it an unbound lane uses system_unbound_wq. */
+	gpu_m4_lane_unbound_highpri = alloc_workqueue("gpu_m4_lane", WQ_UNBOUND | WQ_HIGHPRI, 0);
+	return 0;
+}
+module_init(gpu_m4_drm_provider_lane_init);
+
+static void __exit gpu_m4_drm_provider_lane_exit(void)
+{
+	if (gpu_m4_lane_unbound_highpri)
+		destroy_workqueue(gpu_m4_lane_unbound_highpri);
+}
+module_exit(gpu_m4_drm_provider_lane_exit);
