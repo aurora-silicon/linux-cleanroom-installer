@@ -128,14 +128,17 @@
 #define G15_TPC_SLOT_STRIDE	0x4000000ULL
 #define G15_PASS_STRIDE		0x118000ULL	/* preemption, heap, scene user, FS scratch */
 /*
- * Two-cluster vertex clustering (clustering contract 2): per pass slot one
- * GPU-cached allocation of 64 tilemap segments and four metadata regions,
- * no lower alias, after the ordinary TPC/tilemap slots. A larger eligible
- * geometry than the slot holds uses the ordinary encoding.
+ * Two-cluster vertex clustering (clustering contract 2): a clustered pass
+ * names one GPU-cached allocation of 64 tilemap segments and four metadata
+ * regions, no lower alias, after the ordinary TPC/tilemap slots. A pool of
+ * twice the pass slots lets a retired pass's buffer be zeroed while the next
+ * prefix runs. A larger eligible geometry than a buffer holds uses the
+ * ordinary encoding.
  */
 #define G15_CT_GVA		0x7440000000ULL
 #define G15_CT_STRIDE		0x1000000ULL
 #define G15_CT_SIZE		0x400000ULL
+#define G15_CT_BUFS		(2 * G15_RENDER_SLOTS)
 #define G15_CLUSTER_PB_PAGES	0x3c
 #define G15_AUX_STRIDE		0x98000ULL
 #define G15_WORK_STRIDE		0x20000ULL	/* TA/FS lower and client work pages */
@@ -168,6 +171,10 @@ MODULE_PARM_DESC(mixed_prefix, "Publish computes and renders of one submission i
 static bool vertex_clustering = true;
 module_param(vertex_clustering, bool, 0644);
 MODULE_PARM_DESC(vertex_clustering, "Tile eligible passes (one layer, one sample, 32x32 utiles) on both clusters; storage is provisioned only if set at load");
+
+static bool ct_async = true;
+module_param(ct_async, bool, 0644);
+MODULE_PARM_DESC(ct_async, "Zero a retired pass's clustering buffer in the background while the next prefix runs; 0: zero it when it is next claimed");
 
 static bool early_tiling = true;
 module_param(early_tiling, bool, 0444);
@@ -244,9 +251,22 @@ struct g15_graph {
 };
 
 /* One render pass slot (slot 0 only in this version). */
+/*
+ * A clustering buffer is all zero while CLEAN. A prefix claims it (USED,
+ * dirty: the span its pass may write); after the prefix retires it is DIRTY
+ * until the clear worker (CLEARING) or a claim with no CLEAN buffer left
+ * zeroes that span. States change under be->ct_lock.
+ */
+enum { G15_CT_CLEAN, G15_CT_USED, G15_CT_DIRTY, G15_CT_CLEARING };
+
+struct g15_ct {
+	struct g15_buf b;
+	u64 dirty;
+	u32 state;
+};
+
 struct g15_pass {
 	struct g15_buf aux, pre[3], tpc, tilemap, heap, scene_user, fs_scratch;
-	struct g15_buf ct;	/* clustering segments + metadata (0 size: none) */
 	struct g15_buf ta_work, fs_work, ta_seq, fs_seq, ta_scratch, scene;
 	struct g15_buf its, uts, own_barrier, prev_barrier, fs_dep;
 };
@@ -260,6 +280,10 @@ struct g15_render {
 	struct g15_pass pass[G15_RENDER_SLOTS];
 	u32 slots;
 	u32 pre_records;	/* preemption records per buffer: 2, 3 with clustering */
+	struct g15_ct ct[G15_CT_BUFS];
+	u32 ct_count;
+	struct g15_ct *ct_used[G15_RENDER_SLOTS];	/* claimed by the prefix being published/active */
+	u32 ct_used_count;
 	bool reinit;		/* re-initialize allocators + InitBM before the next render */
 	u64 draw;		/* cumulative host draw ordinal of the last publication */
 	bool registered, c1_written;
@@ -307,13 +331,17 @@ struct g15_backend {
 	 * compute, 1 render, 2 mixed); host gap from a retirement to the next
 	 * publication while work was ready.
 	 */
-	u64 pub_ns, idle_from_ns;
+	u64 pub_ns, idle_from_ns, starve_from_ns, prep_from_ns;
+	u64 st_starved_ns, st_prep_ns;	/* idle with nothing ready; prefix preparation */
 	u64 st_count[3], st_prefixes[3], st_busy_ns[3], st_max_ns[3];	/* [2]: mixed commands */
 	u64 st_gap_ns, st_gaps, st_yields;
 	u64 st_first_ns[3], st_last_ns[3];	/* publish to first / last stage event */
 	u64 st_jobs, st_job_cmds, st_job_max;	/* retired jobs and their command counts */
 	u64 st_early;				/* early-tiled render members */
 	u64 st_clustered;			/* clustered render members */
+	u64 st_ct_sync;				/* clustering buffers zeroed at claim */
+	spinlock_t ct_lock;
+	struct work_struct ct_clear;
 	struct dentry *debugfs;
 	bool queue_registered;
 	int failed;
@@ -1332,11 +1360,15 @@ static int g15_channel_post(struct g15_backend *be, u32 ch, u64 queue, u32 kind,
 static void g15_stat_publish(struct g15_backend *be)
 {
 	be->pub_ns = ktime_get_ns();
+	be->st_prep_ns += be->pub_ns - be->prep_from_ns;
 	if (be->idle_from_ns) {
 		be->st_gap_ns += be->pub_ns - be->idle_from_ns;
 		be->st_gaps++;
 		be->idle_from_ns = 0;
+	} else if (be->starve_from_ns) {
+		be->st_starved_ns += be->pub_ns - be->starve_from_ns;
 	}
+	be->starve_from_ns = 0;
 }
 
 static void g15_stat_retire(struct g15_backend *be)
@@ -1927,6 +1959,92 @@ static void g15_encode_fs(struct g15_backend *be, struct g15_pass *p, const stru
 	put_unaligned_le32(0x40000002, q + 0x30c);
 }
 
+/* Zero retired clustering buffers (their written span) outside be->lock. */
+static void g15_ct_clear_work(struct work_struct *work)
+{
+	struct g15_backend *be = container_of(work, struct g15_backend, ct_clear);
+	struct g15_render *r = &be->r;
+
+	for (;;) {
+		struct g15_ct *c = NULL;
+
+		spin_lock(&be->ct_lock);
+		for (u32 k = 0; !c && k < r->ct_count; k++)
+			if (r->ct[k].state == G15_CT_DIRTY)
+				c = &r->ct[k];
+		if (c)
+			c->state = G15_CT_CLEARING;
+		spin_unlock(&be->ct_lock);
+		if (!c)
+			return;
+		g15_buf_fill(&c->b, 0, 0, c->dirty);
+		wmb();	/* zeroes complete before the buffer can be claimed */
+		spin_lock(&be->ct_lock);
+		c->dirty = 0;
+		c->state = G15_CT_CLEAN;
+		spin_unlock(&be->ct_lock);
+	}
+}
+
+/*
+ * A zeroed clustering buffer of at least bytes for a pass of the prefix
+ * being prepared (be->lock held), or NULL: none provisioned or too small.
+ */
+static struct g15_ct *g15_ct_claim(struct g15_backend *be, u64 bytes)
+{
+	struct g15_render *r = &be->r;
+	struct g15_ct *c = NULL;
+	u64 clear = 0;
+
+	if (!r->ct_count || bytes > r->ct[0].b.size - r->ct[0].b.off)
+		return NULL;
+	for (u32 attempt = 0; !c && attempt < 2; attempt++) {
+		spin_lock(&be->ct_lock);
+		for (u32 k = 0; !c && k < r->ct_count; k++)
+			if (r->ct[k].state == G15_CT_CLEAN)
+				c = &r->ct[k];
+		/* None clean: take a retired one and zero it here. */
+		for (u32 k = 0; !c && k < r->ct_count; k++)
+			if (r->ct[k].state == G15_CT_DIRTY)
+				c = &r->ct[k];
+		if (c) {
+			clear = c->state == G15_CT_DIRTY ? c->dirty : 0;
+			c->state = G15_CT_USED;
+		}
+		spin_unlock(&be->ct_lock);
+		if (!c)
+			flush_work(&be->ct_clear);	/* the rest are being cleared */
+	}
+	if (!c)
+		return NULL;
+	if (clear) {
+		g15_buf_fill(&c->b, 0, 0, clear);
+		be->st_ct_sync++;
+	}
+	c->dirty = bytes;
+	r->ct_used[r->ct_used_count++] = c;
+	return c;
+}
+
+/*
+ * The clustering buffers of the retired (or never published) prefix: zero
+ * them in the background while the next prefix runs.
+ */
+static void g15_ct_release(struct g15_backend *be)
+{
+	struct g15_render *r = &be->r;
+
+	if (!r->ct_used_count)
+		return;
+	spin_lock(&be->ct_lock);
+	for (u32 k = 0; k < r->ct_used_count; k++)
+		r->ct_used[k]->state = G15_CT_DIRTY;
+	spin_unlock(&be->ct_lock);
+	r->ct_used_count = 0;
+	if (READ_ONCE(ct_async))
+		queue_work(system_unbound_wq, &be->ct_clear);
+}
+
 /*
  * A prefix under preparation (scheduling contract 2): members in API order,
  * compute member j in compute slot j, render member j in pass slot j. prev is
@@ -2006,6 +2124,7 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	bool early = pf->prev == 2 && READ_ONCE(early_tiling) &&
 		(u->flags & DRM_ASAHI_RENDER_FRAGMENT_DEPENDENCY) &&
 		!cmd->ts_va[0] && !cmd->ts_va[2];
+	struct g15_ct *ct = NULL;
 	struct g15_cluster cl;
 	struct g15_geom geo;
 	bool cluster;
@@ -2015,12 +2134,17 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	/*
 	 * Clustered tiling (clustering contract 1): one layer, one sample,
 	 * 32x32 utiles, unless the submission asked for single-cluster vertex
-	 * work, and the slot's storage holds this geometry.
+	 * work, and a zeroed buffer holds this geometry.
 	 */
-	g15_cluster_layout(&geo, p->ct.gva, &cl);
-	cluster = READ_ONCE(vertex_clustering) && p->ct.size && u->layers == 1 &&
-		geo.utile_config == 0xa000 && !(u->flags & DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING) &&
-		cl.bytes <= p->ct.size - p->ct.off;
+	cluster = READ_ONCE(vertex_clustering) && u->layers == 1 && geo.utile_config == 0xa000 &&
+		!(u->flags & DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING);
+	if (cluster) {
+		g15_cluster_layout(&geo, 0, &cl);
+		ct = g15_ct_claim(be, cl.bytes);
+		cluster = ct;
+	}
+	if (cluster)
+		g15_cluster_layout(&geo, ct->b.gva, &cl);
 	memset(ta, 0, G15_TA_WORK_SIZE);
 	memset(fs, 0, G15_FS_WORK_SIZE);
 	memset(tas, 0, G15_TA_SEQ_SIZE);
@@ -2042,11 +2166,8 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	g15_buf_fill(&p->pre[0], 0, 0, r->pre_records * 0x540);
 	g15_buf_fill(&p->pre[1], 0, 0, r->pre_records * 0x280);
 	g15_buf_fill(&p->pre[2], 0, 0, r->pre_records * 0x40);
-	if (cluster) {
-		/* Exactly the current segments and metadata, alignment gaps included. */
-		g15_buf_fill(&p->ct, 0, 0, cl.bytes);
-		be->st_clustered++;
-	}
+	if (cluster)
+		be->st_clustered++;	/* its buffer is zero: cleared since its last use */
 	g15_buf_write(&p->ta_work, 0, ta, G15_TA_WORK_SIZE);
 	g15_buf_write(&p->fs_work, 0, fs, G15_FS_WORK_SIZE);
 	g15_buf_write(&p->ta_seq, 0, tas, G15_TA_SEQ_SIZE);
@@ -2141,6 +2262,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job, u32 i)
 	struct g15_geom geo;
 	int ret = 0;
 
+	be->prep_from_ns = ktime_get_ns();
 	for (end = i; end < job->count; end++) {
 		const struct g15_cmd *cmd = &job->cmds[end];
 
@@ -2284,6 +2406,8 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job, u32 i)
 	/* A queue WRITE already advanced: any later failure is uncertain. */
 	ret = ret ? -EIO : 0;
 out:
+	if (ret && ret != -EIO)
+		g15_ct_release(be);	/* never published */
 	kfree(ta);
 	kfree(fs);
 	kfree(tas);
@@ -2673,6 +2797,7 @@ static void g15_poll_work(struct work_struct *work)
 			mutex_unlock(&gpu->lock);
 		}
 		be->active = NULL;
+		g15_ct_release(be);
 		if (be->preempt_global) {
 			/*
 			 * Retired only after the hang preemption: the firmware ended
@@ -2751,6 +2876,7 @@ static void g15_poll_work(struct work_struct *work)
 				dev_warn(gpu->dev, "recovered: ctx %u submission failed with %d\n",
 					 job->vm->asid, err);
 				be->active = NULL;
+				g15_ct_release(be);
 				/* The failing client's VM is lost; other clients continue. */
 				gpu_m4_drm_vm_error(job->vm->frontend, err);
 				g15_guard_put(job);
@@ -2774,8 +2900,11 @@ next:
 	g15_engine_next(be, &done);
 	if (parked && be->active && be->active != parked)
 		be->st_yields++;
-	if (!be->active)
-		be->idle_from_ns = 0;	/* idle with nothing ready is not a gap */
+	if (!be->active && be->idle_from_ns) {
+		/* Idle with nothing ready is not a gap: the clients are late. */
+		be->starve_from_ns = be->idle_from_ns;
+		be->idle_from_ns = 0;
+	}
 	again |= !!be->active;
 out:
 	if (again)
@@ -2804,6 +2933,8 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "jobs %llu job_cmds %llu job_max %llu early %llu recoveries %llu hang_kills %llu clustered %llu\n",
 		   be->st_jobs, be->st_job_cmds, be->st_job_max, be->st_early, be->st_recoveries,
 		   be->st_hang_kills, be->st_clustered);
+	seq_printf(m, "ct_sync %llu starved_us %llu prep_us %llu\n", be->st_ct_sync,
+		   div_u64(be->st_starved_ns, 1000), div_u64(be->st_prep_ns, 1000));
 	mutex_unlock(&be->lock);
 	return 0;
 }
@@ -3602,6 +3733,8 @@ int g15_backend_start(struct g15_gpu *gpu)
 	be->debugfs = debugfs_create_dir("apple-gpu-g15", NULL);
 	debugfs_create_file("stats", 0444, be->debugfs, be, &g15_stats_fops);
 	INIT_WORK(&be->reap, g15_reap_work);
+	spin_lock_init(&be->ct_lock);
+	INIT_WORK(&be->ct_clear, g15_ct_clear_work);
 	be->fw_next = G15_FW_BASE;
 	mutex_lock(&be->lock);
 	ret = g15_graph_alloc(be) ?: g15_render_alloc(be);
@@ -3610,12 +3743,13 @@ int g15_backend_start(struct g15_gpu *gpu)
 		ret = g15_buf_alloc(be, &be->g.slot[k].barrier, G15_BARRIER_SIZE, G15_PTE_FW, 0, 0,
 				    false);
 	/* Clustering storage: GPU-cached client view and shared upper alias. */
-	for (u32 k = 0; !ret && be->r.pre_records == 3 && k < be->r.slots; k++) {
-		struct g15_buf *ct = &be->r.pass[k].ct;
+	for (u32 k = 0; !ret && be->r.pre_records == 3 && k < 2 * be->r.slots; k++) {
+		struct g15_buf *ct = &be->r.ct[k].b;
 
 		ret = g15_buf_alloc(be, ct, G15_CT_SIZE, G15_PTE_SHARED,
 				    G15_CT_GVA + k * G15_CT_STRIDE, 0, false);
 		ct->client_attrs = G15_LEAF_CACHED;
+		be->r.ct_count = k + 1;
 	}
 	if (!ret) {
 		g15_graph_init(be);
