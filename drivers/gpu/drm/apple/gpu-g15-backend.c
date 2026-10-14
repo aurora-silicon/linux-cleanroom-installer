@@ -421,6 +421,11 @@ struct g15_backend {
 	bool chan_wait;		/* a ready prefix waits only for a record's consumption */
 	spinlock_t ct_lock;
 	struct work_struct ct_clear;
+	/*
+	 * ct_clear runs here: preparation (drm_sched's reclaim workqueue)
+	 * flushes it when every slot or buffer is still being reset.
+	 */
+	struct workqueue_struct *clear_wq;
 	struct dentry *debugfs;
 	bool queue_registered;
 	int failed;
@@ -2311,7 +2316,7 @@ static void g15_flight_release(struct g15_backend *be, struct g15_flight *f)
 	f->ct_count = 0;
 	f->slot_count = 0;
 	if (READ_ONCE(ct_async))
-		queue_work(system_unbound_wq, &be->ct_clear);
+		queue_work(be->clear_wq, &be->ct_clear);
 }
 
 /*
@@ -4414,6 +4419,9 @@ int g15_backend_start(struct g15_gpu *gpu)
 			return -EPROTO;	/* TA/FS/compute channels must start empty */
 	be = devm_kzalloc(gpu->dev, sizeof(*be), GFP_KERNEL);
 	if (!be)
+		return -ENOMEM;
+	be->clear_wq = alloc_workqueue("apple-gpu-g15-clear", WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	if (!be->clear_wq)
 		return -ENOMEM;
 	be->gpu = gpu;
 	mutex_init(&be->lock);
