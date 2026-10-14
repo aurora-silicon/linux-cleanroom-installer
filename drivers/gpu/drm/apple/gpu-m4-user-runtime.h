@@ -981,7 +981,8 @@ static int m4_user_compute_prior_expected(struct m4_user_job *j, u32 index,
 			.owner = &j->cmd[index - 1],
 			.firmware = { n->counter->fw_va + GPU_M4_COMPUTE_PACKET_WAIT_OFFSET,
 				GPU_M4_EXEC_DEPENDENCY_SIZE },
-			.stamp_fw = j->queue->notifier->bo->fw_va + 0x630,
+			.stamp_fw = m4_user_render_wait_fw(j->runtime,
+				j->queue->notifier->bo->fw_va, 1),
 			.target = j->cmd[index - 1].final_target,
 			.event = 0x71, .strict = true, .relaxed = m4_user_prior_relax(j, index, 1),
 		};
@@ -996,7 +997,7 @@ static int m4_user_compute_prior_expected(struct m4_user_job *j, u32 index,
 		.owner = &j->compute[index - 1],
 		.firmware = { n->counter->fw_va + GPU_M4_COMPUTE_PACKET_WAIT_OFFSET,
 			GPU_M4_EXEC_DEPENDENCY_SIZE },
-		.stamp_fw = j->queue->notifier->bo->fw_va + 0x640,
+		.stamp_fw = m4_user_compute_wait_fw(j->runtime, j->queue->notifier->bo->fw_va),
 		.target = j->compute_reservation[index - 1].chronology.target_stamp,
 		.event = 15, .strict = true, .relaxed = m4_user_prior_relax(j, index, 1),
 	};
@@ -1195,7 +1196,11 @@ static int m4_user_compute_packet_publish_locked(struct m4_user_job *j, u32 inde
 			.global_previous_target = p->user_target[2],
 			.target_stamp = p->user_target[2] + 0x100,
 			/* Live observation: an outstanding predecessor is NOT complete. */
-			.selected_stamp_before = m4_ready_read32(n->bo->map.vaddr + 0x640),
+			/* With runtime-wide stage cells the notifier's own view
+			 * of its completions is its service (USER) cell.
+			 */
+			.selected_stamp_before = m4_ready_read32(n->bo->map.vaddr +
+				(p->user_stage_cells ? 0x648 : 0x640)),
 			.queue_read = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x30),
 			.queue_write = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x40),
 			.pipe_read = m4_ready_read32(pipe), .pipe_cfi = m4_ready_read32(pipe + 0x10),
@@ -1348,8 +1353,10 @@ static int m4_user_compute_packet_retired_locked(struct m4_user_job *j, u32 inde
 		return M4_USER_WHY(ret, "compute retire %u completed", index);
 	observed = (struct gpu_m4_exec_retirement) {
 		.expected_stamp = r->chronology.target_stamp,
-		.firmware_stamp = m4_ready_read32(notifier + 0x640),
+		.firmware_stamp = p->user_stage_cells ? m4_user_stage_read(p, 2) :
+			m4_ready_read32(notifier + 0x640),
 		.user_stamp = m4_ready_read32(notifier + 0x648),
+		.stage_horizon = m4_user_stage_tail(p, 2),
 		.next = own->queue_next,
 		.queue_read = m4_ready_read32(queue[M4_EXEC_QUEUE_STATE].cpu + 0x30),
 		.queue_write = m4_ready_read32(queue[M4_EXEC_QUEUE_STATE].cpu + 0x40),
@@ -1723,7 +1730,8 @@ static int m4_user_cross_locked(struct m4_gpu_provider_runtime *p, struct m4_use
 		gpu_m4_drm_provider_job_view(a->core_job, &av);
 		j->cross = (struct m4_user_cross) {
 			.untimed = m4_user_prior_relax(a, last + 1, 15),
-			.notifier = n, .stamp_fw = n->bo->fw_va + 0x630, .event = 0x71, .engine = 1,
+			.notifier = n, .stamp_fw = m4_user_render_wait_fw(p, n->bo->fw_va, 1),
+			.event = 0x71, .engine = 1,
 			.target = a->render_reservation[last].chronology.target_stamp,
 			.same_packet = a->queue == j->queue && view.window_parent &&
 				av.window_parent == view.window_parent &&
@@ -1734,7 +1742,8 @@ static int m4_user_cross_locked(struct m4_gpu_provider_runtime *p, struct m4_use
 	else
 		j->cross = (struct m4_user_cross) {
 			.untimed = m4_user_prior_relax(a, last + 1, 15),
-			.notifier = n, .stamp_fw = n->bo->fw_va + 0x640, .event = 15, .engine = 2,
+			.notifier = n, .stamp_fw = m4_user_compute_wait_fw(p, n->bo->fw_va),
+			.event = 15, .engine = 2,
 			.target = a->compute_reservation[last].chronology.target_stamp,
 		};
 	p->user_inflight2_stats.barrier[j->cross.event == 15]++; /* REMOVE-DEBUG */
@@ -1868,7 +1877,8 @@ static int m4_user_inflight2_admit_locked(struct m4_gpu_provider_runtime *p,
 			if ((!p->user_inflight2_wide && !READ_ONCE(inflight2_mixed) &&
 			     (!render_only || a->cmd[a->published_count - 1].engine_mask != 3)) ||
 			    (!render_only && j->queue->notifier->sequence[2] &&
-			     !m4_ready_read32(j->queue->notifier->bo->map.vaddr + 0x640))) {
+			     !m4_ready_read32(j->queue->notifier->bo->map.vaddr +
+				(p->user_stage_cells ? 0x648 : 0x640)))) {
 				veto = M4_USER_VETO_QUEUE;
 				goto vetoed;
 			}
@@ -2088,6 +2098,8 @@ static int m4_user_publish_locked(void *owner, struct gpu_m4_drm_provider_job *j
 		j->native_stage->pending->bind_sequence = ++p->user_bind_sequence;
 		j->native_stage->pending->cross_stamp_fw = j->cross.notifier ? j->cross.stamp_fw : 0;
 		j->native_stage->pending->cross_event = j->cross.notifier ? j->cross.event : 0;
+		j->native_stage->pending->cross_own = j->cross.notifier &&
+			j->cross.notifier == j->queue->notifier;
 		if (j->item.overlap & GPU_M4_DRM_LANE_OVERLAP_SEEN) {
 			if (m4_user_bind_stats[2] != installs)
 				m4_user_overlap_stats.rebind++;
@@ -2190,7 +2202,8 @@ static bool m4_user_command_pending_locked(struct m4_user_job *j,
 		if (!j->compute_reservation)
 			return false;
 		target = j->compute_reservation[index].chronology.target_stamp;
-		stamp = m4_ready_read32(notifier + 0x640);
+		stamp = j->runtime->user_stage_cells ? m4_user_stage_read(j->runtime, 2) :
+			m4_ready_read32(notifier + 0x640);
 	} else {
 		if (!j->render_reservation)
 			return false;

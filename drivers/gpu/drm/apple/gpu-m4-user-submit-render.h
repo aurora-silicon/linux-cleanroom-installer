@@ -368,8 +368,8 @@ static int m4_user_render_prior_expected(struct m4_user_job *j, u32 index,
 		prior[0] = (struct gpu_m4_render_prior_dependency) {
 			.firmware = { m4_user_render_record_fw(n, M4_RREC_PRIOR_TA),
 				GPU_M4_EXEC_DEPENDENCY_SIZE },
-			.predecessor_stamp_fw = early ? j->queue->notifier->bo->fw_va + 0x620 :
-				j->cross.stamp_fw,
+			.predecessor_stamp_fw = early ? m4_user_render_wait_fw(j->runtime,
+				j->queue->notifier->bo->fw_va, 0) : j->cross.stamp_fw,
 			.predecessor_target = j->cross.target,
 			.predecessor_event = early ? 0x70 : j->cross.event, .strict = true,
 			.relaxed = j->cross.untimed &&
@@ -399,7 +399,8 @@ static int m4_user_render_prior_expected(struct m4_user_job *j, u32 index,
 		prior[0] = (struct gpu_m4_render_prior_dependency) {
 			.firmware = { m4_user_render_record_fw(n, M4_RREC_PRIOR_TA),
 				GPU_M4_EXEC_DEPENDENCY_SIZE },
-			.predecessor_stamp_fw = j->queue->notifier->bo->fw_va + 0x640,
+			.predecessor_stamp_fw = m4_user_compute_wait_fw(j->runtime,
+				j->queue->notifier->bo->fw_va),
 			.predecessor_target = j->cmd[index - 1].final_target,
 			.predecessor_event = 15, .strict = true,
 			.relaxed = m4_user_prior_relax(j, index, 2),
@@ -414,7 +415,8 @@ static int m4_user_render_prior_expected(struct m4_user_job *j, u32 index,
 	prior[0] = (struct gpu_m4_render_prior_dependency) {
 		.firmware = { m4_user_render_record_fw(n, M4_RREC_PRIOR_TA),
 			GPU_M4_EXEC_DEPENDENCY_SIZE },
-		.predecessor_stamp_fw = j->queue->notifier->bo->fw_va + (early ? 0x620 : 0x630),
+		.predecessor_stamp_fw = m4_user_render_wait_fw(j->runtime,
+			j->queue->notifier->bo->fw_va, early ? 0 : 1),
 		.predecessor_target = j->render_reservation[index - 1].chronology.target_stamp,
 		.predecessor_event = early ? 0x70 : 0x71, .strict = true,
 		.relaxed = m4_user_prior_relax(j, index, 8),
@@ -423,7 +425,8 @@ static int m4_user_render_prior_expected(struct m4_user_job *j, u32 index,
 		prior[1] = (struct gpu_m4_render_prior_dependency) {
 			.firmware = { m4_user_render_record_fw(n, M4_RREC_PRIOR_FS),
 				GPU_M4_EXEC_DEPENDENCY_SIZE },
-			.predecessor_stamp_fw = j->queue->notifier->bo->fw_va + 0x630,
+			.predecessor_stamp_fw = m4_user_render_wait_fw(j->runtime,
+				j->queue->notifier->bo->fw_va, 1),
 			.predecessor_target = prior[0].predecessor_target,
 			.predecessor_event = 0x71, .fragment_internal = true,
 			.relaxed = m4_user_prior_relax(j, index, 4),
@@ -1148,6 +1151,8 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 		.initialize_pb = init,
 		.chronology = { .uma_submitted_before = before, .uma_completed_before = before,
 			.uma_submitted = before + 2, .target_stamp = target, .init_buffer = init,
+			.stage_fw = { m4_user_stage_fw(p, 0), m4_user_stage_fw(p, 1) },
+			.own_ta_fw = p->user_render_stage_waits ? m4_user_stage_fw(p, 0) : 0,
 			.parameter_id = m4_user_native_slot_parameter(DRM_ASAHI_CMD_RENDER,
 				m4_user_render_fw_slot(j, index)),
 			.record_fw = { notifier->record_fw[0], notifier->record_fw[1] } },
@@ -1320,8 +1325,10 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 			 */
 			m4_ready_write32(notifier->bo->map.vaddr + 0x620 + e * 16,
 				res->chronology.engine[e].previous_target);
-			m4_ready_write32(notifier->bo->map.vaddr + 0x628 + e * 16,
-				res->chronology.engine[e].previous_target);
+			/* The runtime-wide stage cell is never seeded per notifier. */
+			if (!p->user_stage_cells)
+				m4_ready_write32(notifier->bo->map.vaddr + 0x628 + e * 16,
+					res->chronology.engine[e].previous_target);
 		}
 		/* The threshold names this newest reserved sequence; used stamps
 		 * are kept.
@@ -1379,7 +1386,9 @@ static int m4_user_render_stage_sample_locked(struct m4_user_job *j, u32 index,
 		.start_counter = m4_store_read64(start + (engine ? 0x1d8 : 0x1b8)),
 		.expected_target = c->target_stamp,
 		.firmware_stamp = m4_ready_read32(notifier + 0x620 + engine * 16),
-		.user_stamp = m4_ready_read32(notifier + 0x628 + engine * 16),
+		.user_stamp = p->user_stage_cells ? m4_user_stage_read(p, engine) :
+			m4_ready_read32(notifier + 0x628 + engine * 16),
+		.stage_horizon = m4_user_stage_tail(p, engine),
 		.queue_begin = wire->queue_before, .queue_entries = wire->count, .queue_next = wire->queue_next,
 		.queue_read = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x30),
 		.queue_producer = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x40),
@@ -1506,6 +1515,7 @@ static int m4_user_render_pair_owner_locked(void *cookie,
  */
 static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index)
 {
+	struct m4_gpu_provider_runtime *p = j->runtime;
 	struct m4_user_render_packet *packet;
 	const struct m4_user_render_native *n;
 	const struct gpu_m4_render_packet_chronology *c;
@@ -1601,8 +1611,8 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 		packet->bytes.fragment_sequence, sizeof(packet->bytes.fragment_sequence)) ||
 	    memcmp(dependency, packet->bytes.fragment_dependency, GPU_M4_EXEC_DEPENDENCY_SIZE) ||
 	    m4_ready_read32(dependency) != 4 ||
-	    get_unaligned_le64(dependency + 4) != j->queue->notifier->bo->fw_va + 0x620 ||
-	    get_unaligned_le64(dependency + 0xc) != j->queue->notifier->bo->fw_va + 0x620 ||
+	    get_unaligned_le64(dependency + 4) != m4_user_render_wait_fw(p, j->queue->notifier->bo->fw_va, 0) ||
+	    get_unaligned_le64(dependency + 0xc) != m4_user_render_wait_fw(p, j->queue->notifier->bo->fw_va, 0) ||
 	    m4_ready_read32(dependency + 0x14) != c->target_stamp ||
 	    m4_ready_read32(dependency + 0x20) != 0x70 ||
 	    m4_ready_read32(dependency + 0x24) != c->target_stamp || m4_ready_read32(dependency + 0x3c))
@@ -1654,8 +1664,11 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 			.record_fw = prior->firmware.va, .stamp_fw = prior->predecessor_stamp_fw,
 			.expected_target = prior->predecessor_target,
 			.consuming_target = c->target_stamp,
-			.firmware_stamp = m4_ready_read32(j->cross.notifier->bo->map.vaddr +
-				(prior->predecessor_stamp_fw - j->cross.notifier->bo->fw_va)),
+			/* A runtime-wide stage cell is observed below. */
+			.firmware_stamp = prior->predecessor_stamp_fw >= j->cross.notifier->bo->fw_va &&
+				prior->predecessor_stamp_fw - j->cross.notifier->bo->fw_va <
+				GPU_M4_DRM_PAGE_SIZE ? m4_ready_read32(j->cross.notifier->bo->map.vaddr +
+				(prior->predecessor_stamp_fw - j->cross.notifier->bo->fw_va)) : 0,
 			.event = prior->predecessor_event, .engine = 0, .completed = true,
 			/* Cross early tiling waits on that render's TA stamp. */
 			.stamp_horizon = j->cross.notifier->published_target[
@@ -1702,6 +1715,16 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 				.destination_fw = packet->scratch.state.timestamp_va[i],
 				.engine = i < 2 ? 0 : 1, .end = i == 1 || i >= 3, .completed = true,
 			};
+	/* Waits naming a runtime-wide stage cell observe that event's in-order
+	 * frontier, bounded by the event's published tail (any queue's).
+	 */
+	for (u32 i = 0; i < 3; i++) {
+		struct gpu_m4_render_retirement_dependency *d = &sample.dependency[i];
+
+		if (d->record_fw)
+			m4_user_stage_observe(p, d->stamp_fw, &d->firmware_stamp, &d->stamp_horizon);
+	}
+	sample.pair.ta_wait_fw = c->own_ta_fw;
 	sample.pair.uma_descriptor_fw = n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->fw_va;
 	sample.pair.uma_submitted_fw = counter;
 	sample.pair.expected_uma_slot = sample.pair.uma_slot = slot;
@@ -1873,7 +1896,9 @@ static void m4_user_render_fault_snapshot_locked(struct m4_user_job *j, u32 inde
 			.start_counter = m4_store_read64(start + (e ? 0x1d8 : 0x1b8)),
 			.expected_target = c->target_stamp,
 			.firmware_stamp = m4_ready_read32(notifier + 0x620 + e * 16),
-			.user_stamp = m4_ready_read32(notifier + 0x628 + e * 16),
+			.user_stamp = p->user_stage_cells ? m4_user_stage_read(p, e) :
+				m4_ready_read32(notifier + 0x628 + e * 16),
+			.stage_horizon = m4_user_stage_tail(p, e),
 			.queue_begin = w->queue_before, .queue_entries = w->count, .queue_next = w->queue_next,
 			.queue_read = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x30),
 			.queue_producer = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x40),

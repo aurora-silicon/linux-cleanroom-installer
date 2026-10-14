@@ -48,6 +48,15 @@ struct gpu_m4_render_packet_chronology {
 	u64 uma_submitted;
 	u32 target_stamp; /* One paired TA/FS pass target. */
 	u32 parameter_id;
+	/* Nonzero: the runtime-wide stage cell of the TA (0x70) / FS (0x71)
+	 * held event, named by completion metadata +8 and Finalize instead of
+	 * the notifier's private +0x628/+0x638 (gpu_m4_exec_stage_check()).
+	 */
+	u64 stage_fw[2];
+	/* Nonzero: the cell the own-TA wait of the FS names (the TA stage
+	 * cell under render_stage_waits); zero: the notifier's +0x620.
+	 */
+	u64 own_ta_fw;
 	/*
 	 * False requires exact initialized manager/storage/descriptor/slot/context
 	 * leases with no rebuild/growth/rebind and full prior-pair retirement.
@@ -289,11 +298,18 @@ static inline int gpu_m4_render_fragment_dependency(void *output, u64 notifier_f
 	return 0;
 }
 
+/* The stage (Finalize) destination of a pair's engine. */
+static inline u64 gpu_m4_render_packet_stage(u64 notifier, u32 engine,
+		const struct gpu_m4_render_packet_chronology *c)
+{
+	return c && c->stage_fw[engine] ? c->stage_fw[engine] : notifier + 0x628 + engine * 16;
+}
+
 static inline void gpu_m4_render_packet_meta(u8 *meta, u64 notifier, u32 engine,
 		u32 uuid, const struct gpu_m4_render_packet_chronology *c)
 {
 	put_unaligned_le64(notifier + 0x620 + engine * 16, meta);
-	put_unaligned_le64(notifier + 0x628 + engine * 16, meta + 8);
+	put_unaligned_le64(gpu_m4_render_packet_stage(notifier, engine, c), meta + 8);
 	put_unaligned_le32(c ? c->target_stamp : 0x100, meta + 0x10);
 	put_unaligned_le32(engine ? 0x71 : 0x70, meta + 0x14);
 	put_unaligned_le32(uuid, meta + 0x20);
@@ -391,7 +407,7 @@ static inline void gpu_m4_render_packet_tiler(struct gpu_m4_render_packet_output
 	put_unaligned_le32(r->owner.asid, finish + 0x2c);
 	put_unaligned_le64(command + 0x784, finish + 0x34);
 	put_unaligned_le32(r->uuid, finish + 0x40);
-	put_unaligned_le64(notifier + 0x628, finish + 0x48);
+	put_unaligned_le64(gpu_m4_render_packet_stage(notifier, 0, c), finish + 0x48);
 	put_unaligned_le32(c ? c->target_stamp : 0x100, finish + 0x50);
 	put_unaligned_le64(sequence + 0x190, finish + 0x78);
 	put_unaligned_le32(0U - 0x268, finish + 0x80);
@@ -501,7 +517,7 @@ static inline void gpu_m4_render_packet_fragment(struct gpu_m4_render_packet_out
 	memcpy(start + 0x23c, scratch->timestamps[1].end, 0x4c);
 	put_unaligned_le32(8, finish);
 	put_unaligned_le32(r->uuid, finish + 4);
-	put_unaligned_le64(notifier + 0x638, finish + 0xc);
+	put_unaligned_le64(gpu_m4_render_packet_stage(notifier, 1, c), finish + 0xc);
 	put_unaligned_le32(c ? c->target_stamp : 0x100, finish + 0x14);
 	put_unaligned_le64(scene, finish + 0x1c);
 	put_unaligned_le64(manager, finish + 0x24);
@@ -617,6 +633,7 @@ static inline int gpu_m4_render_packet_prepare(struct gpu_m4_render_packet_outpu
 		if (!c->init_buffer)
 			memset(output->init_buffer, 0, sizeof(output->init_buffer));
 		gpu_m4_render_dependency_emit(output->fragment_dependency,
+			c->own_ta_fw ? c->own_ta_fw :
 			owner->firmware[GPU_M4_RENDER_FIRST_NOTIFIERS_FW].va + 0x620,
 			c->target_stamp, 0x70, c->target_stamp, false);
 		for (i = 0; i < 2; i++) {

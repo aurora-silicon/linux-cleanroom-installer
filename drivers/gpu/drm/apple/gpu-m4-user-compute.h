@@ -192,9 +192,7 @@ static void m4_user_why_compute_encode(const struct gpu_m4_compute_packet_admitt
 		w->event_sequence, w->binding_generation, M4_WHY64(in->binding_generation),
 		M4_WHY64(c->binding_generation));
 	M4_USER_WHY_ENCODE(!gpu_m4_exec_fw_range(in->notifier_page_fw, GPU_M4_EXEC_NOTIFY_SIZE, 8) ||
-		w->notifier_fw != in->notifier_page_fw + 0x400 ||
-		w->firmware_stamp_fw != in->notifier_page_fw + 0x640 ||
-		w->user_stamp_fw != in->notifier_page_fw + 0x648,
+		!gpu_m4_compute_packet_stamps_valid(w, in->notifier_page_fw, in->stage_fw),
 		"notifier page %#llx record %#llx stamps %#llx,%#llx", M4_WHY64(in->notifier_page_fw),
 		M4_WHY64(w->notifier_fw), M4_WHY64(w->firmware_stamp_fw), M4_WHY64(w->user_stamp_fw));
 	M4_USER_WHY_ENCODE((in->counter_offset & 0x3fff) || in->counter_offset > ~0ULL - 0x4000,
@@ -531,9 +529,8 @@ static int m4_user_compute_check_locked(struct m4_user_compute_packet *out)
 	    in->work.pool_state_gpu != n->private[GPU_M4_COMPUTE_PRIVATE_POOL_STATE]->va ||
 	    in->work.page_list_gpu != n->private[GPU_M4_COMPUTE_PRIVATE_PAGE_LIST]->va ||
 	    in->work.counter_fw != n->counter->fw_va ||
-	    in->work.notifier_fw != res->notifier->fw_va + 0x400 ||
-	    in->work.firmware_stamp_fw != res->notifier->fw_va + 0x640 ||
-	    in->work.user_stamp_fw != res->notifier->fw_va + 0x648 ||
+	    in->stage_fw != m4_user_stage_fw(p, 2) ||
+	    !gpu_m4_compute_packet_stamps_valid(&in->work, res->notifier->fw_va, in->stage_fw) ||
 	    in->work.record_fw != (out->job->queue->notifier->bo == res->notifier ?
 		out->job->queue->notifier->record_fw[2] : 0))
 		return M4_USER_WHY(-ESTALE, "compute check %u work aliases work=%#llx/%#llx counter=%#llx/%#llx notifier=%#llx/%#llx",
@@ -748,6 +745,7 @@ static int m4_user_compute_prepare_locked(struct m4_user_job *j, u32 index,
 	in->counter = n->counter->object;
 	in->counter_offset = n->counter->backing.offset;
 	in->notifier_page_fw = res->notifier->fw_va;
+	in->stage_fw = m4_user_stage_fw(p, 2);
 	in->timestamp = res->timestamp;
 	in->owner_cookie = out;
 	in->check_owner = m4_user_compute_owner_locked;
@@ -769,7 +767,7 @@ static int m4_user_compute_prepare_locked(struct m4_user_job *j, u32 index,
 		.notifier_fw = res->notifier->fw_va + 0x400,
 		.record_fw = j->queue->notifier->bo == res->notifier ?
 			j->queue->notifier->record_fw[2] : 0,
-		.firmware_stamp_fw = res->notifier->fw_va + 0x640,
+		.firmware_stamp_fw = m4_user_compute_wait_fw(p, res->notifier->fw_va),
 		.user_stamp_fw = res->notifier->fw_va + 0x648,
 		.pool_state_gpu = n->private[GPU_M4_COMPUTE_PRIVATE_POOL_STATE]->va,
 		.page_list_gpu = n->private[GPU_M4_COMPUTE_PRIVATE_PAGE_LIST]->va,
@@ -827,6 +825,7 @@ static int m4_user_compute_prepare_locked(struct m4_user_job *j, u32 index,
 			encoded.chronology = in->chronology;
 			encoded.prior = in->prior;
 			encoded.notifier_page_fw = in->notifier_page_fw;
+			encoded.stage_fw = in->stage_fw;
 			encoded.timestamp = in->timestamp;
 			ret = gpu_m4_compute_packet_encode(&out->base, &out->scratch, &encoded, in->binding_generation);
 		}

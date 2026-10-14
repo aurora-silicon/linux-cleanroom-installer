@@ -514,6 +514,8 @@ static void m4_user_init(struct m4_gpu_provider_runtime *p)
 	INIT_LIST_HEAD(&p->user_job_garbage);
 	INIT_WORK(&p->user_reap, m4_user_reap_work);
 	INIT_DELAYED_WORK(&p->user_collect, m4_user_collect_work);
+	p->user_stage_cells = stage_cells;
+	p->user_render_stage_waits = stage_cells && render_stage_waits;
 	p->user_inflight2 = inflight2;
 	p->user_inflight2_wide = inflight2 && inflight2_wide;
 	p->user_inflight_max = !inflight2 ? 1 :

@@ -464,6 +464,12 @@ struct m4_gpu_provider_runtime {
 	struct m4_user_probe *user_probe;
 	u64 user_client_id;
 	u32 user_target[3], user_physical_used;
+	bool user_stage_cells; /* stage_cells, sampled at m4_user_init() */
+	/* Per held event: the newest target whose producer was made reachable
+	 * (m4_user_wire_publish_locked()), bounding its runtime-wide stage cell.
+	 */
+	u32 user_stage_exposed[3];
+	bool user_render_stage_waits; /* render_stage_waits, likewise */
 	bool ordinary, prerun_staging;
 	int error, handoff_get, handoff_put, tlbi;
 	bool attempted, prepared, complete, selected, v0_extra, writing;

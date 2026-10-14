@@ -141,6 +141,10 @@ struct gpu_m4_compute_packet_input {
 	/* Complete fresh NC firmware work, auxiliary and counter allocations. */
 	struct gpu_m4_exec_interval firmware[3];
 	u64 notifier_page_fw;
+	/* Nonzero: the runtime-wide compute stage cell (held event 15) named
+	 * by work +0x808 and Finalize instead of the notifier's +0x640.
+	 */
+	u64 stage_fw;
 	struct gpu_m4_compute_packet_chronology chronology;
 	struct gpu_m4_compute_packet_dependency prior;
 	u64 timestamp;
@@ -243,12 +247,25 @@ struct gpu_m4_compute_packet_admitted_input {
 	u64 counter_offset;
 	struct gpu_m4_exec_interval firmware[3]; /* work, AUX, counter NC pages */
 	u64 notifier_page_fw;
+	u64 stage_fw; /* As gpu_m4_compute_packet_input.stage_fw. */
 	struct gpu_m4_compute_packet_chronology chronology;
 	struct gpu_m4_compute_packet_dependency prior;
 	u64 timestamp;
 	void *owner_cookie;
 	gpu_m4_compute_packet_check_admitted check_owner;
 };
+
+/* Notifier record and USER (service) cell in the logical queue's page; the
+ * FW (stage) cell there too, or the runtime-wide stage cell of event 15.
+ */
+static inline bool gpu_m4_compute_packet_stamps_valid(const struct gpu_m4_exec_compute_input *w,
+		u64 notifier_page_fw, u64 stage_fw)
+{
+	return w->notifier_fw == notifier_page_fw + 0x400 &&
+		w->firmware_stamp_fw == (stage_fw ? stage_fw : notifier_page_fw + 0x640) &&
+		(!stage_fw || gpu_m4_exec_fw_range(stage_fw, 8, 8)) &&
+		w->user_stamp_fw == notifier_page_fw + 0x648;
+}
 
 static inline bool gpu_m4_compute_packet_separate(const void *a, unsigned long na,
 		const void *b, unsigned long nb)
@@ -411,9 +428,7 @@ static inline int gpu_m4_compute_packet_bindings_validate(
 	if (!w->vm || !w->vm->check || w->attachment_count > GPU_M4_EXEC_ATTACHMENT_MAX ||
 	    (w->attachment_count && !w->attachments) ||
 	    !gpu_m4_exec_fw_range(in->notifier_page_fw, GPU_M4_EXEC_NOTIFY_SIZE, 8) ||
-	    w->notifier_fw != in->notifier_page_fw + 0x400 ||
-	    w->firmware_stamp_fw != in->notifier_page_fw + 0x640 ||
-	    w->user_stamp_fw != in->notifier_page_fw + 0x648 ||
+	    !gpu_m4_compute_packet_stamps_valid(w, in->notifier_page_fw, in->stage_fw) ||
 	    w->registers.preemption_size != 0x4000 ||
 	    w->registers.cdm_end <= w->registers.cdm_base ||
 	    w->registers.cdm_end - w->registers.cdm_base > 0x4000 ||
@@ -652,9 +667,7 @@ static inline int gpu_m4_compute_packet_admitted_validate_checked(
 	    !w->registers.usc_base || (w->registers.usc_base & 0xffffffffULL) ||
 	    w->registers.preemption_size != 0x4000 ||
 	    !gpu_m4_exec_fw_range(in->notifier_page_fw, GPU_M4_EXEC_NOTIFY_SIZE, 8) ||
-	    w->notifier_fw != in->notifier_page_fw + 0x400 ||
-	    w->firmware_stamp_fw != in->notifier_page_fw + 0x640 ||
-	    w->user_stamp_fw != in->notifier_page_fw + 0x648 ||
+	    !gpu_m4_compute_packet_stamps_valid(w, in->notifier_page_fw, in->stage_fw) ||
 	    (in->counter_offset & 0x3fff) || in->counter_offset > ~0ULL - 0x4000)
 		return -EINVAL;
 	if (w->attachment_count &&
@@ -757,6 +770,7 @@ static inline int gpu_m4_compute_packet_prepare_admitted(
 	encoded.chronology = in->chronology;
 	encoded.prior = in->prior;
 	encoded.notifier_page_fw = in->notifier_page_fw;
+	encoded.stage_fw = in->stage_fw;
 	encoded.timestamp = in->timestamp;
 	ret = gpu_m4_compute_packet_encode(output, scratch, &encoded, in->binding_generation);
 	return ret > 0 ? -EPROTO : ret;

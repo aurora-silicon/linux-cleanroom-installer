@@ -55,6 +55,23 @@ MODULE_PARM_DESC(inflight2, "Two ordinary packets in flight (default 1; 0: one a
 static unsigned int inflight_jobs = 4;
 module_param(inflight_jobs, uint, 0644);
 MODULE_PARM_DESC(inflight_jobs, "inflight2: packets in flight, 2..4 (default 4; banks of 8 slots when the load value is >2)");
+/* stage_cells (read once at user init): every work of one held event (TA
+ * 0x70, FS 0x71, compute 15) names the event's ONE runtime-wide stage cell,
+ * the session queue's NC FWSTAMP word, as Finalize destination, completion
+ * metadata +8 and in every wait on that producer. 0 restores the notifier's
+ * private +0x628/+0x638/+0x640 cells.
+ */
+static bool stage_cells = true;
+module_param(stage_cells, bool, 0400);
+MODULE_PARM_DESC(stage_cells, "One runtime-wide stage (Finalize) cell per held event instead of per-notifier cells (default 1)");
+/* render_stage_waits (read once at user init, needs stage_cells): waits on
+ * a render predecessor (prior TA/FS, own TA, global tail) name the event's
+ * runtime-wide stage cell, written by Finalize, instead of the notifier's
+ * service cell written later by notifier service (native writer roles).
+ */
+static bool render_stage_waits = true;
+module_param(render_stage_waits, bool, 0400);
+MODULE_PARM_DESC(render_stage_waits, "Render waits on the runtime-wide stage cells, written at Finalize (default 1; 0: the notifier's service cells)");
 static bool inflight2_wide;
 module_param(inflight2_wide, bool, 0400);
 MODULE_PARM_DESC(inflight2_wide, "inflight2: also overlap partial windows and same-queue mixed/compute windows (default 0)");

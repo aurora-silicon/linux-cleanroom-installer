@@ -11,6 +11,69 @@ struct m4_user_render_packet;
 struct gpu_m4_render_ready_backing;
 struct m4_user_notifier;
 
+/* stage_cells: the runtime-wide stage (Finalize) cell of engine e's held
+ * event (TA 0x70, FS 0x71, compute 15), the session queue's NC FWSTAMP
+ * word; 0 when the notifier's private cells are in use. The firmware stores
+ * a held event's targets in node order and drains buffered out-of-order
+ * completions through the destination of the completion closing the gap, so
+ * all works of the event (of every logical queue) name this one cell. Never
+ * reset after first use: it is the event's in-order frontier.
+ */
+static u64 m4_user_stage_fw(const struct m4_gpu_provider_runtime *p, u32 engine)
+{
+	return p->user_stage_cells && engine < 3 ?
+		p->execution->queue[engine][M4_EXEC_QUEUE_FWSTAMP].va : 0;
+}
+
+static u32 m4_user_stage_read(const struct m4_gpu_provider_runtime *p, u32 engine)
+{
+	return m4_ready_read32(p->execution->queue[engine][M4_EXEC_QUEUE_FWSTAMP].cpu);
+}
+
+/* The event's exposed tail bounding the cell (0: private cells): the newest
+ * target actually made reachable to the firmware, not a reservation. Read
+ * under the GPU mutex, like every publication that advances it.
+ */
+static u32 m4_user_stage_tail(const struct m4_gpu_provider_runtime *p, u32 engine)
+{
+	return p->user_stage_cells && engine < 3 ? p->user_stage_exposed[engine] : 0;
+}
+
+/* The cell a wait on a compute predecessor names: its stage cell. */
+static u64 m4_user_compute_wait_fw(const struct m4_gpu_provider_runtime *p, u64 notifier_fw)
+{
+	u64 stage = m4_user_stage_fw(p, 2);
+
+	return stage ? stage : notifier_fw + 0x640;
+}
+
+/* The cell a wait on a render predecessor's TA (0) or FS (1) names: that
+ * notifier's service cell (+0x620/+0x630, published by notifier service),
+ * or under render_stage_waits the event's runtime-wide stage cell.
+ */
+static u64 m4_user_render_wait_fw(const struct m4_gpu_provider_runtime *p, u64 notifier_fw,
+	u32 engine)
+{
+	u64 stage = p->user_render_stage_waits ? m4_user_stage_fw(p, engine) : 0;
+
+	return stage ? stage : notifier_fw + 0x620 + engine * 16;
+}
+
+/* A wait's predecessor cell: when it is a runtime-wide stage cell, its
+ * value and the event's published tail (true); else nothing (false).
+ */
+static bool m4_user_stage_observe(const struct m4_gpu_provider_runtime *p, u64 stamp_fw,
+	u32 *value, u32 *tail)
+{
+	for (u32 e = 0; p->user_stage_cells && e < 3; e++)
+		if (stamp_fw == m4_user_stage_fw(p, e)) {
+			*value = m4_user_stage_read(p, e);
+			*tail = m4_user_stage_tail(p, e);
+			return true;
+		}
+	return false;
+}
+
 /* inflight2 global-tail barrier: the last command of the job in flight
  * ahead of this one when it was prepared (the global in-flight tail). This
  * job's FIRST command waits on it with a strict opcode-4 record (+0x3c=1):

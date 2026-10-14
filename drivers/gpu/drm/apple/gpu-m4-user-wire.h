@@ -566,6 +566,8 @@ static int m4_user_wire_publish_locked(struct m4_user_job *j, u32 index)
 			m4_ready_write32(p->ready->buffer[GPU_M4_OBJECT_COUNT + 2 * i].cpu + 0x20,
 				c->wire[i].pipe_next);
 			p->user_physical_used |= BIT(i);
+			/* The event's exposed tail: this packet's newest target. */
+			p->user_stage_exposed[i] = c->final_target;
 		}
 	for (u32 n = 0; n < ARRAY_SIZE(kick_order); n++) {
 		u32 i = kick_order[n];

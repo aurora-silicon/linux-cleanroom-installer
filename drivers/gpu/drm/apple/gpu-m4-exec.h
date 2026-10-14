@@ -269,12 +269,39 @@ struct gpu_m4_exec_retirement {
 	 * receipt so its later proofs replay the same rule.
 	 */
 	bool ignore_busy;
+	/* Nonzero: firmware_stamp is the runtime-wide stage cell of the held
+	 * event (gpu_m4_exec_stage_check()), bounded by this published tail of
+	 * that event. Zero keeps the private cell's exact rule. Saved with the
+	 * receipt.
+	 */
+	u32 stage_horizon;
 };
+
+/* Stage (Finalize) cell of a work. The firmware stores the targets of one
+ * held event strictly in that event's node order: an out-of-order completion
+ * is buffered and later drained through the destination of the completion
+ * that closes the gap. Every work of the event therefore names ONE cell for
+ * the whole runtime, which then holds the in-order frontier of the event:
+ * reaching the own target proves the own completion, and the cell can never
+ * pass the event's published tail. Without a horizon the cell is the private,
+ * serialized one and must equal the target.
+ */
+static inline int gpu_m4_exec_stage_check(u32 stamp, u32 expected, u32 horizon)
+{
+	if (!horizon)
+		return stamp == expected ? 0 : -EAGAIN;
+	if ((horizon & 0xff) || !gpu_m4_exec_stamp_reached(horizon, expected))
+		return -EINVAL;
+	if (!stamp || !gpu_m4_exec_stamp_reached(stamp, expected))
+		return -EAGAIN;
+	return gpu_m4_exec_stamp_reached(horizon, stamp) ? 0 : -EPROTO;
+}
 
 /* Serialized first-work gate: events alone never make an owner recyclable. */
 static inline int gpu_m4_exec_retired(const struct gpu_m4_exec_retirement *r)
 {
 	unsigned int i;
+	int stage;
 
 	if (!r || (r->expected_stamp & 0xff) ||
 	    r->next >= GPU_M4_EXEC_RING_COUNT ||
@@ -286,7 +313,10 @@ static inline int gpu_m4_exec_retired(const struct gpu_m4_exec_retirement *r)
 	for (i = 0; i < 3; i++)
 		if (r->queue_consumer[i] >= GPU_M4_EXEC_RING_COUNT)
 			return -EINVAL;
-	if (r->firmware_stamp != r->expected_stamp || r->user_stamp != r->expected_stamp ||
+	stage = gpu_m4_exec_stage_check(r->firmware_stamp, r->expected_stamp, r->stage_horizon);
+	if (stage == -EINVAL)
+		return stage;
+	if (stage == -EAGAIN || r->user_stamp != r->expected_stamp ||
 	    r->queue_read != r->next || r->queue_write != r->next ||
 	    (r->queue_busy && !r->ignore_busy) ||
 	    r->pipe_read != r->pipe_next || r->pipe_cfi != r->pipe_next ||
@@ -297,7 +327,7 @@ static inline int gpu_m4_exec_retired(const struct gpu_m4_exec_retirement *r)
 	for (i = 0; i < 3; i++)
 		if (r->queue_consumer[i] != r->next)
 			return -EAGAIN;
-	return 0;
+	return stage; /* 0, or -EPROTO: a global stage cell beyond its tail. */
 }
 
 struct gpu_m4_exec_pipe_record {
@@ -584,7 +614,11 @@ static inline int gpu_m4_exec_first_compute(void *output,
 	    !gpu_m4_exec_fw_range(in->counter_fw, 8, 8) ||
 	    in->notifier_fw < 0x400 ||
 	    !gpu_m4_exec_fw_range(in->notifier_fw - 0x400, GPU_M4_EXEC_NOTIFY_SIZE, 8) ||
-	    in->firmware_stamp_fw != in->notifier_fw + 0x240 ||
+	    /* The notifier's private stage cell, or (stage_cells) the
+	     * runtime-wide one of event 15 the packet layer names and checks.
+	     */
+	    (in->firmware_stamp_fw != in->notifier_fw + 0x240 &&
+	     !gpu_m4_exec_fw_range(in->firmware_stamp_fw, 8, 8)) ||
 	    in->user_stamp_fw != in->notifier_fw + 0x248 ||
 	    (in->record_fw && !gpu_m4_exec_fw_range(in->record_fw, 0x118, 0x40)) ||
 	    (in->work_gpu & 0x3fff) || (in->auxiliary_gpu & 0x3fff) ||

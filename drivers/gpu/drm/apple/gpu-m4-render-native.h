@@ -1108,6 +1108,7 @@ static inline int gpu_m4_render_native_packet_prepare_once(
 	gpu_m4_render_packet_tiler(output, &packet, &scratch->packet);
 	gpu_m4_render_packet_fragment(output, &packet, &scratch->packet);
 	gpu_m4_render_dependency_emit(output->fragment_dependency,
+		in->chronology->own_ta_fw ? in->chronology->own_ta_fw :
 		fw[GPU_M4_RENDER_FIRST_NOTIFIERS_FW].va + 0x620,
 		in->chronology->target_stamp, 0x70, in->chronology->target_stamp, false);
 	for (i = 0; i < 2; i++) {

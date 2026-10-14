@@ -214,7 +214,7 @@ static inline int gpu_m4_compute_horizon_retired(const struct gpu_m4_exec_retire
 	u32 consumer[4], span = 0, pipe_span = 0;
 	bool physical, notifier;
 	unsigned int i;
-	int ret;
+	int ret, stage;
 
 	if (!r || queue_horizon >= 256 || pipe_horizon >= 256 || r->next >= 256 ||
 	    r->queue_read >= 256 || r->queue_write >= 256 || r->pipe_capacity != 256 ||
@@ -268,18 +268,31 @@ static inline int gpu_m4_compute_horizon_retired(const struct gpu_m4_exec_retire
 			if (consumer[i] != r->next)
 				return -EAGAIN;
 	}
+	/* A runtime-wide stage cell (stage_horizon) is checked against the
+	 * event's published tail whatever this notifier published.
+	 */
+	stage = r->stage_horizon ? gpu_m4_exec_stage_check(r->firmware_stamp,
+		r->expected_stamp, r->stage_horizon) : 0;
+	if (stage == -EINVAL)
+		return stage;
 	if (!notifier) {
-		if (r->firmware_stamp != r->expected_stamp || r->user_stamp != r->expected_stamp)
+		if ((!r->stage_horizon && r->firmware_stamp != r->expected_stamp) ||
+		    stage == -EAGAIN || r->user_stamp != r->expected_stamp)
 			return -EAGAIN;
 	} else {
-		if (!r->firmware_stamp || !r->user_stamp ||
-		    !gpu_m4_exec_stamp_reached(r->firmware_stamp, r->expected_stamp) ||
+		if ((!r->stage_horizon &&
+		     (!r->firmware_stamp ||
+		      !gpu_m4_exec_stamp_reached(r->firmware_stamp, r->expected_stamp))) ||
+		    stage == -EAGAIN || !r->user_stamp ||
 		    !gpu_m4_exec_stamp_reached(r->user_stamp, r->expected_stamp))
 			return -EAGAIN;
-		if (!gpu_m4_exec_stamp_reached(target_horizon, r->firmware_stamp) ||
+		if ((!r->stage_horizon &&
+		     !gpu_m4_exec_stamp_reached(target_horizon, r->firmware_stamp)) ||
 		    !gpu_m4_exec_stamp_reached(target_horizon, r->user_stamp))
 			return -EPROTO; /* Beyond the known submitted tail. */
 	}
+	if (stage)
+		return stage; /* -EPROTO: beyond the event's published tail. */
 	if (!r->uma_submitted || r->uma_submitted != r->uma_completed ||
 	    !r->timestamp_start || r->timestamp_end <= r->timestamp_start)
 		return -EAGAIN;

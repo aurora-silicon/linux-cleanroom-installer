@@ -499,6 +499,12 @@ struct gpu_m4_render_stage_retirement {
 	 * its queue-info busy may stay set while other work runs.
 	 */
 	bool ignore_busy;
+	/* Nonzero: user_stamp is the runtime-wide stage (Finalize) cell of this
+	 * engine's held event, bounded by the event's published tail when
+	 * sampled (gpu_m4_exec_stage_check()). Zero: the notifier's private
+	 * stage cell and its exact/notifier-tail rules.
+	 */
+	u32 stage_horizon;
 };
 
 struct gpu_m4_render_retirement_copy {
@@ -556,6 +562,10 @@ typedef int (*gpu_m4_render_check_hardware_retirement)(void *cookie,
 
 struct gpu_m4_render_pair_retirement {
 	struct gpu_m4_render_stage_retirement stage[2];
+	/* Nonzero: the cell every TA wait of this pair (own TA, early tiling)
+	 * names, the runtime-wide TA stage cell; zero: notifier +0x620.
+	 */
+	u64 ta_wait_fw;
 	u64 uma_descriptor_fw, uma_submitted_fw;
 	/* Held global slot and actual descriptor +0x08 observation must agree. */
 	u32 expected_uma_slot, uma_slot;
@@ -605,7 +615,7 @@ static inline int __gpu_m4_render_stage_horizon(
 {
 	u32 span = 0, pipe_span = 0, consumer[4];
 	unsigned int i;
-	int ret;
+	int ret, stage;
 
 	if (s->physical_successors) {
 		if (s->queue_horizon >= 256 || s->pipe_horizon >= 256)
@@ -652,21 +662,31 @@ static inline int __gpu_m4_render_stage_horizon(
 			if (consumer[i] != s->queue_next)
 				return -EAGAIN;
 	}
+	/* A runtime-wide FS stage cell is bounded by its event's tail whatever
+	 * this notifier published; a TA USER omission is the pair's decision.
+	 */
+	stage = engine && s->stage_horizon ? gpu_m4_exec_stage_check(s->user_stamp,
+		s->expected_target, s->stage_horizon) : 0;
+	if (stage == -EINVAL)
+		return stage;
 	if (!s->notifier_successors) {
-		/* Paired entrance: a TA USER omission is the pair's decision. */
-		return s->threshold != s->expected_threshold ||
-			s->firmware_stamp != s->expected_target ||
-			(engine && s->user_stamp != s->expected_target) ? -EAGAIN : 0;
+		if (s->threshold != s->expected_threshold ||
+		    s->firmware_stamp != s->expected_target || stage == -EAGAIN ||
+		    (engine && !s->stage_horizon && s->user_stamp != s->expected_target))
+			return -EAGAIN;
+		return stage;
 	}
 	if (s->threshold != s->threshold_horizon || !s->firmware_stamp ||
 	    !gpu_m4_exec_stamp_reached(s->firmware_stamp, s->expected_target) ||
-	    (engine && (!s->user_stamp ||
+	    stage == -EAGAIN ||
+	    (engine && !s->stage_horizon && (!s->user_stamp ||
 			!gpu_m4_exec_stamp_reached(s->user_stamp, s->expected_target))))
 		return -EAGAIN;
 	if (!gpu_m4_exec_stamp_reached(s->target_horizon, s->firmware_stamp) ||
-	    (engine && !gpu_m4_exec_stamp_reached(s->target_horizon, s->user_stamp)))
+	    (engine && !s->stage_horizon &&
+	     !gpu_m4_exec_stamp_reached(s->target_horizon, s->user_stamp)))
 		return -EPROTO; /* Beyond the known published tail. */
-	return 0;
+	return stage;
 }
 
 /* Private fields only. A TA user omission is selected solely by the complete
@@ -714,10 +734,18 @@ static inline int __gpu_m4_render_stage_retired(
 		if (s->queue_horizon || s->pipe_horizon || s->target_horizon ||
 		    s->threshold_horizon || s->pipe_shared)
 			return -EINVAL;
-		/* Conservative serialized profile: no coalesced/future stamps or prefixes. */
+		/* Conservative serialized profile: no coalesced/future stamps or
+		 * prefixes; a runtime-wide stage cell is the event's frontier.
+		 */
+		ret = s->stage_horizon && (!paired || engine) ?
+			gpu_m4_exec_stage_check(s->user_stamp, s->expected_target,
+				s->stage_horizon) : 0;
+		if (ret == -EINVAL || ret == -EPROTO)
+			return ret;
 		if (s->threshold != s->expected_threshold ||
-		    s->firmware_stamp != s->expected_target ||
-		    ((!paired || engine) && s->user_stamp != s->expected_target) ||
+		    s->firmware_stamp != s->expected_target || ret ||
+		    ((!paired || engine) && !s->stage_horizon &&
+		     s->user_stamp != s->expected_target) ||
 		    s->queue_read != s->queue_next || s->queue_producer != s->queue_next ||
 		    (s->queue_busy && !s->ignore_busy) || s->pipe_read != s->pipe_next ||
 		    s->pipe_cfi != s->pipe_next || s->pipe_producer != s->pipe_next)
@@ -768,7 +796,7 @@ static inline int __gpu_m4_render_pair_retired(
 		gpu_m4_render_check_retirement check_owner, bool visible)
 {
 	struct gpu_m4_exec_interval ranges[3];
-	u64 completed;
+	u64 completed, ta_wait;
 	unsigned int i, count = 1, own_edges = 0, edges[2] = { 0, 0 };
 	int ret;
 
@@ -808,6 +836,9 @@ static inline int __gpu_m4_render_pair_retired(
 	    in->uma_completed_high_before != in->uma_completed_high_after)
 		return -EAGAIN;
 	completed = ((u64)in->uma_completed_high_after << 32) | in->uma_completed_low;
+	ta_wait = in->ta_wait_fw ? in->ta_wait_fw : in->stage[0].notifier_fw + 0x620;
+	if (in->ta_wait_fw && !gpu_m4_exec_fw_range(in->ta_wait_fw, 8, 8))
+		return -EINVAL;
 	if (in->uma_submitted != in->uma_expected_submitted)
 		return -EAGAIN;
 	if (in->uma_submitted_horizon) {
@@ -841,15 +872,19 @@ static inline int __gpu_m4_render_pair_retired(
 	if (in->stage[0].notifier_successors) {
 		const struct gpu_m4_render_stage_retirement *ta = &in->stage[0], *fs = &in->stage[1];
 
+		/* A runtime-wide stage cell is bounded by its event's tail. */
+		u32 ta_tail = ta->stage_horizon ? ta->stage_horizon : ta->target_horizon;
+		u32 fs_tail = fs->stage_horizon ? fs->stage_horizon : fs->target_horizon;
+
 		if (ta->user_stamp && gpu_m4_exec_stamp_reached(ta->user_stamp, ta->expected_target)) {
-			if (!gpu_m4_exec_stamp_reached(ta->target_horizon, ta->user_stamp))
+			if (!gpu_m4_exec_stamp_reached(ta_tail, ta->user_stamp))
 				return -EPROTO;
 		} else if (!fs->firmware_stamp || !fs->user_stamp ||
 			   !gpu_m4_exec_stamp_reached(fs->firmware_stamp, fs->expected_target) ||
 			   !gpu_m4_exec_stamp_reached(fs->user_stamp, fs->expected_target)) {
 			return -EAGAIN;
 		} else if (!gpu_m4_exec_stamp_reached(fs->target_horizon, fs->firmware_stamp) ||
-			   !gpu_m4_exec_stamp_reached(fs->target_horizon, fs->user_stamp)) {
+			   !gpu_m4_exec_stamp_reached(fs_tail, fs->user_stamp)) {
 			return -EPROTO;
 		}
 	}
@@ -907,11 +942,11 @@ static inline int __gpu_m4_render_pair_retired(
 			/* FRAGMENT_DEPENDENCY early tiling: this TA waited on the
 			 * previous render's TA in the same queue, never its own.
 			 */
-			if (d->stamp_fw != in->stage[0].notifier_fw + 0x620 ||
+			if (d->stamp_fw != ta_wait ||
 			    d->expected_target >= d->consuming_target)
 				return -EINVAL;
 		} else if (d->event == 0x70) {
-			if (d->engine != 1 || d->stamp_fw != in->stage[0].notifier_fw + 0x620 ||
+			if (d->engine != 1 || d->stamp_fw != ta_wait ||
 			    d->expected_target != in->stage[0].expected_target || ++own_edges != 1)
 				return -EINVAL;
 		} else if ((d->event != 15 && d->event != 0x71) ||

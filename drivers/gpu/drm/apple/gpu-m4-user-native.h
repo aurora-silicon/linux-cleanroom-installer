@@ -113,6 +113,10 @@ struct m4_user_native_history {
 	 */
 	u64 cross_stamp_fw;
 	u32 cross_event;
+	/* That predecessor was this queue's own (a runtime-wide stage cell does
+	 * not name its owner).
+	 */
+	bool cross_own;
 	u32 count, spare_refs, last_mask;
 	refcount_t refs;
 	struct m4_user_native_receipt command[GPU_M4_DRM_JOB_MAX_COMMANDS];
@@ -2950,6 +2954,7 @@ static int m4_user_native_render_history_owner_locked(void *cookie,
 {
 	struct m4_user_native_render_history_sample *sample = cookie;
 	struct m4_user_native_stage *s = sample->stage;
+	const struct m4_gpu_provider_runtime *rt = s->queue->runtime;
 	struct m4_user_native_history *h = sample->history;
 	const struct m4_user_native_receipt *r = &h->command[sample->index];
 	const struct m4_user_render_native *n = m4_user_native_render(s, sample->index);
@@ -2984,14 +2989,15 @@ static int m4_user_native_render_history_owner_locked(void *cookie,
 	       * window's prior compute, or the first command's global-tail
 	       * barrier on its recorded predecessor's page.
 	       */
-	      ((r->render_dependency[1].stamp_fw != s->notifier->bo->fw_va + 0x630 ||
+	      ((r->render_dependency[1].stamp_fw != m4_user_render_wait_fw(rt, s->notifier->bo->fw_va, 1) ||
 		r->render_dependency[1].event != 0x71) &&
 	       (!sample->index || r->render_dependency_count != 2 ||
-		r->render_dependency[1].stamp_fw != s->notifier->bo->fw_va + 0x640 ||
+		r->render_dependency[1].stamp_fw != m4_user_compute_wait_fw(rt, s->notifier->bo->fw_va) ||
 		r->render_dependency[1].event != 15) &&
-	       ((!sample->index && h->cross_stamp_fw != s->notifier->bo->fw_va + 0x630) ||
+	       ((!sample->index && (h->cross_stamp_fw != m4_user_render_wait_fw(rt, s->notifier->bo->fw_va, 1) ||
+		(rt->user_render_stage_waits && !h->cross_own))) ||
 		r->render_dependency_count != 3 ||
-		r->render_dependency[1].stamp_fw != s->notifier->bo->fw_va + 0x620 ||
+		r->render_dependency[1].stamp_fw != m4_user_render_wait_fw(rt, s->notifier->bo->fw_va, 0) ||
 		r->render_dependency[1].event != 0x70) &&
 	       (sample->index || !h->cross_stamp_fw ||
 		r->render_dependency[1].stamp_fw != h->cross_stamp_fw ||
@@ -3001,12 +3007,13 @@ static int m4_user_native_render_history_owner_locked(void *cookie,
 	     * its own queue's previous render, the global tail.)
 	     */
 	    (r->render_dependency_count == 3 &&
-	     ((!sample->index && h->cross_stamp_fw != s->notifier->bo->fw_va + 0x630) ||
+	     ((!sample->index && (h->cross_stamp_fw != m4_user_render_wait_fw(rt, s->notifier->bo->fw_va, 1) ||
+		(rt->user_render_stage_waits && !h->cross_own))) ||
 	      r->render_dependency[1].event != 0x70 ||
 	      r->render_dependency[2].record_fw !=
 		m4_user_render_record_fw(n, M4_RREC_PRIOR_FS) ||
 	      r->render_dependency[2].engine != 1 || r->render_dependency[2].event != 0x71 ||
-	      r->render_dependency[2].stamp_fw != s->notifier->bo->fw_va + 0x630)) ||
+	      r->render_dependency[2].stamp_fw != m4_user_render_wait_fw(rt, s->notifier->bo->fw_va, 1))) ||
 	    pair->uma_descriptor_fw != n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->fw_va ||
 	    (r->shared ? !s->ra || n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU] != s->ra->bo[M4_RA_UMA] ||
 		pair->uma_submitted_fw != s->ra->bo[M4_RA_COUNTER]->fw_va + M4_RA_S_OFFSET :
@@ -3064,6 +3071,8 @@ static int m4_user_native_render_receipt_pair_locked(struct m4_user_native_stage
 	    !r->render_dependency_count || r->render_dependency_count > 3)
 		return -ESTALE;
 	memcpy(sample.pair.stage, observed ?: r->render, sizeof(sample.pair.stage));
+	sample.pair.ta_wait_fw = s->queue->runtime->user_render_stage_waits ?
+		m4_user_stage_fw(s->queue->runtime, 0) : 0;
 	sample.pair.uma_descriptor_fw = n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->fw_va;
 	sample.pair.uma_submitted_fw = r->shared ?
 		s->ra->bo[M4_RA_COUNTER]->fw_va + M4_RA_S_OFFSET :
