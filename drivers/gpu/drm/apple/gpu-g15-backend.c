@@ -153,6 +153,7 @@
 #define G15_LEAF_PB_LIST	0x00e0000000000c03ULL
 #define G15_MAX_CLIENT		320
 #define G15_HORIZON_JOBS	4	/* jobs per compute horizon, and scheduler credits */
+#define G15_AHEAD_RECORDS	64	/* unconsumed records per 256-entry channel ring */
 
 static bool wb_sweep;
 module_param(wb_sweep, bool, 0644);
@@ -206,6 +207,28 @@ MODULE_PARM_DESC(early_tiling, "Advertise fragment-only render dependencies: a f
 static unsigned int compute_horizon = G15_HORIZON_JOBS;
 module_param(compute_horizon, uint, 0644);
 MODULE_PARM_DESC(compute_horizon, "Ready compute-only jobs of one queue published in one prefix, 1..4 (1: one job per prefix)");
+
+/*
+ * Render prefixes of half the pass slots, posted ahead (round-5 contract D1,
+ * round-6 contract C3). A job with more renders is published as consecutive
+ * prefixes of at most prefix_renders members. With submit_ahead the next one
+ * is prepared in the free half of the slots while the previous runs, and its
+ * SubmitQueue records are posted behind the running prefix's (the firmware
+ * consumes a prefix's records only as it finishes with it), so its real BM
+ * horizon X and thresholds are published before the running prefix's last
+ * FS completes: no PB catch-up, notification and full drain at every prefix
+ * boundary. The first TA of every prefix keeps its strict (type 1) wait on
+ * the previous prefix's last FS. Compute-only prefixes still wait for the
+ * consumption of the previous record, which lets further ready jobs join
+ * their horizon.
+ */
+static unsigned int prefix_renders = G15_RENDER_SLOTS / 2;
+module_param(prefix_renders, uint, 0644);
+MODULE_PARM_DESC(prefix_renders, "Renders per prefix, 1..16 (8: the next prefix is prepared in the other half of the pass slots)");
+
+static bool submit_ahead = true;
+module_param(submit_ahead, bool, 0644);
+MODULE_PARM_DESC(submit_ahead, "Post a prefix with renders behind the running prefix's unconsumed SubmitQueue records; 0: only after their consumption");
 
 static unsigned int deadline_ms = 5000;
 module_param(deadline_ms, uint, 0644);
@@ -1606,14 +1629,15 @@ static void g15_dump_client(struct g15_backend *be, struct g15_vm *vm, const cha
 
 /* Post one 0x18-byte host channel record (contract 6.3, render R8). */
 static int g15_channel_post(struct g15_backend *be, u32 ch, u64 queue, u32 kind, u32 head,
-			    u8 event, bool new_queue)
+			    u8 event, bool new_queue, bool ahead)
 {
 	struct g15_gpu *gpu = be->gpu;
-	u32 producer = be->producer[ch];
+	u32 producer = be->producer[ch], consumer = g15_r32(gpu, G15_CH_STATE(ch));
 	u8 rec[0x18] = {};
 	int ret;
 
-	if (g15_r32(gpu, G15_CH_STATE(ch)) != producer ||
+	/* Never over an unconsumed record: behind them only with room (ahead). */
+	if ((ahead ? (producer - consumer) % 256 >= G15_AHEAD_RECORDS : consumer != producer) ||
 	    g15_r32(gpu, G15_CH_STATE(ch) + 0x20) != producer)
 		return -EBUSY;
 	put_unaligned_le64(queue, rec + 0x8);
@@ -2722,7 +2746,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	struct g15_graph *g = &be->g;
 	struct g15_render *r = &be->r;
 	struct g15_flight *f = &be->fl[(be->fl_first + be->fl_count) % G15_FLIGHTS];
-	bool overlap = be->fl_count, mixed = READ_ONCE(mixed_prefix);
+	bool overlap = be->fl_count, mixed = READ_ONCE(mixed_prefix), ahead;
 	struct g15_prefix pf = { .n = be->ordinal, .draw = r->draw };
 	u32 i = job->sent, ctx = job->vm->asid, computes = 0, renders = 0, end, free_c;
 	bool render0 = job->cmds[i].render;
@@ -2745,6 +2769,8 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 			computes++;
 			continue;
 		}
+		if (renders >= clamp(READ_ONCE(prefix_renders), 1U, (u32)G15_RENDER_SLOTS))
+			break;
 		g15_geometry(&cmd->r, 0, &geo);
 		k = g15_pass_pick(r, &geo, f->pass_mask);
 		if (k < 0)
@@ -2755,14 +2781,20 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	if (end == i)
 		return overlap ? -EAGAIN : -E2BIG;	/* idle: every slot is free */
 	/*
-	 * Participating channels: every earlier record consumed. Behind a
-	 * running prefix the firmware takes its record within microseconds:
-	 * retry soon rather than at that prefix's retirement.
+	 * Participating channels: every earlier record consumed, or (a prefix
+	 * with renders behind a running one, submit_ahead) room behind the
+	 * unconsumed ones. Behind a running prefix the firmware takes its
+	 * record within microseconds: retry soon rather than at that prefix's
+	 * retirement.
 	 */
+	ahead = overlap && renders && READ_ONCE(submit_ahead);
 	for (u32 ch = 0; ch < 3; ch++) {
+		u32 consumer = g15_r32(gpu, G15_CH_STATE(ch));
+
 		if (ch == G15_COMPUTE_CHANNEL ? !computes : !renders)
 			continue;
-		if (g15_r32(gpu, G15_CH_STATE(ch)) != be->producer[ch] ||
+		if ((ahead ? (be->producer[ch] - consumer) % 256 >= G15_AHEAD_RECORDS :
+			     consumer != be->producer[ch]) ||
 		    g15_r32(gpu, G15_CH_STATE(ch) + 0x20) != be->producer[ch]) {
 			be->chan_wait = overlap;
 			return overlap ? -EAGAIN : -EBUSY;
@@ -2910,7 +2942,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	/* Compute on channel 2, then FS on channel 1, then TA on channel 0 (R8). */
 	if (computes) {
 		ret = g15_channel_post(be, G15_COMPUTE_CHANNEL, g->qinfo.va, 2, pf.c_head,
-				       G15_EVENT_SLOT, !be->queue_registered);
+				       G15_EVENT_SLOT, !be->queue_registered, ahead);
 		if (!ret) {
 			be->queue_registered = true;
 			ret = apple_rtkit_send_message(gpu->rtkit, 0x21, G15_COMPUTE_DOORBELL,
@@ -2919,13 +2951,13 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	}
 	if (renders && !ret) {
 		ret = g15_channel_post(be, G15_FS_CHANNEL, r->qinfo[1].va, 1, pf.fs_head, 1,
-				       !r->registered);
+				       !r->registered, ahead);
 		if (!ret)
 			ret = apple_rtkit_send_message(gpu->rtkit, 0x21, G15_FS_DOORBELL, NULL,
 						       false);
 		if (!ret)
 			ret = g15_channel_post(be, G15_TA_CHANNEL, r->qinfo[0].va, 0, pf.ta_head, 0,
-					       !r->registered);
+					       !r->registered, ahead);
 		if (!ret)
 			ret = apple_rtkit_send_message(gpu->rtkit, 0x21, G15_TA_DOORBELL, NULL,
 						       false);
