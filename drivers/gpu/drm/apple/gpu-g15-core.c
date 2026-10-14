@@ -39,6 +39,62 @@ module_param(enable, bool, 0400);
 MODULE_PARM_DESC(enable, "Permit the watchdog-guarded T6030 GPU firmware start");
 
 /*
+ * Firmware predictive-idle inputs (Globals): the standby time in us (+0x7a8)
+ * and the model's minimum confidence (+0x7c4, f32). The board profile's
+ * 700 us / 0.7 power the GPU down between works that are ~100 us apart once
+ * the model has seen a sustained low-utilization stream, and within 1 ms of
+ * idle, costing ~300 us at the next pickup. Imported at initdata; a write
+ * after startup is re-imported (DEVCTL 0x13).
+ */
+static struct g15_gpu *g15_idle_gpu;	/* the started GPU, for runtime writes */
+static unsigned int idle_standby_us = 2500;
+static unsigned int idle_min_conf = 500;	/* permille */
+
+static u32 g15_permille_f32(u32 p)
+{
+	u32 k = 0;
+
+	p = clamp(p, 1U, 1000U);
+	while (p * (1U << k) < 500)	/* p/1000 * 2^k in [0.5, 1) */
+		k++;
+	if (p == 1000)
+		return 0x3f800000;
+	/* p/1000 = m/2^24 * 2^(1-k-1), m in [2^23, 2^24) */
+	return ((126 - k) << 23) |
+	       ((u32)div_u64((u64)p << (24 + k), 1000) - (1U << 23));
+}
+
+static int g15_idle_set(const char *val, const struct kernel_param *kp)
+{
+	struct g15_gpu *gpu = READ_ONCE(g15_idle_gpu);
+	u8 rec[0x38] = {};
+	int ret = param_set_uint(val, kp);
+
+	if (ret || !gpu)
+		return ret;
+	put_unaligned_le32(0x13, rec);
+	mutex_lock(&gpu->lock);
+	ret = g15_w32(gpu, G15_GLOBALS + 0x7a8, clamp(idle_standby_us, 100U, 100000U)) ?:
+	      g15_w32(gpu, G15_GLOBALS + 0x7c4, g15_permille_f32(idle_min_conf));
+	wmb();
+	if (!ret)
+		ret = g15_devctl_record(gpu, rec);
+	mutex_unlock(&gpu->lock);
+	dev_info(gpu->dev, "idle policy: standby %u us, min confidence %u/1000 re-imported: %d\n",
+		 idle_standby_us, idle_min_conf, ret);
+	return ret;
+}
+
+static const struct kernel_param_ops g15_idle_ops = {
+	.set = g15_idle_set,
+	.get = param_get_uint,
+};
+module_param_cb(idle_standby_us, &g15_idle_ops, &idle_standby_us, 0644);
+MODULE_PARM_DESC(idle_standby_us, "Firmware predictive-idle standby time, 100..100000 us (Globals +0x7a8; board profile 700, native ADT 1500): the GPU stays up about this long after its last work");
+module_param_cb(idle_min_conf, &g15_idle_ops, &idle_min_conf, 0644);
+MODULE_PARM_DESC(idle_min_conf, "Firmware predictive-idle minimum confidence, permille (Globals +0x7c4; board profile 700)");
+
+/*
  * GPU firmware builds whose ABI this driver implements. The canonical object
  * VAs (gpu-g15.h), the initdata graph, the board-image templates and the
  * stage-2 work images all belong to one build, so the build is identified
@@ -979,7 +1035,9 @@ static int g15_build(struct g15_gpu *gpu)
 	ret = -EINVAL;
 	if (get_unaligned_le32(hw + 0xa38) != 1 ||
 	    get_unaligned_le32(hw + 0xb58) != G15_DVFS_STATES - 1 ||
-	    get_unaligned_le32(glob + 0x980) != 10)
+	    get_unaligned_le32(glob + 0x980) != 10 ||
+	    get_unaligned_le32(glob + 0x7a8) != 700 ||
+	    get_unaligned_le32(glob + 0x7c4) != 0x3f333333)
 		goto out;
 	ret = g15_board_from_adt(gpu, hw);
 	if (ret)
@@ -999,6 +1057,8 @@ static int g15_build(struct g15_gpu *gpu)
 				   hw + 0x640 + 32 * g15_iomaps[i].slot + 8);
 	put_unaligned_le64(G15_TIMESTAMPS, hw + 0x28);
 	put_unaligned_le32(100, glob + 0x980);
+	put_unaligned_le32(clamp(idle_standby_us, 100U, 100000U), glob + 0x7a8);
+	put_unaligned_le32(g15_permille_f32(idle_min_conf), glob + 0x7c4);
 	/* HardwareDataA at +0x4580: maintained S8 request. */
 	put_unaligned_le32(8, hw + 0x4580 + 0x2c);
 	put_unaligned_le32(8, hw + 0x4580 + 0x30);
@@ -1235,6 +1295,7 @@ static int g15_start(struct g15_gpu *gpu)
 		return ret;
 	g15_drain_rings(gpu);
 	gpu->ready = true;
+	WRITE_ONCE(g15_idle_gpu, gpu);
 	dev_info(gpu->dev, "M3: firmware accepted owned initdata and device controls\n");
 	return 0;
 }
