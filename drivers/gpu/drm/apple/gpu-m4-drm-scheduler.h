@@ -102,14 +102,6 @@ struct gpu_m4_drm_sched_ops {
 /* At most this many credits per queue (two packets in flight). */
 enum { GPU_M4_DRM_SCHED_MAX_CREDITS = 2 };
 
-/*
- * A scheduler queue's own credit limit: every armed job's FINISHED fence is
- * ordered behind its predecessor's (terminal fence), so any depth keeps
- * queue order. Providers that keep per-credit state size it by
- * GPU_M4_DRM_SCHED_MAX_CREDITS and must not configure more than that.
- */
-enum { GPU_M4_DRM_SCHED_QUEUE_CREDITS = 64 };
-
 struct gpu_m4_drm_sched_config {
 	struct device *dev;
 	void *owner;
