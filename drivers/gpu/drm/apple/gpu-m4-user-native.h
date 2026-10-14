@@ -37,6 +37,14 @@ struct m4_user_native_receipt {
 	u16 type;
 	u32 uma_slot, parameter_id;
 	u64 submitted, completed;
+	/* render_shared: the render ran on its queue's retained allocator, in
+	 * firmware UMA ID / PB ID fw_slot (uma_slot stays the host unit's slot
+	 * token), with InitBuffer only when init_buffer; observed_submitted is
+	 * the allocator's cumulative S it retired within (>= submitted).
+	 */
+	bool shared, init_buffer;
+	u32 fw_slot;
+	u64 observed_submitted;
 	union {
 		struct gpu_m4_exec_retirement compute;
 		struct gpu_m4_render_stage_retirement render[2];
@@ -49,6 +57,12 @@ struct m4_user_native_receipt {
 	struct gpu_m4_render_retirement_copy render_copies[GPU_M4_DRM_RENDER_TIMESTAMPS];
 	u32 render_dependency_count, render_copy_count;
 };
+
+/* The UMA ID / PB ID slot the receipt's works named to firmware. */
+static u32 m4_user_native_receipt_fw_slot(const struct m4_user_native_receipt *r)
+{
+	return r->shared ? r->fw_slot : r->uma_slot;
+}
 
 struct m4_user_native_history {
 	struct list_head garbage;
@@ -149,6 +163,10 @@ struct m4_user_native_bo {
 	 * new owner of the same cell.
 	 */
 	bool cell_released;
+	/* Owned by a retained render allocator (its upper lease too), never by
+	 * a unit or a stage.
+	 */
+	bool ra_owned;
 };
 
 /* Render microsequences live in their work cell at this offset (seq_in_cell)
@@ -203,6 +221,57 @@ struct m4_user_render_native {
 	struct m4_user_native_bo *manager, *tpc;
 };
 
+/* render_shared (boot parameter): every render of a queue runs on that
+ * queue's ONE retained render allocator (q10 contract,
+ * m4-j713-g16g-retained-shared-allocators-a2dc2ad95-contract-20261014.md):
+ * the UMA descriptor M (with its +0x100/+0x200 auxiliary records), its USC
+ * pool/freelist/page list, the PB manager P, the PB heap/page list/block
+ * list/ring and the host-published counters X (scenes) and S (allocator
+ * stages). It is initialized once (full InitBuffer, X=1) and afterwards only
+ * X += 1 and S += 2 are published per render: no per-render InitBuffer, no
+ * manager/list rebuild, and the firmware catches M and P up only when the
+ * queue's submitted renders have all completed. Render units keep only their
+ * per-render storage (work cells, scene, tilemap, TPC, preemption, scratch,
+ * auxiliary); their host slot stays a reuse token with no firmware meaning.
+ */
+static bool render_shared = true;
+module_param(render_shared, bool, 0400);
+MODULE_PARM_DESC(render_shared, "Queues' renders share one retained render allocator and PB (boot only, default 1)");
+static unsigned int render_shared_pb_mib = 32;
+module_param(render_shared_pb_mib, uint, 0400);
+MODULE_PARM_DESC(render_shared_pb_mib, "render_shared: retained PB heap capacity in MiB (4..256, boot only)");
+
+enum m4_user_render_alloc_bo {
+	M4_RA_UMA,		/* M page: GPU + FW (descriptor and aux records) */
+	M4_RA_POOL,		/* 32 MiB USC private pool, GPU */
+	M4_RA_POOL_STATE,	/* pool freelist, GPU */
+	M4_RA_UMA_LIST,		/* pool page list, GPU */
+	M4_RA_HEAP,		/* PB heap, GPU */
+	M4_RA_PB_LIST,		/* PB page list: GPU + FW */
+	M4_RA_PB_BLOCKS,	/* PB block list, FW */
+	M4_RA_PB_RING,		/* PB block ring R, FW */
+	M4_RA_COUNTER,		/* X at +0, S at +M4_RA_S_OFFSET: index-2 live cells */
+	M4_RA_MANAGER,		/* P, FW */
+	M4_RA_BOS,
+};
+/* S (the M submitted cell) lives on the X page, away from X's 0x40 bytes. */
+#define M4_RA_S_OFFSET 0x80U
+
+struct m4_user_render_alloc {
+	struct m4_user_native_bo *bo[M4_RA_BOS];
+	struct gpu_m4_render_pb_layout pb;	/* initialized, fixed capacity */
+	u64 submitted;				/* committed S (stage completions) */
+	u32 scenes;				/* committed X */
+	u32 slot;				/* firmware UMA ID (PB ID slot - 33) */
+	bool initialized;			/* first InitBuffer published */
+	bool slot_reused;			/* slot taken from a released allocator */
+	/* A larger replacement keeps the replaced allocator (its units, slot
+	 * and backing) until the queue's release.
+	 */
+	struct m4_user_render_alloc *older;
+	bool baseline, tree;
+};
+
 static void *m4_user_render_sequence_cpu(const struct m4_user_render_native *n, u32 engine)
 {
 	u32 role = engine ? GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW :
@@ -252,6 +321,11 @@ struct m4_user_native_unit {
 	 */
 	bool cold, cold_mark, cold_proven, cold_base, cold_warm, cold_idle;
 	bool cold_trim, cold_need;
+	/* render_shared: a render unit whose allocator/PB roles name its queue's
+	 * retained allocator ra (not in bo[]); its slot is a host reuse token only.
+	 */
+	bool shared;
+	struct m4_user_render_alloc *ra;
 	/* This COMPLETED unit's typed mapped descriptors are members of its VM's
 	 * persistent native baseline (future child images). Not a use, borrower,
 	 * retirement or release authority; cleared only by an actual removal or
@@ -360,6 +434,10 @@ struct m4_user_native_stage {
 	 */
 	u64 retargeted;
 	u32 retarget_slot[GPU_M4_DRM_JOB_MAX_COMMANDS];
+	/* render_shared: its queue's retained render allocator, whose BOs this
+	 * stage also holds in bo[] (and native[]/extra[]).
+	 */
+	struct m4_user_render_alloc *ra;
 	struct m4_user_native_history *history, *pending;
 	struct m4_user_native_stage *idle_replacement;
 	u64 next_va, charge, allocation_bytes;
@@ -1784,6 +1862,358 @@ static int m4_user_native_compute_allocate(struct m4_user_native_stage *s, u32 i
 	return ret;
 }
 
+static bool m4_user_native_render_need(const struct gpu_m4_drm_job_command *command,
+	struct gpu_m4_exec_geometry *geometry, struct gpu_m4_render_pb_layout *pb,
+	const struct m4_user_queue *q);
+
+/* ---- render_shared: the queue's retained render allocator ---- */
+
+static u32 m4_user_render_alloc_maps(const struct m4_user_render_alloc *ra,
+	struct gpu_m4_drm_provider_private_gem *maps)
+{
+	u32 n = 0;
+
+	for (u32 i = 0; i < M4_RA_BOS; i++)
+		if (ra->bo[i] && ra->bo[i]->va)
+			maps[n++] = ra->bo[i]->mapping;
+	return n;
+}
+
+/* The allocator's client-VA BOs join the VM's persistent native baseline and,
+ * S3c, its authority tree as DRIVER extents, as a new unit's do.
+ */
+static int m4_user_render_alloc_baseline_add_locked(struct m4_user_queue *q,
+	struct m4_user_render_alloc *ra)
+{
+	struct gpu_m4_drm_provider_private_gem maps[M4_RA_BOS];
+	struct m4_gpu_provider_runtime *p = q->runtime;
+	struct gpu_m4_drm_provider_vm *vm = q->vm->provider_vm;
+	u32 count = m4_user_render_alloc_maps(ra, maps);
+	u64 revision;
+	int ret = -EAGAIN;
+
+	lockdep_assert_held(&p->hello->gpu->lock);
+	if (gpu_m4_drm_provider_vm_authority(vm) && !ra->tree && !p->error) {
+		ret = count ? gpu_m4_drm_provider_vm_native_map_locked(vm, maps, count) : 0;
+		if (ret)
+			return ret;
+		ra->tree = !!count;
+		ret = -EAGAIN;
+	}
+	if (ra->baseline || p->error)
+		return 0;
+	for (u32 attempt = 0; count && ret == -EAGAIN && attempt < 2; attempt++)
+		ret = gpu_m4_drm_provider_vm_baseline_add_locked(vm,
+			gpu_m4_drm_provider_vm_baseline_revision_locked(vm), maps, count, &revision);
+	if (count && !ret) {
+		ra->baseline = true;
+		gpu_m4_drm_provider_vm_tree_native_add_locked(vm, maps, count);
+	}
+	return 0;
+}
+
+static int m4_user_render_alloc_baseline_remove_locked(struct m4_user_queue *q,
+	struct m4_user_render_alloc *ra)
+{
+	struct gpu_m4_drm_provider_private_gem maps[M4_RA_BOS];
+	struct gpu_m4_drm_provider_vm *vm = q->vm->provider_vm;
+	u32 count = m4_user_render_alloc_maps(ra, maps);
+	u64 revision;
+	int ret = -EAGAIN;
+
+	lockdep_assert_held(&q->runtime->hello->gpu->lock);
+	if (ra->tree) {
+		ret = count ? gpu_m4_drm_provider_vm_native_unmap_locked(vm, maps, count) : -ESTALE;
+		if (ret)
+			return ret;
+		ra->tree = false;
+		ret = -EAGAIN;
+	}
+	if (!ra->baseline)
+		return 0;
+	if (q->vm->closed) {
+		ra->baseline = false;
+		return 0;
+	}
+	if (!count)
+		return -ESTALE;
+	for (u32 attempt = 0; ret == -EAGAIN && attempt < 2; attempt++)
+		ret = gpu_m4_drm_provider_vm_baseline_remove_locked(vm,
+			gpu_m4_drm_provider_vm_baseline_revision_locked(vm), maps, count, &revision);
+	if (!ret) {
+		ra->baseline = false;
+		gpu_m4_drm_provider_vm_tree_native_remove_locked(vm, maps, count);
+	}
+	return ret;
+}
+
+/* A render UMA ID / PB ID for a new allocator: held by no allocator, not
+ * quarantined, and either never named to firmware (zero PB descriptor
+ * slice) or released by a quiescent allocator. With render_shared every
+ * render runs on an allocator, so render units' slots are host reuse tokens
+ * the firmware never sees and do not exclude a slot here.
+ */
+static u32 m4_user_render_alloc_slot_locked(struct m4_gpu_provider_runtime *p)
+{
+	for (u32 slot = GPU_M4_RENDER_UMA_SLOT_FIRST;
+	     slot < GPU_M4_RENDER_UMA_SLOT_FIRST + GPU_M4_RENDER_UMA_SLOT_COUNT; slot++) {
+		u32 pbid = m4_user_native_slot_parameter(DRM_ASAHI_CMD_RENDER, slot);
+
+		if (p->user_slot_alloc[slot] || test_bit(slot, p->user_slot_quarantined))
+			continue;
+		if (test_bit(slot, p->user_slot_released) ||
+		    !memchr_inv(p->ready->buffer[GPU_M4_PARAMETER].cpu +
+			GPU_M4_RENDER_PARAMETER_DESCRIPTOR_SIZE * pbid, 0,
+			GPU_M4_RENDER_PARAMETER_DESCRIPTOR_SIZE))
+			return slot;
+	}
+	return 0;
+}
+
+/* The stage holds one more reference to each allocator BO and maps it, as a
+ * warm unit's BOs join a new stage.
+ */
+static int m4_user_render_alloc_join_locked(struct m4_user_native_stage *s,
+	struct m4_user_render_alloc *ra)
+{
+	u32 nb = 0, nm = 0, ne = 0;
+
+	lockdep_assert_held(&s->queue->runtime->hello->gpu->lock);
+	for (u32 i = 0; i < M4_RA_BOS; i++) {
+		struct m4_user_native_bo *b = ra->bo[i];
+		bool found = false;
+
+		if (!b || !b->ra_owned || !refcount_read(&b->refs) ||
+		    refcount_read(&b->refs) == U32_MAX)
+			return -ESTALE;
+		for (u32 j = 0; j < s->bo_count; j++)
+			found |= s->bo[j] == b;
+		if (!found) {
+			nb++;
+			nm += !!b->va;
+			ne += !b->va;
+		}
+	}
+	if (nb > M4_USER_NATIVE_BO_MAX - s->bo_count ||
+	    nm > M4_USER_NATIVE_MAP_MAX - s->native_count ||
+	    ne > M4_USER_NATIVE_EXTRA_MAX - s->extra_count)
+		return -E2BIG;
+	for (u32 i = 0; i < M4_RA_BOS; i++) {
+		struct m4_user_native_bo *b = ra->bo[i];
+		bool found = false;
+
+		for (u32 j = 0; j < s->bo_count; j++)
+			found |= s->bo[j] == b;
+		if (found)
+			continue;
+		refcount_inc(&b->refs);
+		s->bo[s->bo_count++] = b;
+		if (b->va)
+			s->native[s->native_count++] = b->mapping;
+		else
+			s->extra[s->extra_count++] = m4_user_native_extra(b);
+	}
+	return 0;
+}
+
+static DEFINE_MUTEX(m4_user_render_alloc_lock);
+
+/* Construct the queue's allocator in its first render stage: its BOs are
+ * created as that stage's (no building unit), then also owned by the
+ * allocator; the pool is seeded once; one render UMA ID / PB ID is leased for
+ * the queue's lifetime. Nothing is published here: the first render's
+ * publication writes M, P, the lists and the ring, with InitBuffer.
+ */
+static int m4_user_render_alloc_create(struct m4_user_native_stage *s, u64 heap,
+	struct m4_user_render_alloc **out)
+{
+	static const struct { u8 role; bool mapped, firmware; } layout[M4_RA_BOS] = {
+		[M4_RA_UMA] = { M4_RA_UMA, true, true },
+		[M4_RA_POOL] = { M4_RA_POOL, true, false },
+		[M4_RA_POOL_STATE] = { M4_RA_POOL_STATE, true, false },
+		[M4_RA_UMA_LIST] = { M4_RA_UMA_LIST, true, false },
+		[M4_RA_HEAP] = { M4_RA_HEAP, true, false },
+		[M4_RA_PB_LIST] = { M4_RA_PB_LIST, true, true },
+		[M4_RA_PB_BLOCKS] = { M4_RA_PB_BLOCKS, false, true },
+		[M4_RA_PB_RING] = { M4_RA_PB_RING, false, true },
+		[M4_RA_COUNTER] = { M4_RA_COUNTER, false, true },
+		[M4_RA_MANAGER] = { M4_RA_MANAGER, false, true },
+	};
+	struct m4_user_queue *q = s->queue;
+	struct m4_gpu_provider_runtime *p = q->runtime;
+	struct mutex *lock = &p->hello->gpu->lock;
+	struct gpu_m4_exec_vm vm = { .start = GPU_M4_DRM_UAT_PRIVATE_START,
+		.end = GPU_M4_DRM_UAT_PRIVATE_END, .cookie = s, .check = m4_user_native_initial_range };
+	struct m4_user_render_alloc *ra;
+	u64 size[M4_RA_BOS];
+	int ret;
+
+	lockdep_assert_not_held(lock);
+	if (s->building)
+		return -EINVAL;
+	ra = kzalloc(sizeof(*ra), GFP_KERNEL);
+	if (!ra)
+		return -ENOMEM;
+	ret = gpu_m4_render_pb_capacity(&ra->pb, heap);
+	if (ret) {
+		kfree(ra);
+		return ret;
+	}
+	size[M4_RA_UMA] = 0x4000;
+	size[M4_RA_POOL] = GPU_M4_EXEC_POOL_SIZE;
+	size[M4_RA_POOL_STATE] = GPU_M4_EXEC_POOL_STATE_SIZE;
+	size[M4_RA_UMA_LIST] = GPU_M4_EXEC_POOL_PAGE_LIST_SIZE;
+	size[M4_RA_HEAP] = ra->pb.heap_size;
+	size[M4_RA_PB_LIST] = ra->pb.page_list_size;
+	size[M4_RA_PB_BLOCKS] = ra->pb.block_list_size;
+	size[M4_RA_PB_RING] = 8;
+	size[M4_RA_COUNTER] = GPU_M4_DRM_PAGE_SIZE;
+	size[M4_RA_MANAGER] = 0x4000;
+	for (u32 i = 0; i < M4_RA_BOS; i++) {
+		ret = m4_user_native_add(s, size[i], i == M4_RA_HEAP ? 0x20000 : GPU_M4_DRM_PAGE_SIZE,
+			layout[i].mapped, layout[i].firmware, false, false, &ra->bo[i]);
+		if (ret)
+			goto fail;
+	}
+	mutex_lock(lock);
+	ret = gpu_m4_exec_uma_pool(ra->bo[M4_RA_POOL_STATE]->map.vaddr,
+		ra->bo[M4_RA_UMA_LIST]->map.vaddr, &vm, ra->bo[M4_RA_POOL]->va);
+	if (!ret) {
+		ra->slot = m4_user_render_alloc_slot_locked(p);
+		ret = ra->slot ? 0 : -EBUSY;
+	}
+	if (!ret)
+		ret = m4_user_render_alloc_baseline_add_locked(q, ra);
+	if (!ret) {
+		for (u32 i = 0; i < M4_RA_BOS; i++) {
+			refcount_inc(&ra->bo[i]->refs);
+			ra->bo[i]->ra_owned = true;
+		}
+		p->user_slot_alloc[ra->slot] = ra;
+		ra->slot_reused = test_and_clear_bit(ra->slot, p->user_slot_released);
+		*out = ra;
+	}
+	mutex_unlock(lock);
+	dma_wmb();
+	if (!ret)
+		return 0;
+fail:
+	/* The stage still holds every BO created so far and releases them
+	 * (with their upper leases) as ordinary non-unit stage BOs.
+	 */
+	if (ra->tree || ra->baseline) {
+		mutex_lock(lock);
+		m4_user_render_alloc_baseline_remove_locked(q, ra);
+		mutex_unlock(lock);
+	}
+	kfree(ra);
+	return ret;
+}
+
+/* The stage's allocator: created with the queue's first render stage, then
+ * joined by every render stage of the queue whose renders' PB needs (the
+ * geometry policy, partial-render growth included) fit its fixed capacity.
+ * A larger need replaces it by a new allocator of at least twice the
+ * capacity; the replaced one keeps its units and slot until queue release.
+ */
+static int m4_user_render_alloc_stage(struct m4_user_native_stage *s,
+	const struct gpu_m4_drm_mixed_batch *batch)
+{
+	struct m4_user_queue *q = s->queue;
+	struct mutex *lock = &q->runtime->hello->gpu->lock;
+	struct m4_user_render_alloc *ra = NULL;
+	u64 need = (u64)clamp_t(u32, READ_ONCE(render_shared_pb_mib), 4, 256) << 20;
+	int ret = 0;
+
+	for (u32 i = 0; i < batch->count; i++) {
+		struct gpu_m4_exec_geometry geometry;
+		struct gpu_m4_render_pb_layout pb;
+
+		if (m4_user_native_render_need(&batch->commands[i], &geometry, &pb, q) &&
+		    pb.heap_size > need)
+			need = pb.heap_size;
+	}
+	mutex_lock(&m4_user_render_alloc_lock);
+	mutex_lock(lock);
+	ra = q->render_alloc;
+	if (ra && ra->pb.heap_size >= need)
+		ret = m4_user_render_alloc_join_locked(s, ra);
+	mutex_unlock(lock);
+	if (!ret && (!ra || ra->pb.heap_size < need)) {
+		struct m4_user_render_alloc *older = ra;
+
+		if (older && need < 2 * older->pb.heap_size)
+			need = 2 * older->pb.heap_size;
+		ret = need > (1ULL << 30) ? -E2BIG :
+			m4_user_render_alloc_create(s, need, &ra);
+		if (!ret) {
+			mutex_lock(lock);
+			ra->older = older;
+			q->render_alloc = ra;
+			mutex_unlock(lock);
+		}
+	}
+	mutex_unlock(&m4_user_render_alloc_lock);
+	if (!ret)
+		s->ra = ra;
+	return ret;
+}
+
+/* Queue release (no stage or unit of the queue remains): leave the tree and
+ * baseline, then free the allocator once firmware provably caught it up
+ * (M completed == S, P progress == X); otherwise quarantine its slot and
+ * keep every backing.
+ */
+static void m4_user_render_alloc_free_locked(struct m4_user_queue *q,
+	struct m4_user_render_alloc *ra)
+{
+	struct m4_gpu_provider_runtime *p = q->runtime;
+	u64 completed = 0;
+	bool quiet;
+
+	quiet = ra->bo[M4_RA_UMA] && ra->bo[M4_RA_COUNTER] && ra->bo[M4_RA_MANAGER] &&
+		!m4_store_packed64(ra->bo[M4_RA_UMA]->map.vaddr + 0x54, &completed) &&
+		completed == m4_store_read64(ra->bo[M4_RA_COUNTER]->map.vaddr + M4_RA_S_OFFSET) &&
+		completed == ra->submitted &&
+		m4_ready_read32(ra->bo[M4_RA_MANAGER]->map.vaddr) == ra->scenes &&
+		m4_ready_read32(ra->bo[M4_RA_COUNTER]->map.vaddr) == ra->scenes;
+	if (!quiet || m4_user_render_alloc_baseline_remove_locked(q, ra)) {
+		pr_warn("GPU render allocator slot %u quarantined: completed=%llu submitted=%llu scenes=%u/%u\n",
+			ra->slot, completed, ra->submitted, ra->scenes,
+			ra->bo[M4_RA_MANAGER] ? m4_ready_read32(ra->bo[M4_RA_MANAGER]->map.vaddr) : 0);
+		set_bit(ra->slot, p->user_slot_quarantined);
+		return; /* Every backing stays held (and p->user_slot_alloc). */
+	}
+	p->user_slot_alloc[ra->slot] = NULL;
+	if (ra->initialized)
+		set_bit(ra->slot, p->user_slot_released);
+	for (u32 i = 0; i < M4_RA_BOS; i++) {
+		struct m4_user_native_bo *b = ra->bo[i];
+
+		if (!b)
+			continue;
+		if (b->upper)
+			gpu_m4_drm_upper_put_locked(b->upper);
+		m4_user_native_bo_put_locked(b);
+	}
+	kfree(ra);
+}
+
+static void m4_user_render_alloc_release_locked(struct m4_user_queue *q)
+{
+	struct m4_user_render_alloc *ra = q->render_alloc;
+
+	lockdep_assert_held(&q->runtime->hello->gpu->lock);
+	q->render_alloc = NULL;
+	while (ra) {
+		struct m4_user_render_alloc *older = ra->older;
+
+		ra->older = NULL;
+		m4_user_render_alloc_free_locked(q, ra);
+		ra = older;
+	}
+}
+
 /* GPU backing is a complete typed private mapping. Firmware backing retains
  * the same actual native object and its canonical lease, not a PA callback.
  * Logical firmware subrecords are inside that full-page cache owner.
@@ -1837,6 +2267,14 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 	}
 	if (ret)
 		return ret;
+	/* render_shared: the PB (and its capacity) is the queue's allocator's. */
+	if (s->ra) {
+		if (!s->building)
+			return -ESTALE;
+		n->pb = s->ra->pb;
+		s->building->shared = true;
+		s->building->ra = s->ra;
+	}
 	resource_size[0] = n->geometry.tilemap_size;
 	resource_size[1] = n->geometry.tpc_size;
 	resource_size[2] = resource_size[3] = 0x4000;
@@ -1864,10 +2302,14 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 	};
 	n->tpc = n->resource[GPU_M4_RENDER_TPC];
 	o->tpc_firmware = m4_user_native_fw(n->tpc, 0, n->tpc->size);
-	ret = m4_user_native_add(s, n->pb.heap_size, 0x20000, true, false, false, false,
-		&n->parameter_heap);
-	if (ret)
-		return ret;
+	if (s->ra) {
+		n->parameter_heap = s->ra->bo[M4_RA_HEAP];
+	} else {
+		ret = m4_user_native_add(s, n->pb.heap_size, 0x20000, true, false, false, false,
+			&n->parameter_heap);
+		if (ret)
+			return ret;
+	}
 	o->parameter_heap = m4_user_native_gpu(n->parameter_heap);
 	gpu_size[GPU_M4_RENDER_FIRST_PRIVATE_POOL_GPU] = GPU_M4_EXEC_POOL_SIZE;
 	gpu_size[GPU_M4_RENDER_FIRST_POOL_STATE_GPU] = GPU_M4_EXEC_POOL_STATE_SIZE;
@@ -1880,11 +2322,23 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 		bool work = i == GPU_M4_RENDER_FIRST_TILER_WORK_GPU ||
 			i == GPU_M4_RENDER_FIRST_FRAGMENT_WORK_GPU;
 		bool fw = work || i == GPU_M4_RENDER_FIRST_PB_LIST_GPU || i == GPU_M4_RENDER_FIRST_UMA_GPU;
+		int role = !s->ra || work ? -1 :
+			i == GPU_M4_RENDER_FIRST_PRIVATE_POOL_GPU ? M4_RA_POOL :
+			i == GPU_M4_RENDER_FIRST_POOL_STATE_GPU ? M4_RA_POOL_STATE :
+			i == GPU_M4_RENDER_FIRST_UMA_LIST_GPU ? M4_RA_UMA_LIST :
+			i == GPU_M4_RENDER_FIRST_PB_LIST_GPU ? M4_RA_PB_LIST :
+			i == GPU_M4_RENDER_FIRST_UMA_GPU ? M4_RA_UMA : -2;
 
-		ret = m4_user_native_add(s, gpu_size[i], GPU_M4_DRM_PAGE_SIZE, true, fw,
-			false, work, &n->gpu[i]);
-		if (ret)
-			return ret;
+		if (role == -2)
+			return -EINVAL;
+		if (role >= 0) {
+			n->gpu[i] = s->ra->bo[role];
+		} else {
+			ret = m4_user_native_add(s, gpu_size[i], GPU_M4_DRM_PAGE_SIZE, true, fw,
+				false, work, &n->gpu[i]);
+			if (ret)
+				return ret;
+		}
 		o->gpu[i] = m4_user_native_gpu(n->gpu[i]);
 	}
 	n->work[0] = n->gpu[GPU_M4_RENDER_FIRST_TILER_WORK_GPU];
@@ -1896,9 +2350,21 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 	o->firmware[(role)] = m4_user_native_fw(n->firmware[(role)], 0, (bytes)); \
 } while (0)
 	M4_NATIVE_FW(GPU_M4_RENDER_FIRST_SCENE_FW, 0x4000);
-	M4_NATIVE_FW(GPU_M4_RENDER_FIRST_PB_BLOCKS_FW, n->pb.block_list_size);
-	M4_NATIVE_FW(GPU_M4_RENDER_FIRST_PB_RING_FW, 8);
-	M4_NATIVE_FW(GPU_M4_RENDER_FIRST_PB_COUNTER_FW, 0x40);
+	if (s->ra) {
+		n->firmware[GPU_M4_RENDER_FIRST_PB_BLOCKS_FW] = s->ra->bo[M4_RA_PB_BLOCKS];
+		o->firmware[GPU_M4_RENDER_FIRST_PB_BLOCKS_FW] = m4_user_native_fw(
+			s->ra->bo[M4_RA_PB_BLOCKS], 0, n->pb.block_list_size);
+		n->firmware[GPU_M4_RENDER_FIRST_PB_RING_FW] = s->ra->bo[M4_RA_PB_RING];
+		o->firmware[GPU_M4_RENDER_FIRST_PB_RING_FW] = m4_user_native_fw(
+			s->ra->bo[M4_RA_PB_RING], 0, 8);
+		n->firmware[GPU_M4_RENDER_FIRST_PB_COUNTER_FW] = s->ra->bo[M4_RA_COUNTER];
+		o->firmware[GPU_M4_RENDER_FIRST_PB_COUNTER_FW] = m4_user_native_fw(
+			s->ra->bo[M4_RA_COUNTER], 0, 0x40);
+	} else {
+		M4_NATIVE_FW(GPU_M4_RENDER_FIRST_PB_BLOCKS_FW, n->pb.block_list_size);
+		M4_NATIVE_FW(GPU_M4_RENDER_FIRST_PB_RING_FW, 8);
+		M4_NATIVE_FW(GPU_M4_RENDER_FIRST_PB_COUNTER_FW, 0x40);
+	}
 	in_cell = READ_ONCE(seq_in_cell);
 	if (!in_cell) {
 		M4_NATIVE_FW(GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW, 0x400);
@@ -1930,9 +2396,14 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 		M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_FRAGMENT_WORK_FW, n->work[1], 0x4000);
 	}
 #undef M4_NATIVE_ALIAS
-	ret = m4_user_native_add(s, 0x4000, GPU_M4_DRM_PAGE_SIZE, false, true, false, false, &n->manager);
-	if (ret)
-		return ret;
+	if (s->ra) {
+		n->manager = s->ra->bo[M4_RA_MANAGER];
+	} else {
+		ret = m4_user_native_add(s, 0x4000, GPU_M4_DRM_PAGE_SIZE, false, true, false,
+			false, &n->manager);
+		if (ret)
+			return ret;
+	}
 	o->manager = m4_user_native_fw(n->manager, 0, GPU_M4_RENDER_PARAMETER_MANAGER_SIZE);
 	b = n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW];
 	o->init_buffer = m4_user_native_fw(b, 0x300, GPU_M4_RENDER_INIT_BUFFER_SIZE);
@@ -1949,7 +2420,10 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 	/* Slot/PB descriptor, physical READY queues/activity and notifier binding
 	 * are supplied only by the root's actual publication reservation. Fresh PB
 	 * allocator bytes also wait for that real ID; no dummy ID is encoded here.
+	 * A shared unit's pool was seeded once by its allocator.
 	 */
+	if (s->ra)
+		return 0;
 	mutex_lock(lock);
 	ret = gpu_m4_exec_uma_pool(n->gpu[GPU_M4_RENDER_FIRST_POOL_STATE_GPU]->map.vaddr,
 		n->gpu[GPU_M4_RENDER_FIRST_UMA_LIST_GPU]->map.vaddr, &vm,
@@ -2167,7 +2641,8 @@ static int m4_user_native_receipt_prepare_locked(struct m4_user_native_stage *s,
 		    u->command.type != s->command[i].type ||
 		    (m4_user_native_reused(s, i) &&
 		     (!s->reuse_history[i] || !s->reuse_displacement[i]))) {
-			ret = -ESTALE;
+			ret = M4_USER_WHY(-ESTALE, "receipt prepare unit %u accepted=%d idle=%d shared=%d",
+				i, u && u->accepted == s, u && u->idle, u && u->shared);
 			break;
 		}
 		if (view.batch->commands[i].type != s->command[i].type)
@@ -2188,8 +2663,10 @@ static int m4_user_native_receipt_prepare_locked(struct m4_user_native_stage *s,
 
 		if (b->access_proof == proof)
 			continue; /* Repeated occurrence of an already proven BO. */
-		ret = gpu_m4_drm_provider_job_check_access_locked(job, p->provider,
-			b->object, 0, b->coverage, M4_USER_NATIVE_RW, false, &cache);
+		ret = M4_USER_WHY(gpu_m4_drm_provider_job_check_access_locked(job, p->provider,
+			b->object, 0, b->coverage, M4_USER_NATIVE_RW, false, &cache),
+			"receipt prepare access bo %u/%u fw=%#llx va=%#llx ra=%d unit=%d", i, s->bo_count,
+			M4_WHY64(b->fw_va), M4_WHY64(b->va), b->ra_owned, !!b->unit);
 		if (!ret) {
 			b->access_proof = proof;
 			m4_user_native_proof_stats.proof_bos++;
@@ -2412,7 +2889,9 @@ static int m4_user_native_render_history_owner_locked(void *cookie,
 	      r->render_dependency[2].engine != 1 || r->render_dependency[2].event != 0x71 ||
 	      r->render_dependency[2].stamp_fw != s->notifier->bo->fw_va + 0x630)) ||
 	    pair->uma_descriptor_fw != n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->fw_va ||
-	    pair->uma_submitted_fw != n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x500 ||
+	    (r->shared ? !s->ra || n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU] != s->ra->bo[M4_RA_UMA] ||
+		pair->uma_submitted_fw != s->ra->bo[M4_RA_COUNTER]->fw_va + M4_RA_S_OFFSET :
+		pair->uma_submitted_fw != n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x500) ||
 	    pair->stage[0].expected_generation != h->binding_generation ||
 	    pair->stage[1].expected_generation != h->binding_generation ||
 	    pair->stage[0].notifier_fw != s->notifier->bo->fw_va ||
@@ -2459,16 +2938,21 @@ static int m4_user_native_render_receipt_pair_locked(struct m4_user_native_stage
 	    history->count != s->count || index >= history->count)
 		return -ESTALE;
 	r = &history->command[index];
-	if (!n || r->submitted < 2 || (r->submitted & 1) || r->submitted != r->completed ||
+	if (!n || r->submitted < 2 || (r->submitted & 1) ||
+	    (r->shared ? !s->ra || r->completed < r->submitted ||
+		r->completed > r->observed_submitted : r->submitted != r->completed) ||
 	    r->render_copy_count > GPU_M4_DRM_RENDER_TIMESTAMPS ||
 	    !r->render_dependency_count || r->render_dependency_count > 3)
 		return -ESTALE;
 	memcpy(sample.pair.stage, observed ?: r->render, sizeof(sample.pair.stage));
 	sample.pair.uma_descriptor_fw = n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->fw_va;
-	sample.pair.uma_submitted_fw = n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x500;
-	sample.pair.expected_uma_slot = sample.pair.uma_slot = r->uma_slot;
+	sample.pair.uma_submitted_fw = r->shared ?
+		s->ra->bo[M4_RA_COUNTER]->fw_va + M4_RA_S_OFFSET :
+		n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x500;
+	sample.pair.expected_uma_slot = sample.pair.uma_slot = m4_user_native_receipt_fw_slot(r);
 	sample.pair.uma_submitted_before = r->submitted - 2;
 	sample.pair.uma_expected_submitted = sample.pair.uma_submitted = r->submitted;
+	sample.pair.uma_submitted_horizon = r->shared ? r->observed_submitted : 0;
 	sample.pair.uma_completed_high_before = sample.pair.uma_completed_high_after = r->completed >> 32;
 	sample.pair.uma_completed_low = r->completed;
 	sample.pair.copies = r->render_copies;
@@ -2477,7 +2961,7 @@ static int m4_user_native_render_receipt_pair_locked(struct m4_user_native_stage
 	sample.pair.dependencies = r->render_dependency;
 	sample.pair.dependency_count = r->render_dependency_count;
 	sample.pair.dependency_capacity = ARRAY_SIZE(r->render_dependency);
-	sample.pair.init_buffer = true;
+	sample.pair.init_buffer = r->shared ? r->init_buffer : true;
 	/* Mandatory callback proves actual committed CORE/cache provenance. */
 	sample.pair.rtkit_healthy = sample.pair.run_healthy = sample.pair.control_healthy = true;
 	sample.pair.binding_healthy = sample.pair.fault_drain_complete = true;
@@ -2527,7 +3011,8 @@ static int m4_user_native_history_check_locked(struct m4_user_native_stage *s)
 		const struct m4_user_native_receipt *r = &h->command[i];
 
 		if (r->type != s->command[i].type || r->type != view.batch->commands[i].type ||
-		    !r->submitted || r->submitted != r->completed)
+		    !r->submitted || (r->shared ? r->completed < r->submitted :
+			r->submitted != r->completed))
 			return M4_USER_WHY(-ESTALE, "native history receipt %u type=%u/%u/%u submitted=%llu completed=%llu",
 				i, r->type, s->command[i].type, view.batch->commands[i].type,
 				M4_WHY64(r->submitted), M4_WHY64(r->completed));
@@ -2540,7 +3025,9 @@ static int m4_user_native_history_check_locked(struct m4_user_native_stage *s)
 			ret = gpu_m4_compute_reuse_retired_prefixes(&r->compute);
 		} else if (r->type == DRM_ASAHI_CMD_RENDER) {
 			if (!m4_user_native_slot_valid(r->type, r->uma_slot) ||
-			    r->parameter_id != m4_user_native_slot_parameter(r->type, r->uma_slot) ||
+			    !m4_user_native_slot_valid(r->type, m4_user_native_receipt_fw_slot(r)) ||
+			    r->parameter_id != m4_user_native_slot_parameter(r->type,
+				m4_user_native_receipt_fw_slot(r)) ||
 			    (r->submitted & 1))
 				return M4_USER_WHY(-ESTALE, "native history receipt %u render slot=%u parameter=%u submitted=%llu",
 					i, r->uma_slot, r->parameter_id, M4_WHY64(r->submitted));
@@ -2713,9 +3200,13 @@ static int m4_user_native_reuse_history_locked(struct m4_user_native_stage *s,
 		ret = m4_user_native_history_command_locked(sb, ib, s->command[index].type, &rb);
 	if (ret)
 		return M4_USER_WHY(ret, "native reuse %u histories A=%u B=%u", index, ia, ib);
-	if (ra->uma_slot != rb->uma_slot || ra->parameter_id != rb->parameter_id ||
+	if (ra->uma_slot != rb->uma_slot ||
+	    ra->shared != rb->shared ||
 	    !m4_user_native_slot_valid(s->command[index].type, ra->uma_slot) ||
-	    ra->parameter_id != m4_user_native_slot_parameter(s->command[index].type, ra->uma_slot))
+	    ra->parameter_id != m4_user_native_slot_parameter(s->command[index].type,
+		m4_user_native_receipt_fw_slot(ra)) ||
+	    rb->parameter_id != m4_user_native_slot_parameter(s->command[index].type,
+		m4_user_native_receipt_fw_slot(rb)))
 		return M4_USER_WHY(-ESTALE, "native reuse %u slot A=%u/%u B=%u/%u", index, ra->uma_slot,
 			ra->parameter_id, rb->uma_slot, rb->parameter_id);
 	*origin = sa; *old_index = ia; *displacer = sb; *displacer_index = ib;
@@ -2914,7 +3405,7 @@ static bool m4_user_native_stage_release_locked(struct m4_gpu_provider_runtime *
 	for (u32 i = 0; i < s->bo_count; i++) {
 		if (!s->bo[i]) /* dropped after settlement */
 			continue;
-		if (!s->bo[i]->unit && s->bo[i]->upper)
+		if (!s->bo[i]->unit && !s->bo[i]->ra_owned && s->bo[i]->upper)
 			gpu_m4_drm_upper_put_locked(s->bo[i]->upper);
 		m4_user_native_bo_put_locked(s->bo[i]);
 	}
@@ -3361,7 +3852,12 @@ static int m4_user_native_unit_take(struct m4_user_native_stage *s, u32 index,
 		u32 nb = 0, nm = 0, ne = 0;
 		bool current_owner = false, last = step + 1 == total, retarget = pass >= passes;
 
-		if (u->queue != s->queue || u->command.type != command->type)
+		/* render_shared: a shared unit's allocator roles name its queue's
+		 * allocator, never a private one (and vice versa).
+		 */
+		if (u->queue != s->queue || u->command.type != command->type ||
+		    (command->type == DRM_ASAHI_CMD_RENDER &&
+		     (u->shared != !!s->ra || u->ra != s->ra)))
 			continue;
 		seen = true;
 		units += last;
@@ -3404,9 +3900,13 @@ static int m4_user_native_unit_take(struct m4_user_native_stage *s, u32 index,
 			ret = m4_user_native_history_command_locked(sb, u->displacement_index, command->type, &rb);
 		if (ret)
 			goto out;
-		if (ra->uma_slot != rb->uma_slot || ra->parameter_id != rb->parameter_id ||
+		if (ra->uma_slot != rb->uma_slot ||
+		    ra->shared != rb->shared ||
 		    !m4_user_native_slot_valid(command->type, ra->uma_slot) ||
-		    ra->parameter_id != m4_user_native_slot_parameter(command->type, ra->uma_slot) ||
+		    ra->parameter_id != m4_user_native_slot_parameter(command->type,
+			m4_user_native_receipt_fw_slot(ra)) ||
+		    rb->parameter_id != m4_user_native_slot_parameter(command->type,
+			m4_user_native_receipt_fw_slot(rb)) ||
 		    !u->bo_count || u->bo_count > ARRAY_SIZE(u->bo)) {
 			ret = -ESTALE;
 			goto out;
@@ -3651,9 +4151,13 @@ static int m4_user_native_cold_proof_locked(struct m4_user_native_unit *u)
 			u->displacement_index, type, &rb);
 	if (ret)
 		return ret;
-	if (ra->uma_slot != rb->uma_slot || ra->parameter_id != rb->parameter_id ||
+	if (ra->uma_slot != rb->uma_slot ||
+	    ra->shared != rb->shared ||
 	    !m4_user_native_slot_valid(type, ra->uma_slot) ||
-	    ra->parameter_id != m4_user_native_slot_parameter(type, ra->uma_slot))
+	    ra->parameter_id != m4_user_native_slot_parameter(type,
+		m4_user_native_receipt_fw_slot(ra)) ||
+	    rb->parameter_id != m4_user_native_slot_parameter(type,
+		m4_user_native_receipt_fw_slot(rb)))
 		return -ESTALE;
 	return 0;
 }
@@ -4197,7 +4701,8 @@ static void m4_user_native_witness_advance_locked(struct m4_gpu_provider_runtime
 			ra = &a->command[u->history_index];
 			rn = &nb->command[d->displacement_index];
 			if (ra->type != u->command.type || rn->type != ra->type ||
-			    rn->uma_slot != ra->uma_slot || rn->parameter_id != ra->parameter_id)
+			    rn->uma_slot != ra->uma_slot || rn->shared != ra->shared ||
+			    (!ra->shared && rn->parameter_id != ra->parameter_id))
 				break;
 			refcount_inc(&nb->refs);
 			u->displacement = nb;
@@ -5370,6 +5875,19 @@ static int m4_user_native_stage(void *owner, void *queue,
 		.object = s->notifier->bo->object, .size = s->notifier->bo->size,
 		.access = M4_USER_NATIVE_RW, .purpose = GPU_M4_DRM_PROVIDER_STAGE_FIRMWARE_METADATA,
 	};
+	/* render_shared: the queue's retained render allocator joins (or, for
+	 * its first render stage, is built by) every stage with a render.
+	 */
+	if (READ_ONCE(render_shared)) {
+		for (u32 i = 0; i < s->count; i++) {
+			if (view->batch->commands[i].type != DRM_ASAHI_CMD_RENDER)
+				continue;
+			ret = m4_user_render_alloc_stage(s, view->batch);
+			if (ret)
+				return ret;
+			break;
+		}
+	}
 	/* Warm whole-unit reuse first, then every NEW unit and its exact cell
 	 * credits are reserved together before any partial construction.
 	 */

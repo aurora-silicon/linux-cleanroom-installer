@@ -560,6 +560,11 @@ struct gpu_m4_render_pair_retirement {
 	/* Held global slot and actual descriptor +0x08 observation must agree. */
 	u32 expected_uma_slot, uma_slot;
 	u64 uma_submitted_before, uma_expected_submitted, uma_submitted;
+	/* Nonzero for a retained allocator shared by later pairs: the S it had
+	 * published when sampled. Completed may then pass this pair's S (later
+	 * pairs advance the same M), never this horizon.
+	 */
+	u64 uma_submitted_horizon;
 	/* Bounded nontearing capture of the packed descriptor+0x54 completed u64. */
 	u32 uma_completed_high_before, uma_completed_low, uma_completed_high_after;
 	const struct gpu_m4_render_retirement_copy *copies;
@@ -803,8 +808,22 @@ static inline int __gpu_m4_render_pair_retired(
 	    in->uma_completed_high_before != in->uma_completed_high_after)
 		return -EAGAIN;
 	completed = ((u64)in->uma_completed_high_after << 32) | in->uma_completed_low;
-	if (in->uma_submitted != in->uma_expected_submitted || completed != in->uma_expected_submitted)
+	if (in->uma_submitted != in->uma_expected_submitted)
 		return -EAGAIN;
+	if (in->uma_submitted_horizon) {
+		if ((in->uma_submitted_horizon & 1) ||
+		    in->uma_submitted_horizon < in->uma_expected_submitted)
+			return -EINVAL;
+		/* Stage completions of later pairs may count first; the stage
+		 * stamps below prove this pair's own TA and FS.
+		 */
+		if (completed < in->uma_expected_submitted)
+			return -EAGAIN;
+		if (completed > in->uma_submitted_horizon)
+			return -EPROTO;
+	} else if (completed != in->uma_expected_submitted) {
+		return -EAGAIN;
+	}
 	for (i = 0; i < 2; i++) {
 		ret = __gpu_m4_render_stage_retired(&in->stage[i], i, true);
 		if (ret)

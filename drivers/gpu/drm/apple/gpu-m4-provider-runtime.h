@@ -312,6 +312,8 @@ struct m4_user_asid {
 	u64 binds[3];
 };
 
+struct m4_user_render_alloc;
+
 struct m4_gpu_provider_runtime {
 	struct m4_gpu_hello *hello;
 	struct m4_gpu_ready *ready;
@@ -448,6 +450,14 @@ struct m4_gpu_provider_runtime {
 	 * lookup is O(1) instead of a walk of every retained unit.
 	 */
 	struct m4_user_native_unit *user_slot_unit[M4_USER_SLOT_TABLE];
+	/* render_shared: the retained render allocator holding each render
+	 * UMA ID / PB ID (slot), and slots released by a quiescent one (their
+	 * PB descriptor slice is a saved, released descriptor, not zero) or
+	 * quarantined (an allocator released without catch-up proof).
+	 */
+	struct m4_user_render_alloc *user_slot_alloc[M4_USER_SLOT_TABLE];
+	DECLARE_BITMAP(user_slot_released, M4_USER_SLOT_TABLE);
+	DECLARE_BITMAP(user_slot_quarantined, M4_USER_SLOT_TABLE);
 	struct m4_user_native_stage *user_last[3];
 	struct m4_user_probe *user_probe;
 	u64 user_client_id;

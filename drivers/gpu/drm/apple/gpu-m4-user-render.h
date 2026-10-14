@@ -9,6 +9,25 @@
  * another scheduler or lifetime. No MMIO, table/ring store, cache operation,
  * allocation or fence transition is performed here.
  */
+/* render_shared: command index runs on the queue's retained allocator. */
+static struct m4_user_render_alloc *m4_user_render_ra(const struct m4_user_job *j, u32 index)
+{
+	const struct m4_user_native_stage *s = j->native_stage;
+
+	return s && s->ra && index < s->count && s->unit[index] && s->unit[index]->shared &&
+		s->command[index].type == DRM_ASAHI_CMD_RENDER ? s->ra : NULL;
+}
+
+/* The firmware UMA ID (PB ID slot - 33) the command's works name: its
+ * allocator's, or the unit's own leased slot.
+ */
+static u32 m4_user_render_fw_slot(const struct m4_user_job *j, u32 index)
+{
+	const struct m4_user_render_alloc *ra = m4_user_render_ra(j, index);
+
+	return ra ? ra->slot : index < ARRAY_SIZE(j->cmd) ? j->cmd[index].uma_slot : 0;
+}
+
 enum m4_user_render_session_role {
 	M4_USER_RENDER_TA_ACTIVITY,
 	M4_USER_RENDER_FS_ACTIVITY,
@@ -457,7 +476,8 @@ static int m4_user_render_prepare_locked(struct m4_user_job *j, u32 index,
 		.uuid = res->chronology.target_stamp, .owner_cookie = out,
 		.check_owner = m4_user_render_owner_locked, .admission = &out->span_admission,
 	};
-	if (READ_ONCE(pb_fit)) {
+	/* A retained allocator's P keeps the capacity it was built with. */
+	if (READ_ONCE(pb_fit) && !m4_user_render_ra(j, index)) {
 		struct gpu_m4_exec_geometry geometry;
 		struct gpu_m4_render_pb_layout pb;
 

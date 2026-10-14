@@ -26,7 +26,7 @@ static int m4_user_render_session_locked(struct m4_user_job *j, u32 index, bool 
 	static const u32 size[] = { 0xc18, 0x1248, 0x24c0, 0x24c0, 16 };
 	struct m4_user_render_reservation *res = &j->render_reservation[index];
 	struct gpu_m4_render_ready_backing *owner = j->session + index * M4_USER_RENDER_SESSION_COUNT;
-	u32 slot = index < ARRAY_SIZE(j->cmd) ? j->cmd[index].uma_slot : 0;
+	u32 slot = m4_user_render_fw_slot(j, index);
 
 	if (!m4_user_native_slot_valid(DRM_ASAHI_CMD_RENDER, slot))
 		return -ESTALE;
@@ -456,6 +456,7 @@ static int m4_user_render_reservation_check_locked(struct m4_user_job *j, u32 in
 	const struct gpu_m4_render_packet_chronology *c, *tail;
 	struct gpu_m4_render_prior_dependency prior[2];
 	const struct m4_user_command *cmd;
+	struct m4_user_render_alloc *ra;
 	u64 before = 0, between = 0;
 	bool published;
 	int ret;
@@ -488,12 +489,26 @@ static int m4_user_render_reservation_check_locked(struct m4_user_job *j, u32 in
 	native = m4_user_native_render(j->native_stage, index);
 	if (!notifier || !native || !refcount_read(&notifier->refs) ||
 	    notifier != j->native_stage->notifier || res->notifier != notifier->bo ||
-	    res->uma_slot != cmd->uma_slot || res->completion_record[0] || res->completion_record[1])
+	    res->uma_slot != m4_user_render_fw_slot(j, index) ||
+	    res->completion_record[0] || res->completion_record[1])
 		return M4_USER_WHY(-ESTALE, "render reservation %u notifier=%d native=%d slot=%u/%u record=%u,%u",
 			index, !!notifier, !!native, res->uma_slot, cmd->uma_slot,
 			res->completion_record[0], res->completion_record[1]);
 	c = &res->chronology;
-	if (m4_user_native_reused(j->native_stage, index)) {
+	ra = m4_user_render_ra(j, index);
+	if (ra) {
+		/* The allocator's committed total when this render was prepared
+		 * (it has only grown since, by this queue's later renders).
+		 */
+		before = c->uma_submitted_before;
+		if ((!published && (before != ra->submitted ||
+				    c->init_buffer == ra->initialized)) ||
+		    (published && before + 2 > ra->submitted) ||
+		    c->init_buffer != res->initialize_pb)
+			return M4_USER_WHY(-ESTALE, "render reservation %u allocator before=%llu S=%llu init=%d/%d",
+				index, M4_WHY64(before), M4_WHY64(ra->submitted), c->init_buffer,
+				ra->initialized);
+	} else if (m4_user_native_reused(j->native_stage, index)) {
 		ret = m4_user_render_history_locked(j, index, &before);
 		if (ret)
 			return M4_USER_WHY(ret, "render reservation %u warm history", index);
@@ -501,11 +516,12 @@ static int m4_user_render_reservation_check_locked(struct m4_user_job *j, u32 in
 	ret = m4_user_render_prior_expected(j, index, prior);
 	if (ret)
 		return M4_USER_WHY(ret, "render reservation %u prior", index);
-	if (c->parameter_id != m4_user_native_slot_parameter(DRM_ASAHI_CMD_RENDER, cmd->uma_slot) ||
+	if (c->parameter_id != m4_user_native_slot_parameter(DRM_ASAHI_CMD_RENDER,
+		m4_user_render_fw_slot(j, index)) ||
 	    !c->target_stamp || (c->target_stamp & 0xff) ||
 	    !m4_user_render_prior_same(&c->prior[0], &prior[0]) ||
-	    !m4_user_render_prior_same(&c->prior[1], &prior[1]) || !c->init_buffer ||
-	    !res->initialize_pb || c->uma_submitted_before != before ||
+	    !m4_user_render_prior_same(&c->prior[1], &prior[1]) ||
+	    (!ra && (!c->init_buffer || !res->initialize_pb)) || c->uma_submitted_before != before ||
 	    c->uma_completed_before != before || c->uma_submitted != before + 2 ||
 	    c->engine[1].counter > ~0ULL - 1 ||
 	    c->engine[0].counter != c->engine[1].counter + 1 ||
@@ -670,6 +686,109 @@ static int m4_user_render_warm_locked(struct m4_user_job *j, u32 index)
 	    completed != before ||
 	    m4_store_read64(n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->map.vaddr + 0x500) != before)
 		return -ESTALE;
+	return 0;
+}
+
+/* render_shared: the allocator's M/P are this command's. The first render
+ * builds M (owner anchor +0 = M's own FWVA, +8 the allocator's UMA ID, +0x4c
+ * its S cell, render policy +0x5c 0) and finds M, P and the lists fresh;
+ * later renders find that same M and an initialized P, preserved as the
+ * firmware left them.
+ */
+static int m4_user_render_ra_backing_locked(struct m4_user_job *j, u32 index,
+	struct m4_user_render_alloc *ra, bool init, u8 descriptor[0xa0])
+{
+	const struct m4_user_render_native *n = m4_user_native_render(j->native_stage, index);
+	struct m4_user_render_packet *packet = &j->render[index];
+	struct gpu_m4_exec_vm vm = { .start = GPU_M4_DRM_UAT_PRIVATE_START,
+		.end = GPU_M4_DRM_UAT_PRIVATE_END, .cookie = &packet->input,
+		.check = gpu_m4_render_native_range };
+	struct m4_user_native_bo *m = ra->bo[M4_RA_UMA], *counter = ra->bo[M4_RA_COUNTER];
+	void *uma;
+	u64 s_cell;
+	int ret;
+
+	if (!n || index >= ARRAY_SIZE(j->cmd) || j->cmd[index].published ||
+	    n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU] != m || n->manager != ra->bo[M4_RA_MANAGER] ||
+	    n->parameter_heap != ra->bo[M4_RA_HEAP] ||
+	    n->firmware[GPU_M4_RENDER_FIRST_PB_COUNTER_FW] != counter ||
+	    n->gpu[GPU_M4_RENDER_FIRST_PB_LIST_GPU] != ra->bo[M4_RA_PB_LIST] ||
+	    n->firmware[GPU_M4_RENDER_FIRST_PB_BLOCKS_FW] != ra->bo[M4_RA_PB_BLOCKS] ||
+	    n->firmware[GPU_M4_RENDER_FIRST_PB_RING_FW] != ra->bo[M4_RA_PB_RING] ||
+	    init != !ra->initialized)
+		return M4_USER_WHY(-ESTALE, "allocator backing %u roles init=%d/%d", index, init,
+			ra->initialized);
+	uma = m->map.vaddr;
+	s_cell = counter->fw_va + M4_RA_S_OFFSET;
+	if (init) {
+		if (memchr_inv(uma, 0, 0x4000) ||
+		    memchr_inv(n->manager->map.vaddr, 0, GPU_M4_RENDER_PARAMETER_MANAGER_SIZE) ||
+		    memchr_inv(n->gpu[GPU_M4_RENDER_FIRST_PB_LIST_GPU]->map.vaddr, 0,
+			packet->scratch.state.pb.page_list_size) ||
+		    memchr_inv(n->firmware[GPU_M4_RENDER_FIRST_PB_BLOCKS_FW]->map.vaddr, 0,
+			packet->scratch.state.pb.block_list_size) ||
+		    memchr_inv(n->firmware[GPU_M4_RENDER_FIRST_PB_RING_FW]->map.vaddr, 0, 8) ||
+		    memchr_inv(counter->map.vaddr, 0, 0x100) || ra->submitted || ra->scenes)
+			return M4_USER_WHY(-ESTALE, "allocator backing %u not fresh uma=%d p=%d list=%d blocks=%d ring=%d cells=%d S=%llu X=%u",
+				index, !!memchr_inv(uma, 0, 0x4000),
+				!!memchr_inv(n->manager->map.vaddr, 0, GPU_M4_RENDER_PARAMETER_MANAGER_SIZE),
+				!!memchr_inv(n->gpu[GPU_M4_RENDER_FIRST_PB_LIST_GPU]->map.vaddr, 0,
+					packet->scratch.state.pb.page_list_size),
+				!!memchr_inv(n->firmware[GPU_M4_RENDER_FIRST_PB_BLOCKS_FW]->map.vaddr, 0,
+					packet->scratch.state.pb.block_list_size),
+				!!memchr_inv(n->firmware[GPU_M4_RENDER_FIRST_PB_RING_FW]->map.vaddr, 0, 8),
+				!!memchr_inv(counter->map.vaddr, 0, 0x100), M4_WHY64(ra->submitted),
+				ra->scenes);
+		ret = gpu_m4_exec_uma_descriptor(descriptor, &vm, n->work[0]->fw_va, s_cell,
+			n->gpu[GPU_M4_RENDER_FIRST_POOL_STATE_GPU]->va,
+			n->gpu[GPU_M4_RENDER_FIRST_UMA_LIST_GPU]->va);
+		if (ret)
+			return gpu_m4_render_native_status(ret);
+		put_unaligned_le64(m->fw_va, descriptor);
+		put_unaligned_le32(ra->slot, descriptor + 8);
+		put_unaligned_le32(0, descriptor + 0x5c);
+		return 0;
+	}
+	if (m4_store_read64(uma) != m->fw_va || m4_ready_read32(uma + 8) != ra->slot ||
+	    m4_ready_read32(uma + 0x5c) || m4_store_read64(uma + 0x4c) != s_cell ||
+	    m4_store_read64(counter->map.vaddr + M4_RA_S_OFFSET) != ra->submitted ||
+	    m4_ready_read32(counter->map.vaddr) != ra->scenes ||
+	    m4_store_read64(n->manager->map.vaddr + 0x64) != counter->fw_va ||
+	    m4_ready_read32(n->manager->map.vaddr + 0xc) !=
+		m4_user_native_slot_parameter(DRM_ASAHI_CMD_RENDER, ra->slot))
+		return M4_USER_WHY(-ESTALE, "allocator backing %u M %#llx/%#llx slot %u/%u policy %u S-cell %#llx/%#llx S %llu/%llu X %u/%u P+0x64 %#llx P+0xc %u",
+			index, M4_WHY64(m4_store_read64(uma)), M4_WHY64(m->fw_va),
+			m4_ready_read32(uma + 8), ra->slot, m4_ready_read32(uma + 0x5c),
+			M4_WHY64(m4_store_read64(uma + 0x4c)), M4_WHY64(s_cell),
+			M4_WHY64(m4_store_read64(counter->map.vaddr + M4_RA_S_OFFSET)),
+			M4_WHY64(ra->submitted), m4_ready_read32(counter->map.vaddr), ra->scenes,
+			M4_WHY64(m4_store_read64(n->manager->map.vaddr + 0x64)),
+			m4_ready_read32(n->manager->map.vaddr + 0xc));
+	return 0;
+}
+
+/* render_shared: the allocator holds its UMA ID / PB ID; its first lease
+ * needs a fresh or allocator-released PB descriptor slice.
+ */
+static int m4_user_render_ra_slot_locked(struct m4_user_job *j, struct m4_user_render_alloc *ra,
+	bool init)
+{
+	struct m4_gpu_provider_runtime *p = j->runtime;
+
+	if (!m4_user_native_slot_valid(DRM_ASAHI_CMD_RENDER, ra->slot) ||
+	    p->user_slot_alloc[ra->slot] != ra || test_bit(ra->slot, p->user_slot_quarantined))
+		return M4_USER_WHY(-ESTALE, "allocator slot %u owner=%d quarantined=%d", ra->slot,
+			ra->slot < M4_USER_SLOT_TABLE && p->user_slot_alloc[ra->slot] == ra,
+			ra->slot < M4_USER_SLOT_TABLE && test_bit(ra->slot, p->user_slot_quarantined));
+	/* A slot released by a quiescent allocator keeps its old PB descriptor;
+	 * the first InitBuffer fully rebuilds it.
+	 */
+	if (init && !ra->slot_reused &&
+	    memchr_inv(p->ready->buffer[GPU_M4_PARAMETER].cpu +
+		GPU_M4_RENDER_PARAMETER_DESCRIPTOR_SIZE *
+		m4_user_native_slot_parameter(DRM_ASAHI_CMD_RENDER, ra->slot), 0,
+		GPU_M4_RENDER_PARAMETER_DESCRIPTOR_SIZE))
+		return M4_USER_WHY(-ESTALE, "allocator slot %u PB descriptor in use", ra->slot);
 	return 0;
 }
 
@@ -978,7 +1097,8 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 	u64 ta[3], fs[3], target, before = 0;
 	const char *phase = "packet-prepare";
 	u32 count = 0, fs_count = 0;
-	bool warm, join = j->wire_open != 0;
+	struct m4_user_render_alloc *ra;
+	bool warm, init, join = j->wire_open != 0;
 	int ret;
 
 	lockdep_assert_held(&p->hello->gpu->lock);
@@ -999,7 +1119,13 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 		return M4_USER_WHY(-ESTALE, "render publish %u native=%d notifier=%d", index, !!n,
 			!!notifier);
 	warm = m4_user_native_reused(j->native_stage, index);
-	if (warm) {
+	ra = m4_user_render_ra(j, index);
+	init = !ra || !ra->initialized;
+	if (ra) {
+		before = ra->submitted;
+		if (before > ~0ULL - 2 || ra->scenes == U32_MAX)
+			return -EOVERFLOW;
+	} else if (warm) {
 		ret = m4_user_render_history_locked(j, index, &before);
 		if (ret)
 			return M4_USER_WHY(ret, "render publish %u warm history", index);
@@ -1012,11 +1138,12 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 		return -EOVERFLOW; /* Stop before unsupported signed-counter wrap. */
 	target += 0x100;
 	*res = (struct m4_user_render_reservation) {
-		.notifier = notifier->bo, .uma_slot = cmd->uma_slot, .initialize_pb = true,
+		.notifier = notifier->bo, .uma_slot = m4_user_render_fw_slot(j, index),
+		.initialize_pb = init,
 		.chronology = { .uma_submitted_before = before, .uma_completed_before = before,
-			.uma_submitted = before + 2, .target_stamp = target, .init_buffer = true,
+			.uma_submitted = before + 2, .target_stamp = target, .init_buffer = init,
 			.parameter_id = m4_user_native_slot_parameter(DRM_ASAHI_CMD_RENDER,
-				cmd->uma_slot) },
+				m4_user_render_fw_slot(j, index)) },
 	};
 	for (u32 e = 0; e < 2; e++)
 		res->chronology.engine[e] = (struct gpu_m4_render_engine_chronology) {
@@ -1036,7 +1163,10 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 	memset(cmd->wire, 0, sizeof(cmd->wire)); cmd->engine_mask = 0;
 	if (res->chronology.prior[0].firmware.va)
 		ta[count++] = res->chronology.prior[0].firmware.va;
-	ta[count++] = n->owner.init_buffer.span.va; ta[count++] = n->work[0]->fw_va;
+	/* A retained, initialized allocator's P needs no PB-control entry. */
+	if (init)
+		ta[count++] = n->owner.init_buffer.span.va;
+	ta[count++] = n->work[0]->fw_va;
 	/* Early tiling: the FS strict wait on the previous FS comes first. */
 	if (res->chronology.prior[1].firmware.va)
 		fs[fs_count++] = res->chronology.prior[1].firmware.va;
@@ -1059,13 +1189,15 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 		m4_user_render_dump(j, index, packet);
 #endif
 	if (!ret) {
-		phase = warm ? "warm-backing" : "fresh-backing";
-		ret = warm ? m4_user_render_warm_locked(j, index) :
+		phase = ra ? "allocator-backing" : warm ? "warm-backing" : "fresh-backing";
+		ret = ra ? m4_user_render_ra_backing_locked(j, index, ra, init, descriptor) :
+			warm ? m4_user_render_warm_locked(j, index) :
 			m4_user_render_fresh_locked(j, index, descriptor);
 	}
 	if (!ret) {
 		phase = "predecessor-slot";
-		ret = m4_user_render_slot_locked(j, index);
+		ret = ra ? m4_user_render_ra_slot_locked(j, ra, init) :
+			m4_user_render_slot_locked(j, index);
 	}
 	if (!ret) {
 		phase = "wire-check";
@@ -1076,7 +1208,7 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 	/* The strict wait is this render's own scene metadata subrecord, covered
 	 * by its actual protected cache/resv owner, complete before any producer.
 	 */
-	if (!ret && count == 3 &&
+	if (!ret && res->chronology.prior[0].firmware.va &&
 	    (get_unaligned_le32(packet->bytes.prior_dependency[0] + 0x3c) !=
 	     !res->chronology.prior[0].relaxed ||
 	     memcmp(packet->bytes.scene + 0x380, packet->bytes.prior_dependency[0],
@@ -1109,22 +1241,39 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 	cmd->published = true;
 	cmd->final_target = res->chronology.target_stamp;
 	j->published_count++;
-	if (!warm)
+	if (ra ? init : !warm)
 		memcpy(n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->map.vaddr, descriptor, sizeof(descriptor));
 	/* Fresh UMA auxiliary records stay zero, as in the qualified initializer.
 	 * Start/work contain their checked GPU/FW aliases; they are not scratch
 	 * pointer records and must not be reconstructed once firmware mutates them.
+	 * A retained allocator's P, lists and ring are written once, with its
+	 * first (InitBuffer) render, and then left as the firmware keeps them.
 	 */
-	memcpy(n->manager->map.vaddr, packet->parameter_manager, sizeof(packet->parameter_manager));
-	memcpy(n->gpu[GPU_M4_RENDER_FIRST_PB_LIST_GPU]->map.vaddr, packet->pb_pages,
-		packet->scratch.state.pb.page_list_size);
-	memcpy(n->firmware[GPU_M4_RENDER_FIRST_PB_BLOCKS_FW]->map.vaddr, packet->pb_blocks,
-		packet->scratch.state.pb.block_list_size);
-	memcpy(n->firmware[GPU_M4_RENDER_FIRST_PB_RING_FW]->map.vaddr, packet->pb_ring, 8);
-	/* This is the retired/displaced private manager's full rebuild, paired
-	 * with InitBuffer, NOT a reset of the persistent UMA counter/cursors.
+	if (init) {
+		memcpy(n->manager->map.vaddr, packet->parameter_manager,
+			sizeof(packet->parameter_manager));
+		memcpy(n->gpu[GPU_M4_RENDER_FIRST_PB_LIST_GPU]->map.vaddr, packet->pb_pages,
+			packet->scratch.state.pb.page_list_size);
+		memcpy(n->firmware[GPU_M4_RENDER_FIRST_PB_BLOCKS_FW]->map.vaddr, packet->pb_blocks,
+			packet->scratch.state.pb.block_list_size);
+		memcpy(n->firmware[GPU_M4_RENDER_FIRST_PB_RING_FW]->map.vaddr, packet->pb_ring, 8);
+		/* This is the retired/displaced private manager's full rebuild, paired
+		 * with InitBuffer, NOT a reset of the persistent UMA counter/cursors.
+		 */
+		memset(n->firmware[GPU_M4_RENDER_FIRST_PB_COUNTER_FW]->map.vaddr, 0, 0x40);
+	}
+	/* render_shared: publish this scene and pair in the allocator's
+	 * cumulative X and S before anything becomes reachable.
 	 */
-	memset(n->firmware[GPU_M4_RENDER_FIRST_PB_COUNTER_FW]->map.vaddr, 0, 0x40);
+	if (ra) {
+		void *cells = ra->bo[M4_RA_COUNTER]->map.vaddr;
+
+		ra->initialized = true;
+		ra->scenes++;
+		ra->submitted += 2;
+		m4_ready_write32(cells, ra->scenes);
+		put_unaligned_le64(ra->submitted, cells + M4_RA_S_OFFSET);
+	}
 	/* The scene image carries InitBuffer +0x300, own-TA wait +0x340, the
 	 * strict prior wait +0x380 and the submitted counter +0x500.
 	 */
@@ -1199,7 +1348,7 @@ static int m4_user_render_stage_sample_locked(struct m4_user_job *j, u32 index,
 	struct gpu_m4_render_stage_retirement s = {
 		.notifier_fw = j->queue->notifier->bo->fw_va,
 		.uma_descriptor_fw = n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->fw_va,
-		.uma_slot = j->cmd[index].uma_slot,
+		.uma_slot = m4_user_render_fw_slot(j, index),
 		.reservation_sequence = c->engine[engine].reservation_sequence,
 		.expected_threshold = c->engine[engine].threshold_to_publish,
 		.threshold = m4_store_read64(notifier + 0x600 + engine * 8),
@@ -1344,6 +1493,8 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 	u64 completed, counter;
 	struct m4_user_render_pair_sample sample = { .job = j, .index = index };
 	struct m4_user_native_receipt *receipt;
+	struct m4_user_render_alloc *ra;
+	u64 s_cell, s_value = 0;
 	u32 slot, tail;
 	bool physical, notified;
 	int ret;
@@ -1352,7 +1503,8 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 	    index >= ARRAY_SIZE(j->cmd) || index != j->completed_count ||
 	    !j->cmd[index].published || j->cmd[index].receipt || j->cmd[index].engine_mask != 3)
 		return -ESTALE;
-	slot = j->cmd[index].uma_slot;
+	ra = m4_user_render_ra(j, index);
+	slot = m4_user_render_fw_slot(j, index);
 	packet = &j->render[index]; n = m4_user_native_render(j->native_stage, index);
 	if (!n || packet->native != n || !j->native_stage->pending ||
 	    j->native_stage->pending->job != j->core_job || j->native_stage->pending->complete ||
@@ -1389,12 +1541,33 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 		ret = m4_store_packed64(uma + 0x54, &completed);
 	if (ret)
 		return ret;
+	/* render_shared: M's S cell is the allocator's, published cumulatively
+	 * by this and later renders; this pair retired once M completed passed
+	 * its own S, bounded by everything the allocator has published.
+	 */
+	s_cell = ra ? ra->bo[M4_RA_COUNTER]->fw_va + M4_RA_S_OFFSET :
+		n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x500;
 	if (m4_store_read64(uma) != n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->fw_va ||
-	    m4_ready_read32(uma + 8) != slot || m4_ready_read32(uma + 0x5c) ||
-	    counter != n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x500)
-		return -ESTALE;
-	if (m4_store_read64(scene + 0x500) != c->uma_submitted || completed != c->uma_submitted)
+	    m4_ready_read32(uma + 8) != slot || m4_ready_read32(uma + 0x5c) || counter != s_cell ||
+	    (ra && (n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU] != ra->bo[M4_RA_UMA] ||
+		    c->uma_submitted > ra->submitted)))
+		return M4_USER_WHY(-ESTALE, "render retire %u M %#llx slot %u/%u policy %u S-cell %#llx/%#llx shared=%d",
+			index, M4_WHY64(m4_store_read64(uma)), m4_ready_read32(uma + 8), slot,
+			m4_ready_read32(uma + 0x5c), M4_WHY64(counter), M4_WHY64(s_cell), !!ra);
+	if (ra) {
+		s_value = m4_store_read64(ra->bo[M4_RA_COUNTER]->map.vaddr + M4_RA_S_OFFSET);
+		if (s_value != ra->submitted)
+			return M4_USER_WHY(-ESTALE, "render retire %u S %llu/%llu", index,
+				M4_WHY64(s_value), M4_WHY64(ra->submitted));
+		if (completed < c->uma_submitted)
+			return -EAGAIN;
+		if (completed > s_value)
+			return M4_USER_WHY(-EPROTO, "render retire %u completed %llu > S %llu", index,
+				M4_WHY64(completed), M4_WHY64(s_value));
+	} else if (m4_store_read64(scene + 0x500) != c->uma_submitted ||
+		   completed != c->uma_submitted) {
 		return -EAGAIN;
+	}
 	/* Both exact frozen operation streams remain retained through success.
 	 * They contain every requested endpoint/copy; no CPU readback substitutes
 	 * for their completed hardware sequence.
@@ -1511,6 +1684,7 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 	sample.pair.expected_uma_slot = sample.pair.uma_slot = slot;
 	sample.pair.uma_submitted_before = c->uma_submitted_before;
 	sample.pair.uma_expected_submitted = sample.pair.uma_submitted = c->uma_submitted;
+	sample.pair.uma_submitted_horizon = s_value;
 	sample.pair.uma_completed_high_before = sample.pair.uma_completed_high_after = completed >> 32;
 	sample.pair.uma_completed_low = completed;
 	sample.pair.copies = sample.copies;
@@ -1526,7 +1700,11 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 	sample.pair.binding_healthy = sample.pair.fault_drain_complete = true;
 	ret = gpu_m4_render_pair_hardware_retired(&sample.pair, &sample, m4_user_render_pair_owner_locked);
 	if (ret)
-		return ret;
+		return M4_USER_WHY(ret, "render retire %u pair S %llu..%llu completed %llu horizon %llu init=%d deps=%u entries=%u,%u",
+			index, M4_WHY64(c->uma_submitted_before), M4_WHY64(c->uma_submitted),
+			M4_WHY64(completed), M4_WHY64(s_value), c->init_buffer,
+			sample.pair.dependency_count, sample.pair.stage[0].queue_entries,
+			sample.pair.stage[1].queue_entries);
 	/* Raw observations, including the horizon they were taken within. */
 	receipt = &j->native_stage->pending->command[index];
 	memcpy(receipt->render, sample.pair.stage, sizeof(receipt->render));
@@ -1534,7 +1712,14 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 	receipt->render_dependency_count = sample.pair.dependency_count;
 	memcpy(receipt->render_copies, sample.copies, sizeof(receipt->render_copies));
 	receipt->render_copy_count = sample.pair.copy_count;
-	receipt->uma_slot = slot;
+	/* A shared render's receipt keeps its unit's host slot token; the
+	 * firmware slot and PB ID are its allocator's.
+	 */
+	receipt->uma_slot = j->cmd[index].uma_slot;
+	receipt->fw_slot = slot;
+	receipt->shared = !!ra;
+	receipt->init_buffer = c->init_buffer;
+	receipt->observed_submitted = s_value;
 	receipt->parameter_id = c->parameter_id;
 	receipt->submitted = c->uma_submitted;
 	receipt->completed = completed;

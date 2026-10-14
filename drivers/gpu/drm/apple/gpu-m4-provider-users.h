@@ -27,6 +27,7 @@ struct m4_user_vm {
 
 static void m4_user_native_prebuild_work(struct work_struct *work);
 static void m4_user_native_prebuild_start_locked(struct m4_user_queue *q);
+static void m4_user_render_alloc_release_locked(struct m4_user_queue *q);
 
 struct m4_user_queue {
 	struct list_head garbage, handle_put, native_idle, units;
@@ -34,6 +35,10 @@ struct m4_user_queue {
 	struct m4_user_vm *vm;
 	struct gpu_m4_drm_provider_queue *provider_queue;
 	struct m4_user_notifier *notifier;
+	/* render_shared: this queue's retained render allocator, created by its
+	 * first render stage and released with the queue.
+	 */
+	struct m4_user_render_alloc *render_alloc;
 	u64 usc_base, client_id, native_idle_bytes;
 	u32 priority; /* DRM_ASAHI_PRIORITY_*, privilege checked by the frontend */
 	u32 execution_window; /* commands per child window, fixed at creation */
@@ -431,6 +436,8 @@ static void m4_user_reap_work(struct work_struct *work)
 		if (!list_empty(&p->user_queue_garbage)) {
 			q = list_first_entry(&p->user_queue_garbage, struct m4_user_queue, garbage);
 			list_del_init(&q->garbage);
+			/* No stage or unit of the queue remains. */
+			m4_user_render_alloc_release_locked(q);
 			m4_user_notifier_put_locked(q->notifier);
 			m4_user_vm_put_locked(q->vm);
 			mutex_unlock(lock);
