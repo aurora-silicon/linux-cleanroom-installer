@@ -27,6 +27,7 @@
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/math64.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -252,6 +253,27 @@ static unsigned int notifier_cached = 2;
 module_param(notifier_cached, uint, 0444);
 MODULE_PARM_DESC(notifier_cached, "Map notifiers ASC-cached (firmware AttrIndex 0, firmware-only): bit 0 compute, bit 1 render (default 2); others AttrIndex 2");
 
+/*
+ * Allocator managers (manager_cached): the compute and render UMA managers
+ * (firmware + GPU class), the PB manager, its block control and the misc
+ * record (firmware-only) are firmware-owned once initialized. UMA install
+ * and catch-up clean and invalidate the manager's first 0x70 bytes, the FS
+ * catch-up the PB manager's first 0x80; the GPU allocates through the
+ * descriptors the firmware installs from them, never through their own
+ * addresses. Mapped AttrIndex 0 (each keeping its access class), they are
+ * written by the host only before their first exposure. After a recovered
+ * render abort the render allocator state is rebuilt, and a cached set the
+ * ASC may still hold dirty lines of is never rewritten: the first rebuild
+ * moves to a spare set allocated with the graph (fresh pages and
+ * addresses, AttrIndex 2, with its own UMA/PB counters and scene list) and
+ * retains the old one until reboot; later rebuilds rewrite that uncached
+ * spare in place, as all rebuilds did before. block_ctl reads in reports
+ * are then only diagnostics.
+ */
+static bool manager_cached = true;
+module_param(manager_cached, bool, 0444);
+MODULE_PARM_DESC(manager_cached, "Map the UMA managers, PB manager, block control and misc records ASC-cached (firmware AttrIndex 0); 0: AttrIndex 2");
+
 static unsigned int resnap_us = 100;
 module_param(resnap_us, uint, 0644);
 MODULE_PARM_DESC(resnap_us, "Completion re-check interval while a command is published, 25..1000 us (EP0x20 events wake earlier)");
@@ -344,6 +366,15 @@ struct g15_render {
 	u32 pass_busy;		/* pass slots held by published or prepared prefixes */
 	u32 pass_cursor;	/* next small pass slot (1..slots-1) to try */
 	bool reinit;		/* re-initialize allocators + InitBM before the next render */
+	/*
+	 * manager_cached: the never-exposed uncached allocator set the first
+	 * rebuild moves to; afterwards it retains the replaced cached set.
+	 */
+	struct {
+		struct g15_buf uma_mgr[2], uma_counter[2];
+		struct g15_buf block_ctl, pb_counter, mgr_misc, scene_list, pb_mgr;
+	} spare;
+	bool spare_ready;
 	u64 draw;		/* cumulative host draw ordinal of the last publication */
 	bool registered, c1_written;
 };
@@ -640,6 +671,14 @@ static u64 g15_notifier_class(u32 bit)
 	return notifier_cached & bit ? G15_PTE_FW_CACHED : G15_PTE_FW;
 }
 
+/* Allocator managers: their index-2 class, or its AttrIndex 0 twin (manager_cached). */
+static u64 g15_manager_class(u64 attr)
+{
+	if (!manager_cached)
+		return attr;
+	return attr == G15_PTE_SHARED ? G15_PTE_SHARED_CACHED : G15_PTE_FW_CACHED;
+}
+
 /* Queue scratch: firmware-private cached, or the previous shared index-2 class. */
 static u64 g15_queue_scratch(void)
 {
@@ -660,7 +699,7 @@ static int g15_graph_alloc(struct g15_backend *be)
 	ret = ret ?: g15_buf_alloc(be, &g->freelist, 0x400000, sh, G15_FREELIST_GVA, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->pool_table, 0x1000, sh, G15_POOL_TABLE_PAGE,
 				   G15_POOL_TABLE_OFF, false);
-	ret = ret ?: g15_buf_alloc(be, &g->manager, 0x84, sh, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &g->manager, 0x84, g15_manager_class(sh), 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->counter, 0x40, sh, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->sched_ctx, 0x40, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->notifier, 0x108, g15_notifier_class(1), 0, 0, false);
@@ -783,7 +822,8 @@ static int g15_render_alloc(struct g15_backend *be)
 					   G15_UMA_FREELIST_GVA(e), 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->pool_table[e], 0x1000, sh,
 					   G15_UMA_TABLE_PAGE(e), 0x3000, false);
-		ret = ret ?: g15_buf_alloc(be, &r->uma_mgr[e], 0x84, sh, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &r->uma_mgr[e], 0x84, g15_manager_class(sh), 0, 0,
+					   false);
 		ret = ret ?: g15_buf_alloc(be, &r->uma_counter[e], 0x40, sh, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->qinfo[e], 0xb4, cfw, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->qstate[e], 0x60, fw, 0, 0, false);
@@ -797,11 +837,24 @@ static int g15_render_alloc(struct g15_backend *be)
 	ret = ret ?: g15_buf_alloc(be, &r->notifier, 0x108, g15_notifier_class(2), 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->threshold, 4, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->job_list, 0x18, cfw, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &r->block_ctl, 0x40, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &r->block_ctl, 0x40, g15_manager_class(fw), 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->pb_counter, 0x40, fw, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &r->mgr_misc, 0x40, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &r->mgr_misc, 0x40, g15_manager_class(fw), 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->scene_list, 0xc0, sh, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &r->pb_mgr, 0xac, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &r->pb_mgr, 0xac, g15_manager_class(fw), 0, 0, false);
+	/* The uncached spare set for the first rebuild after an abort (manager_cached). */
+	for (u32 e = 0; manager_cached && !ret && e < 2; e++) {
+		ret = g15_buf_alloc(be, &r->spare.uma_mgr[e], 0x84, sh, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &r->spare.uma_counter[e], 0x40, sh, 0, 0, false);
+	}
+	if (manager_cached) {
+		ret = ret ?: g15_buf_alloc(be, &r->spare.block_ctl, 0x40, fw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &r->spare.pb_counter, 0x40, fw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &r->spare.mgr_misc, 0x40, fw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &r->spare.scene_list, 0xc0, sh, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &r->spare.pb_mgr, 0xac, fw, 0, 0, false);
+		r->spare_ready = !ret;
+	}
 	ret = ret ?: g15_buf_alloc(be, &r->legacy_empty, 0x40, sh, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->initbm, 0x20, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->pb_pages, 0x28000, sh, G15_PB_PAGE_LIST_GVA, 0, false);
@@ -930,6 +983,29 @@ static void g15_render_pools_init(struct g15_backend *be)
 	g15_buf_w32(&r->mgr_misc, 0x20, 1);
 	g15_buf_w32(&r->pb_counter, 0, 1);
 	wmb();
+}
+
+/*
+ * First rebuild after an abort with cached managers: the cached set may
+ * still have dirty lines in the ASC, so it is retained untouched and the
+ * graph moves to the never-exposed uncached spare (and its own counters
+ * and scene list), which g15_render_pools_init() then initializes.
+ */
+static void g15_render_take_spare(struct g15_backend *be)
+{
+	struct g15_render *r = &be->r;
+
+	for (u32 e = 0; e < 2; e++) {
+		swap(r->uma_mgr[e], r->spare.uma_mgr[e]);
+		swap(r->uma_counter[e], r->spare.uma_counter[e]);
+	}
+	swap(r->block_ctl, r->spare.block_ctl);
+	swap(r->pb_counter, r->spare.pb_counter);
+	swap(r->mgr_misc, r->spare.mgr_misc);
+	swap(r->scene_list, r->spare.scene_list);
+	swap(r->pb_mgr, r->spare.pb_mgr);
+	r->spare_ready = false;
+	dev_info(be->gpu->dev, "render allocators moved to a fresh uncached set; the cached set is retained\n");
 }
 
 static void g15_render_init(struct g15_backend *be)
@@ -2626,6 +2702,8 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 			goto out;
 		/* After a recovered render abort the allocator state is not trusted. */
 		if (r->reinit) {
+			if (r->spare_ready)
+				g15_render_take_spare(be);
 			g15_render_pools_init(be);
 			dev_info(gpu->dev, "render allocators re-initialized; InitBM at draw %llu\n",
 				 r->draw + 1);
@@ -2833,6 +2911,7 @@ static void g15_report(struct g15_backend *be, const char *what)
 			 g15_buf_r32(&r->qstate[1], 0x30), g15_buf_r32(&r->qstate[1], 0x40),
 			 be->fs_head, g15_r32(gpu, G15_CH_STATE(1)), g15_r32(gpu, G15_CH_STATE(1) + 0x20),
 			 atomic_read(&gpu->stage_events), be->stage_seen,
+			 /* block_ctl: possibly stale with manager_cached (diagnostic only) */
 			 g15_buf_r32(&r->pb_counter, 0), g15_buf_r32(&r->block_ctl, 0),
 			 g15_buf_r32(&r->block_ctl, 4));
 	}
