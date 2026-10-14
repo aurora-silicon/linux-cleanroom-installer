@@ -47,6 +47,23 @@ MODULE_PARM_DESC(enable, "Permit the watchdog-guarded T6030 GPU firmware start")
  * after startup is re-imported (DEVCTL 0x13).
  */
 static struct g15_gpu *g15_idle_gpu;	/* the started GPU, for runtime writes */
+
+/*
+ * HardwareData's first two pages hold HardwareDataB, the tiler/fragment/
+ * compute activity records (+0x1880/+0x24c0/+0x3740) that every Start and
+ * Finalize of the matching engine reads and updates, and the head of
+ * HardwareDataA. After initdata only the firmware touches them: the host
+ * writes them before the firmware starts and never reads them again, and the
+ * GPU has no access (firmware-only class). Map those pages with firmware
+ * AttrIndex 0 (inner+outer write-back for the ASC) instead of 2 (inner
+ * non-cacheable); the last page, with the fault information (+0x8900) and the
+ * HardwareDataA timestamps the host may read, keeps AttrIndex 2.
+ */
+#define G15_HWDATA_CACHED	(ALIGN(G15_HWDATA + 1, G15_PAGE) + G15_PAGE - G15_HWDATA)
+
+static bool hwdata_cached = true;
+module_param(hwdata_cached, bool, 0444);
+MODULE_PARM_DESC(hwdata_cached, "Map the HardwareData pages holding HardwareDataB and the engine activity records ASC-cached (firmware AttrIndex 0); 0: AttrIndex 2");
 static unsigned int idle_standby_us = 2500;
 static unsigned int idle_min_conf = 500;	/* permille */
 
@@ -977,11 +994,18 @@ static int g15_build(struct g15_gpu *gpu)
 	u8 *hw = NULL, *glob = NULL, *power = NULL;
 	int ret;
 
+	/* Activity records cached; fault info and HardwareDataA timestamps not. */
+	BUILD_BUG_ON(0x3740 + 0x100 > G15_HWDATA_CACHED || G15_HWDATA_CACHED > 0x4580 + 0x413c ||
+		     G15_HWDATA_CACHED >= G15_HARDWARE_SIZE);
+
 	/* Owned objects and channels (contract 4.1). */
 	ret = g15_back(gpu, G15_ROOT, 0xc0, G15_PTE_FW) ?:
 	      g15_back(gpu, G15_REGION_A, 0x4000, G15_PTE_FW) ?:
 	      g15_back(gpu, G15_RUNTIME, 0x4b3, G15_PTE_FW) ?:
-	      g15_back(gpu, G15_HWDATA, G15_HARDWARE_SIZE, G15_PTE_FW) ?:
+	      g15_back(gpu, G15_HWDATA, G15_HWDATA_CACHED,
+		       hwdata_cached ? G15_PTE_FW_CACHED : G15_PTE_FW) ?:
+	      g15_back(gpu, G15_HWDATA + G15_HWDATA_CACHED, G15_HARDWARE_SIZE - G15_HWDATA_CACHED,
+		       G15_PTE_FW) ?:
 	      g15_back(gpu, G15_PAIR, 0x100, G15_PTE_FW) ?:
 	      g15_back(gpu, G15_SMALL, 0x10, G15_PTE_FW) ?:
 	      g15_back(gpu, G15_C0, 0x1000, G15_PTE_SHARED) ?:

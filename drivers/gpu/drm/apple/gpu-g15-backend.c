@@ -221,15 +221,17 @@ MODULE_PARM_DESC(repoll_us, "Retry a prefix ready behind the running ones, held 
  * length at completion), compute/TA/FS work images (0x880/0x920/0xc60 at
  * admission and completion; each image ends inside the last line of that
  * span, so every byte is in a maintained line), barriers (0x30 of the
- * one-line 0x3e record) and InitBM (0x20). Queue-info is firmware-private
- * after its initialization. Host-polled or host-updated cells (stamps, queue
- * state, thresholds, counters, notifiers, timestamp cells) and GPU-written
- * storage keep AttrIndex 2. All of these objects are retained until reboot,
- * so no cached mapping is ever torn down.
+ * one-line 0x3e record) and InitBM (0x20). Queue-info, the scheduling
+ * contexts and the queues' job lists are firmware-private after the host
+ * initializes them, before the firmware first sees their addresses.
+ * Host-polled or host-updated cells (stamps, queue state, thresholds,
+ * counters, notifiers, timestamp cells) and GPU-written storage keep
+ * AttrIndex 2. All of these objects are retained until reboot, so no cached
+ * mapping is ever torn down.
  */
 static bool fw_cached = true;
 module_param(fw_cached, bool, 0444);
-MODULE_PARM_DESC(fw_cached, "Map microsequences, work images, barriers/InitBM and queue-info ASC-cached (firmware AttrIndex 0), as the firmware maintains them; 0: AttrIndex 2 (inner non-cacheable)");
+MODULE_PARM_DESC(fw_cached, "Map microsequences, work images, barriers/InitBM, queue-info, scheduling contexts and job lists ASC-cached (firmware AttrIndex 0); 0: AttrIndex 2 (inner non-cacheable)");
 
 static unsigned int resnap_us = 100;
 module_param(resnap_us, uint, 0644);
@@ -629,10 +631,10 @@ static int g15_graph_alloc(struct g15_backend *be)
 				   G15_POOL_TABLE_OFF, false);
 	ret = ret ?: g15_buf_alloc(be, &g->manager, 0x84, sh, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->counter, 0x40, sh, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &g->sched_ctx, 0x40, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &g->sched_ctx, 0x40, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->notifier, 0x108, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->threshold, 4, fw, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &g->job_list, 0x18, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &g->job_list, 0x18, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->qinfo, 0xb4, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->qstate, 0x60, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->ring, G15_QUEUE_CAP * 8, fw, 0, 0, false);
@@ -759,10 +761,10 @@ static int g15_render_alloc(struct g15_backend *be)
 		ret = ret ?: g15_buf_alloc(be, &r->user_stamp[e], 4, sh, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->fw_stamp[e], 4, sh, 0, 0, false);
 	}
-	ret = ret ?: g15_buf_alloc(be, &r->sched_ctx, 0x40, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &r->sched_ctx, 0x40, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->notifier, 0x108, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->threshold, 4, fw, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &r->job_list, 0x18, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &r->job_list, 0x18, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->block_ctl, 0x40, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->pb_counter, 0x40, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->mgr_misc, 0x40, fw, 0, 0, false);
