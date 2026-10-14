@@ -17,6 +17,9 @@
 #include "gpu-m4-drm-provider-job.h"
 #include "gpu-m4-drm-vm-tree.h"
 
+/* Child windows a batch may hold built and enqueued behind its active one. */
+#define GPU_M4_PROVIDER_PREFETCH_MAX 3U
+
 struct gpu_m4_drm_provider_queue {
 	struct kref ref;
 	struct gpu_m4_drm_provider *provider;
@@ -103,11 +106,13 @@ struct gpu_m4_drm_provider_job {
 	 * the original decoded metadata and timestamp leases through this ref.
 	 */
 	struct gpu_m4_drm_provider_job *window_parent, *active_window;
-	/* window_prefetch: the following child, built and enqueued behind the
-	 * still executing active one (lane FIFO order). Promoted to active when
-	 * the active child completes; finalization drops it like active.
+	/* window_prefetch: the following children, built and enqueued behind
+	 * the still executing active one, in command (= lane FIFO) order. The
+	 * oldest is promoted to active when the active child completes;
+	 * finalization drops them like active.
 	 */
-	struct gpu_m4_drm_provider_job *next_window;
+	struct gpu_m4_drm_provider_job *next_window[GPU_M4_PROVIDER_PREFETCH_MAX];
+	u32 next_count;
 	/* Parent-only CPU materializer. Workqueue non-reentrancy serializes every
 	 * unlocked materialization field; the provider mutex guards the rest.
 	 * window_work_ref is the ONE parent ref owned from run until finalization.
@@ -454,6 +459,45 @@ module_param(window_prefetch, bool, 0644);
 MODULE_PARM_DESC(window_prefetch, "Build and enqueue a batch's next child window while the current one executes (default 1)");
 /* REMOVE-DEBUG: prefetched children enqueued, prefetches refused. */
 static atomic64_t gpu_m4_provider_prefetch_stat[2];
+
+/* Children prefetched behind the active one. The firmware reports a whole
+ * run of completed windows with one event (it notifies when its scheduler
+ * idles or at the eight-node service), so with a single prefetched child the
+ * host learned of window k's end only together with k+1's and built k+2
+ * after both had drained: every second window of a long submission ran into
+ * an idle GPU (alternate n=64: ~400 us gaps). Two keep a built window queued
+ * behind those that may complete together.
+ */
+static unsigned int window_prefetch_depth = 2;
+module_param(window_prefetch_depth, uint, 0644);
+MODULE_PARM_DESC(window_prefetch_depth, "Child windows prefetched behind a batch's active one, 1..3 (default 2)");
+
+static u32 gpu_m4_provider_prefetch_depth(void)
+{
+	return clamp(READ_ONCE(window_prefetch_depth), 1U, GPU_M4_PROVIDER_PREFETCH_MAX);
+}
+
+static bool gpu_m4_provider_window_prefetched(const struct gpu_m4_drm_provider_job *parent,
+	const struct gpu_m4_drm_provider_job *child)
+{
+	for (u32 i = 0; i < parent->next_count; i++)
+		if (parent->next_window[i] == child)
+			return true;
+	return false;
+}
+
+/* First command after the active child and every prefetched one. */
+static u32 gpu_m4_provider_window_frontier(const struct gpu_m4_drm_provider_job *parent)
+{
+	u32 first = parent->window_cursor;
+
+	if (parent->active_window)
+		first += parent->active_window->batch.count;
+	for (u32 i = 0; i < parent->next_count; i++)
+		first += parent->next_window[i]->batch.count;
+	return first;
+}
+
 /* Prefetch kick (A/B): rerun the materializer right after a child is enqueued
  * so its successor builds while it executes. 0: only later wakes prefetch.
  */
@@ -657,7 +701,7 @@ static void gpu_m4_provider_complete_locked(struct gpu_m4_drm_provider_job *job,
 	 * retains the child, whose parent ref retains the work item.
 	 */
 	if (error && job->window_parent && (job->window_parent->active_window == job ||
-					     job->window_parent->next_window == job))
+					     gpu_m4_provider_window_prefetched(job->window_parent, job)))
 		queue_work(system_unbound_wq, &job->window_parent->window_work);
 }
 
@@ -1361,10 +1405,14 @@ bool gpu_m4_drm_provider_job_uncertain_locked(struct gpu_m4_drm_provider_job *jo
 	 * transferred ref and therefore this parent; follow only the attached child.
 	 */
 	if (job->aggregate)
-		return (job->active_window &&
-			gpu_m4_drm_provider_job_uncertain_locked(job->active_window)) ||
-		       (job->next_window &&
-			gpu_m4_drm_provider_job_uncertain_locked(job->next_window));
+	{
+		if (job->active_window && gpu_m4_drm_provider_job_uncertain_locked(job->active_window))
+			return true;
+		for (u32 i = 0; i < job->next_count; i++)
+			if (gpu_m4_drm_provider_job_uncertain_locked(job->next_window[i]))
+				return true;
+		return false;
+	}
 	return job->protected && job->state != GPU_M4_PROVIDER_RETIRED;
 }
 EXPORT_SYMBOL_GPL(gpu_m4_drm_provider_job_uncertain_locked);
@@ -3379,7 +3427,7 @@ static int gpu_m4_provider_window_enqueue_locked(struct gpu_m4_drm_provider_job 
 	if (queue->closed || parent->state != GPU_M4_PROVIDER_AGGREGATE ||
 	    parent->retirement->ready)
 		return -ECANCELED;
-	if ((parent->active_window != child && parent->next_window != child) ||
+	if ((parent->active_window != child && !gpu_m4_provider_window_prefetched(parent, child)) ||
 	    child->window_parent != parent ||
 	    !child->accepted || child->window_enqueued || child->state != GPU_M4_PROVIDER_PREPARED)
 		return -ESTALE;
@@ -3423,7 +3471,7 @@ static void gpu_m4_provider_window_abort(struct gpu_m4_drm_provider_job *child, 
 	mutex_lock(lock);
 	if (!WARN_ON(child->window_enqueued || child->protected ||
 		     child->window_parent->active_window == child ||
-		     child->window_parent->next_window == child ||
+		     gpu_m4_provider_window_prefetched(child->window_parent, child) ||
 		     child->state != GPU_M4_PROVIDER_PREPARED)) {
 		child->state = GPU_M4_PROVIDER_CANCELED;
 		gpu_m4_provider_complete_locked(child, error < 0 ? error : -ECANCELED);
@@ -3460,8 +3508,9 @@ static void gpu_m4_provider_window_finish(struct gpu_m4_drm_provider_job *parent
 	int error, bool faulted)
 {
 	struct mutex *lock = gpu_m4_provider_job_lock(parent);
-	struct gpu_m4_drm_provider_job *child, *next;
-	bool enqueued = false, next_enqueued = false;
+	struct gpu_m4_drm_provider_job *child, *next[GPU_M4_PROVIDER_PREFETCH_MAX];
+	bool enqueued = false, next_enqueued[GPU_M4_PROVIDER_PREFETCH_MAX] = { };
+	u32 next_count;
 
 	mutex_lock(lock);
 	if (!parent->retirement->ready) {
@@ -3479,10 +3528,13 @@ static void gpu_m4_provider_window_finish(struct gpu_m4_drm_provider_job *parent
 	if (child)
 		enqueued = child->window_enqueued;
 	parent->active_window = NULL;
-	next = parent->next_window;
-	if (next)
-		next_enqueued = next->window_enqueued;
-	parent->next_window = NULL;
+	next_count = parent->next_count;
+	for (u32 i = 0; i < next_count; i++) {
+		next[i] = parent->next_window[i];
+		next_enqueued[i] = next[i]->window_enqueued;
+		parent->next_window[i] = NULL;
+	}
+	parent->next_count = 0;
 	parent->window_work_ref = false;
 	gpu_m4_provider_aggregate_remove_locked(parent->queue, parent);
 	gpu_m4_provider_early_unregister_locked(parent);
@@ -3503,25 +3555,30 @@ static void gpu_m4_provider_window_finish(struct gpu_m4_drm_provider_job *parent
 	 * (it fails at start on a failed VM/provider); an unenqueued one is
 	 * dropped unpublished.
 	 */
-	if (next && next_enqueued)
-		WARN_ON(gpu_m4_drm_provider_job_put(next) && !faulted);
-	else if (next)
-		gpu_m4_provider_window_abort(next, error);
+	for (u32 i = 0; i < next_count; i++) {
+		if (next_enqueued[i])
+			WARN_ON(gpu_m4_drm_provider_job_put(next[i]) && !faulted);
+		else
+			gpu_m4_provider_window_abort(next[i], error);
+	}
 	WARN_ON(gpu_m4_drm_provider_job_signal(parent));
 	/* Transfer window_work_ref: this may run inside window_work itself. */
 	queue_work(system_unbound_wq, &parent->window_put_work);
 }
 
 /* Build the child starting at first while the active one executes and
- * enqueue it behind it. Any refusal (capacity, closure, failure) leaves the
- * ordinary build after the active child's completion to retry; nothing is
- * published here and a built but unenqueued child is dropped unpublished.
+ * enqueue it behind it and every earlier prefetched child (first is the
+ * frontier). Any refusal (capacity, closure, failure) leaves the ordinary
+ * build after the active child's completion to retry; nothing is published
+ * here and a built but unenqueued child is dropped unpublished. With room
+ * for another, the following child is prefetched by the next window_work.
  */
 static void gpu_m4_provider_window_prefetch(struct gpu_m4_drm_provider_job *parent, u32 first)
 {
 	struct mutex *lock = gpu_m4_provider_job_lock(parent);
 	struct gpu_m4_drm_provider_job *child;
 	u64 start = ktime_get_ns();
+	bool more;
 	int ret;
 
 	child = gpu_m4_provider_window_build(parent, first,
@@ -3532,18 +3589,22 @@ static void gpu_m4_provider_window_prefetch(struct gpu_m4_drm_provider_job *pare
 		return;
 	}
 	mutex_lock(lock);
-	ret = parent->retirement->ready || parent->next_window || !parent->active_window ||
+	ret = parent->retirement->ready || !parent->active_window ||
+	      parent->next_count >= gpu_m4_provider_prefetch_depth() ||
 	      !parent->active_window->window_enqueued ||
-	      parent->window_cursor + parent->active_window->batch.count != first ? -ECANCELED : 0;
+	      (parent->next_count && !parent->next_window[parent->next_count - 1]->window_enqueued) ||
+	      gpu_m4_provider_window_frontier(parent) != first ? -ECANCELED : 0;
 	if (!ret)
-		parent->next_window = child;
+		parent->next_window[parent->next_count++] = child;
 	/* Explicit sync: the parent's scheduler inputs were its only inputs. */
 	if (!ret && child->implicit)
 		ret = -EOPNOTSUPP;
 	if (!ret)
 		ret = gpu_m4_provider_window_enqueue_locked(parent, child);
-	if (ret && parent->next_window == child)
-		parent->next_window = NULL;
+	if (ret && parent->next_count && parent->next_window[parent->next_count - 1] == child)
+		parent->next_window[--parent->next_count] = NULL;
+	more = !ret && parent->next_count < gpu_m4_provider_prefetch_depth() &&
+	       gpu_m4_provider_window_frontier(parent) < parent->batch.count;
 	mutex_unlock(lock);
 	if (ret) {
 		atomic64_inc(&gpu_m4_provider_prefetch_stat[1]);
@@ -3551,6 +3612,8 @@ static void gpu_m4_provider_window_prefetch(struct gpu_m4_drm_provider_job *pare
 		return;
 	}
 	atomic64_inc(&gpu_m4_provider_prefetch_stat[0]);
+	if (more)
+		queue_work(system_unbound_wq, &parent->window_work);
 }
 
 /* Never-run phase of an early materializer (begin_dependencies). It builds
@@ -3704,20 +3767,25 @@ again:
 			}
 			drop = child;
 			/* The prefetched successor is already in the lane FIFO. */
-			if (parent->next_window) {
-				parent->active_window = parent->next_window;
-				parent->next_window = NULL;
+			if (parent->next_count) {
+				parent->active_window = parent->next_window[0];
+				for (u32 i = 1; i < parent->next_count; i++)
+					parent->next_window[i - 1] = parent->next_window[i];
+				parent->next_window[--parent->next_count] = NULL;
 				goto again;
 			}
 		} else if (child->retirement->ready) {
 			ret = child->retirement->error ?: -EIO;
 			faulted = child->state == GPU_M4_PROVIDER_FAULTED;
-		} else if (READ_ONCE(window_prefetch) && !parent->next_window &&
-			   parent->window_cursor + child->batch.count < parent->batch.count &&
+		} else if (READ_ONCE(window_prefetch) &&
+			   parent->next_count < gpu_m4_provider_prefetch_depth() &&
+			   (!parent->next_count ||
+			    parent->next_window[parent->next_count - 1]->window_enqueued) &&
+			   gpu_m4_provider_window_frontier(parent) < parent->batch.count &&
 			   !queue->closed && !gpu_m4_drm_provider_error_locked(queue->provider) &&
 			   !gpu_m4_drm_provider_vm_error_locked(queue->vm)) {
 			/* Still executing: build and enqueue the next child now. */
-			first = parent->window_cursor + child->batch.count;
+			first = gpu_m4_provider_window_frontier(parent);
 			mutex_unlock(lock);
 			if (drop)
 				WARN_ON(gpu_m4_drm_provider_job_put(drop));
@@ -3917,7 +3985,7 @@ int gpu_m4_drm_provider_job_window_complete_locked(struct gpu_m4_drm_provider_jo
 	parent = child->window_parent;
 	if (!parent)
 		return 0;
-	if ((parent->active_window != child && parent->next_window != child) ||
+	if ((parent->active_window != child && !gpu_m4_provider_window_prefetched(parent, child)) ||
 	    !child->window_enqueued || child->window_complete ||
 	    child->state != GPU_M4_PROVIDER_RETIRED || !child->retirement->ready ||
 	    child->retirement->error)
