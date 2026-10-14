@@ -290,6 +290,23 @@ static unsigned int render_queue_class = 2;
 module_param(render_queue_class, uint, 0444);
 MODULE_PARM_DESC(render_queue_class, "TA/FS queue-info scheduling row: 2 (default, quantum 8) or 0 (donor row, quantum 1)");
 
+/*
+ * Prior-FS -> next-TA barrier type within a prefix (render_internal_hold).
+ * Type 1 adds a firmware job-finalization hold on the predecessor FS on top
+ * of its FW stamp wait (dependency registration 0x537 at admission, kind-1
+ * release 0x538 after the FS completion records). With 0, a render whose
+ * predecessor render is a member of the same prefix keeps only the stamp
+ * wait: its TA starts after the previous FS's Finalize3D stamp. The first
+ * render of every prefix, renders after a compute, prefixes that
+ * (re)initialize the PB with InitBM and resynchronized ones keep type 1.
+ * All members' storage is owned and the prefix's whole BM horizon (host PB
+ * counter) is published before its first record, so no FS of the prefix
+ * can take the PB catch-up on a partial horizon.
+ */
+static unsigned int render_internal_hold;
+module_param(render_internal_hold, uint, 0444);
+MODULE_PARM_DESC(render_internal_hold, "Barrier type of a render's wait on the previous render of the same prefix: 0 (default) FW stamp only, 1 also the FS job-finalization hold");
+
 static unsigned int resnap_us = 100;
 module_param(resnap_us, uint, 0644);
 MODULE_PARM_DESC(resnap_us, "Completion re-check interval while a command is published, 25..1000 us (EP0x20 events wake earlier)");
@@ -2447,6 +2464,7 @@ static void g15_flight_release(struct g15_backend *be, struct g15_flight *f)
  */
 struct g15_prefix {
 	u32 computes, renders, prev;
+	bool initbm;		/* this prefix (re)initializes the PB with InitBM */
 	u32 c_head, ta_head, fs_head;
 	u64 n, draw;		/* last compute ordinal / last draw ordinal */
 	u32 last_ct, last_fs;
@@ -2598,16 +2616,21 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	} else {
 		u32 prev_fs = pf->prev ? pf->last_fs :
 			n == 1 ? G15_FS_SEED : g15_stamp_seed(G15_FS_SEED, n - 1);
+		/* Restricted type 0: predecessor render in this prefix, no InitBM/resync. */
+		bool internal = pf->prev == 2 && pf->renders && !pf->initbm &&
+				!be->fs_resync && !render_internal_hold;
 
 		/* After a recovered failure the previous FS may never have written. */
 		if (!pf->prev && be->fs_resync)
 			prev_fs = g15_buf_r32(&r->fw_stamp[1], 0);
-		g15_barrier(&p->prev_barrier, r->fw_stamp[1].va, prev_fs, 1, Tta, 0x3d420, 1);
+		g15_barrier(&p->prev_barrier, r->fw_stamp[1].va, prev_fs, 1, Tta, 0x3d420,
+			    internal ? 0 : 1);
 	}
 	g15_barrier(&p->own_barrier, r->fw_stamp[0].va, Tta, 0, Tfs, G15_FS_UUID, 0);
 	if (n == 1 || (!pf->renders && r->reinit)) {
 		u8 bm[0x20] = {};
 
+		pf->initbm = true;
 		put_unaligned_le32(6, bm + 0x0);
 		put_unaligned_le32(ctx, bm + 0x4);
 		put_unaligned_le32(G15_PB_BLOCKS, bm + 0x10);
