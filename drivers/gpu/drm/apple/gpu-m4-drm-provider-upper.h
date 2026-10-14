@@ -13,9 +13,26 @@ struct gpu_m4_drm_upper_lease;
 #define GPU_M4_DRM_UPPER_END 0xfffffc3000000000ULL
 #define GPU_M4_DRM_UPPER_FW_ATTRS 0x00c000000000044bULL
 #define GPU_M4_DRM_UPPER_SHARED_ATTRS 0x00e000000000040bULL
+/* FW RW + GPU RW with ASC AttrIndex 0 (inner+outer WB): the permission-
+ * preserving cached twin of GPU_M4_DRM_UPPER_SHARED_ATTRS. Native maps its
+ * command images and microsequences ASC-cached. Only the retained command
+ * cells use it: there is no qualified cached-mapping teardown, so such a
+ * lease must live until ASC stop.
+ */
+#define GPU_M4_DRM_UPPER_SHARED_CACHED_ATTRS 0x00e0000000000403ULL
 
 enum gpu_m4_drm_upper_window { GPU_M4_DRM_UPPER_NORMAL, GPU_M4_DRM_UPPER_TS };
-enum gpu_m4_drm_upper_class { GPU_M4_DRM_UPPER_FW_ONLY, GPU_M4_DRM_UPPER_SHARED };
+enum gpu_m4_drm_upper_class { GPU_M4_DRM_UPPER_FW_ONLY, GPU_M4_DRM_UPPER_SHARED,
+	GPU_M4_DRM_UPPER_SHARED_CACHED };
+
+static inline u64 gpu_m4_drm_upper_class_attrs(enum gpu_m4_drm_upper_class class)
+{
+	switch (class) {
+	case GPU_M4_DRM_UPPER_FW_ONLY: return GPU_M4_DRM_UPPER_FW_ATTRS;
+	case GPU_M4_DRM_UPPER_SHARED: return GPU_M4_DRM_UPPER_SHARED_ATTRS;
+	default: return GPU_M4_DRM_UPPER_SHARED_CACHED_ATTRS;
+	}
+}
 enum gpu_m4_drm_upper_placement {
 	GPU_M4_DRM_UPPER_ANY_CHILD,
 	GPU_M4_DRM_UPPER_EXISTING_ONLY,

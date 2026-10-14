@@ -525,7 +525,9 @@ static int m4_user_compute_check_locked(struct m4_user_compute_packet *out)
 	for (u32 i = 0; i < GPU_M4_COMPUTE_PRIVATE_COUNT; i++) {
 		struct m4_user_native_bo *bo = n->private[i];
 		const struct gpu_m4_compute_packet_private *m = &in->private[i];
-		u64 attrs = i == GPU_M4_COMPUTE_PRIVATE_WORK || i == GPU_M4_COMPUTE_PRIVATE_AUX ?
+		u64 attrs = i == GPU_M4_COMPUTE_PRIVATE_WORK && bo && bo->cell ?
+			m4_arena_cell_attrs(bo->cell->arena) :
+			i == GPU_M4_COMPUTE_PRIVATE_WORK || i == GPU_M4_COMPUTE_PRIVATE_AUX ?
 			GPU_M4_DRM_UPPER_SHARED_ATTRS : 0;
 
 		if (!bo || m->object != bo->object || m->lease != bo->claim ||
@@ -790,6 +792,7 @@ static int m4_user_compute_prepare_locked(struct m4_user_job *j, u32 index,
 		.auxiliary_gpu = n->private[GPU_M4_COMPUTE_PRIVATE_AUX]->va,
 		.context_store_gpu = n->private[GPU_M4_COMPUTE_PRIVATE_CONTEXT]->va,
 		.counter_fw = n->counter->fw_va,
+		.stamps_fw = n->counter->fw_va + GPU_M4_EXEC_COMPUTE_STAMPS,
 		.notifier_fw = res->notifier->fw_va + 0x400,
 		.firmware_stamp_fw = res->notifier->fw_va + 0x640,
 		.user_stamp_fw = res->notifier->fw_va + 0x648,
@@ -878,6 +881,7 @@ static int m4_user_compute_prepare_locked(struct m4_user_job *j, u32 index,
 	ts.work = out->work;
 	ts.work_fw = in->work.work_fw;
 	ts.queue_fw = in->work.queue_fw;
+	ts.stamps_fw = in->work.stamps_fw;
 	ts.cookie = out;
 	ts.ops = &m4_user_compute_ts_ops;
 	ret = gpu_m4_drm_provider_job_timestamp_count_locked(j->core_job, &count);

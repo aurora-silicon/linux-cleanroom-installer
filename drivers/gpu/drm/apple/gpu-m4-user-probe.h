@@ -511,8 +511,8 @@ static int m4_user_probe_finish(struct m4_gpu_provider_runtime *p)
 		goto fail;
 	}
 	for (u32 i = 0; i < 2; i++) {
-		ret = gpu_m4_render_timestamp_ns(m4_store_read64(
-			native->private[GPU_M4_COMPUTE_PRIVATE_WORK]->map.vaddr + 0x8c0 + i * 8), &ns[i]);
+		ret = gpu_m4_render_timestamp_ns(m4_store_read64(native->counter->map.vaddr +
+			GPU_M4_EXEC_COMPUTE_STAMPS + i * 8), &ns[i]);
 		if (ret)
 			goto fail;
 	}

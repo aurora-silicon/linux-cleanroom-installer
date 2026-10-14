@@ -475,8 +475,17 @@ static inline int gpu_m4_exec_uma_descriptor(void *output,
 	return 0;
 }
 
+/* Ordinary runtime works keep their private start/end engine stamps in their
+ * separately mapped NC submitted-counter page, at counter_fw +
+ * GPU_M4_EXEC_COMPUTE_STAMPS, instead of work+0x8c0: the firmware does not
+ * synchronize those cells, so a cached work page must not hold host-observed
+ * receipt values. stamps_fw 0 keeps work+0x8c0 (fixture/trial works).
+ */
+#define GPU_M4_EXEC_COMPUTE_STAMPS 0x40U
+
 /* Encode only into a fresh private work; these cells remain pinned until reboot. */
-static inline int gpu_m4_exec_compute_timestamps(void *output, u64 work_fw, u64 queue_fw)
+static inline int gpu_m4_exec_compute_timestamps(void *output, u64 work_fw, u64 queue_fw,
+						 u64 stamps_fw)
 {
 	u8 *work = output;
 	unsigned int i;
@@ -484,8 +493,8 @@ static inline int gpu_m4_exec_compute_timestamps(void *output, u64 work_fw, u64 
 	if (!output || !gpu_m4_exec_fw_range(work_fw, GPU_M4_EXEC_COMPUTE_SIZE, 8) ||
 	    !gpu_m4_exec_fw_range(queue_fw, GPU_M4_EXEC_QUEUE_SIZE, 8))
 		return -EINVAL;
-	put_unaligned_le64(work_fw + 0x8c0, work + 0x834);
-	put_unaligned_le64(work_fw + 0x8c8, work + 0x83c);
+	put_unaligned_le64(stamps_fw, work + 0x834);
+	put_unaligned_le64(stamps_fw + 8, work + 0x83c);
 	put_unaligned_le64(0, work + 0x844);
 	put_unaligned_le64(0, work + 0x84c);
 	for (i = 0; i < 2; i++) {
@@ -516,6 +525,7 @@ struct gpu_m4_exec_compute_input {
 	u64 auxiliary_gpu;
 	u64 context_store_gpu;
 	u64 counter_fw;
+	u64 stamps_fw; /* private start/end stamp pair; 0: work_fw + 0x8c0 */
 	u64 notifier_fw;
 	u64 firmware_stamp_fw;
 	u64 user_stamp_fw;
@@ -638,7 +648,8 @@ static inline int gpu_m4_exec_first_compute(void *output,
 					in->counter_fw, in->pool_state_gpu, in->page_list_gpu);
 	if (ret)
 		return ret;
-	ret = gpu_m4_exec_compute_timestamps(work, in->work_fw, in->queue_fw);
+	ret = gpu_m4_exec_compute_timestamps(work, in->work_fw, in->queue_fw,
+		in->stamps_fw ?: in->work_fw + 0x8c0);
 	if (ret)
 		return ret;
 	put_unaligned_le32(3, work);

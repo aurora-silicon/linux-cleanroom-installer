@@ -151,6 +151,28 @@ struct m4_user_native_bo {
 	bool cell_released;
 };
 
+/* Render microsequences live in their work cell at this offset (seq_in_cell)
+ * instead of separate firmware-only BOs: with cell_cached they are ASC-cached
+ * like native microsequences and retained with the arena (a separate cached
+ * BO would need a cached-mapping teardown at its release).
+ */
+#define M4_USER_RENDER_SEQ_CELL_OFFSET 0x2000U
+static bool seq_in_cell = true;
+module_param(seq_in_cell, bool, 0644);
+MODULE_PARM_DESC(seq_in_cell, "New render units keep their microsequences in their work cells (default 1)");
+
+/* CPU view of a render unit's TA (engine 0) or FS microsequence. */
+struct m4_user_render_native;
+static void *m4_user_render_sequence_cpu(const struct m4_user_render_native *n, u32 engine);
+
+/* Upper class of a native BO: a command cell has its arena's class. */
+static enum gpu_m4_drm_upper_class m4_user_native_upper_class(const struct m4_user_native_bo *b)
+{
+	if (b->cell)
+		return b->cell->arena->cell_class;
+	return b->va ? GPU_M4_DRM_UPPER_SHARED : GPU_M4_DRM_UPPER_FW_ONLY;
+}
+
 struct m4_user_notifier {
 	struct m4_user_native_bo *bo;
 	/* threshold[] is also the published threshold tail; published_target[]
@@ -180,6 +202,15 @@ struct m4_user_render_native {
 	struct m4_user_native_bo *gpu[GPU_M4_RENDER_FIRST_GPU_COUNT];
 	struct m4_user_native_bo *manager, *tpc;
 };
+
+static void *m4_user_render_sequence_cpu(const struct m4_user_render_native *n, u32 engine)
+{
+	u32 role = engine ? GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW :
+		GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW;
+	const struct m4_user_native_bo *b = n->firmware[role];
+
+	return b->map.vaddr + (n->owner.firmware[role].span.va - b->fw_va);
+}
 
 struct m4_user_native_command {
 	u16 type;
@@ -1005,8 +1036,7 @@ static int m4_user_native_backing_ready(void *owner, u64 offset, u64 size,
 {
 	struct m4_user_native_bo *b = owner;
 
-	if (offset || size != b->size ||
-	    class != (b->va ? GPU_M4_DRM_UPPER_SHARED : GPU_M4_DRM_UPPER_FW_ONLY))
+	if (offset || size != b->size || class != m4_user_native_upper_class(b))
 		return -EPERM;
 	return m4_user_native_bo_arm_locked(b, b->runtime->user_starting.job);
 }
@@ -1244,15 +1274,14 @@ static int m4_user_native_upper_locked(struct m4_user_native_bo *b)
 
 	if (b->cell) {
 		ret = gpu_m4_drm_upper_reference_locked(b->cell->upper, &b->cell->backing,
-			GPU_M4_DRM_UPPER_NORMAL, GPU_M4_DRM_UPPER_SHARED);
+			GPU_M4_DRM_UPPER_NORMAL, b->cell->arena->cell_class);
 		if (ret)
 			return ret;
 		b->backing = b->cell->backing;
 		lease = b->cell->upper;
 	} else {
 		lease = gpu_m4_drm_upper_accept_locked(b->runtime->ready->upper, &b->backing,
-			GPU_M4_DRM_UPPER_NORMAL,
-			b->va ? GPU_M4_DRM_UPPER_SHARED : GPU_M4_DRM_UPPER_FW_ONLY);
+			GPU_M4_DRM_UPPER_NORMAL, m4_user_native_upper_class(b));
 		if (IS_ERR(lease))
 			return PTR_ERR(lease);
 	}
@@ -1791,6 +1820,7 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 	struct m4_user_native_bo *b;
 	struct mutex *lock = &s->queue->runtime->hello->gpu->lock;
 	u64 resource_size[ARRAY_SIZE(resources)], gpu_size[GPU_M4_RENDER_FIRST_GPU_COUNT];
+	bool in_cell;
 	int ret;
 
 	s->command[index].render_key = geometry;
@@ -1865,8 +1895,11 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 	M4_NATIVE_FW(GPU_M4_RENDER_FIRST_PB_BLOCKS_FW, n->pb.block_list_size);
 	M4_NATIVE_FW(GPU_M4_RENDER_FIRST_PB_RING_FW, 8);
 	M4_NATIVE_FW(GPU_M4_RENDER_FIRST_PB_COUNTER_FW, 0x40);
-	M4_NATIVE_FW(GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW, 0x400);
-	M4_NATIVE_FW(GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW, 0x800);
+	in_cell = READ_ONCE(seq_in_cell);
+	if (!in_cell) {
+		M4_NATIVE_FW(GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW, 0x400);
+		M4_NATIVE_FW(GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW, 0x800);
+	}
 #undef M4_NATIVE_FW
 #define M4_NATIVE_ALIAS(role, bo, logical) do { \
 	n->firmware[(role)] = (bo); \
@@ -1875,8 +1908,23 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 	M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_SCRATCH_FW, n->resource[GPU_M4_RENDER_SCRATCH], 0x4000);
 	M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_UMA_FW, n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU], 0x4000);
 	M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_PB_LIST_FW, n->gpu[GPU_M4_RENDER_FIRST_PB_LIST_GPU], n->pb.page_list_size);
-	M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_TILER_WORK_FW, n->work[0], 0x4000);
-	M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_FRAGMENT_WORK_FW, n->work[1], 0x4000);
+	if (in_cell) {
+		/* Each microsequence in its own work cell's upper half: the cell's
+		 * firmware attribute (ASC-cached with cell_cached), retained with
+		 * the arena; the work image keeps the lower half.
+		 */
+		M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_TILER_WORK_FW, n->work[0], M4_USER_RENDER_SEQ_CELL_OFFSET);
+		M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_FRAGMENT_WORK_FW, n->work[1], M4_USER_RENDER_SEQ_CELL_OFFSET);
+		n->firmware[GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW] = n->work[0];
+		o->firmware[GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW] = m4_user_native_fw(n->work[0],
+			M4_USER_RENDER_SEQ_CELL_OFFSET, 0x800);
+		n->firmware[GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW] = n->work[1];
+		o->firmware[GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW] = m4_user_native_fw(n->work[1],
+			M4_USER_RENDER_SEQ_CELL_OFFSET, 0x800);
+	} else {
+		M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_TILER_WORK_FW, n->work[0], 0x4000);
+		M4_NATIVE_ALIAS(GPU_M4_RENDER_FIRST_FRAGMENT_WORK_FW, n->work[1], 0x4000);
+	}
 #undef M4_NATIVE_ALIAS
 	ret = m4_user_native_add(s, 0x4000, GPU_M4_DRM_PAGE_SIZE, false, true, false, false, &n->manager);
 	if (ret)

@@ -146,8 +146,7 @@ static int m4_user_render_bo_locked(struct m4_user_render_packet *packet,
 	 * root[2], latest live health pass); otherwise its owned path is walked.
 	 */
 	ret = gpu_m4_drm_upper_check_lease_locked(bo->upper, &bo->backing,
-		GPU_M4_DRM_UPPER_NORMAL, bo->va ? GPU_M4_DRM_UPPER_SHARED :
-		GPU_M4_DRM_UPPER_FW_ONLY, bo->fw_va);
+		GPU_M4_DRM_UPPER_NORMAL, m4_user_native_upper_class(bo), bo->fw_va);
 	return gpu_m4_render_native_status(ret);
 }
 

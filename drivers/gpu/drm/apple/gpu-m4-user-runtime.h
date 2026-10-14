@@ -861,14 +861,16 @@ static int m4_user_compute_reuse_check_locked(void *cookie,
 	    completed != expected[1].submitted ||
 	    receipt->uma_submitted != expected[1].submitted ||
 	    receipt->uma_completed != expected[1].submitted ||
-	    m4_store_read64(expected[1].work + 0x8c0) != receipt->timestamp_start ||
-	    m4_store_read64(expected[1].work + 0x8c8) != receipt->timestamp_end)
+	    m4_store_read64(nb->counter->map.vaddr + GPU_M4_EXEC_COMPUTE_STAMPS) !=
+		receipt->timestamp_start ||
+	    m4_store_read64(nb->counter->map.vaddr + GPU_M4_EXEC_COMPUTE_STAMPS + 8) !=
+		receipt->timestamp_end)
 		return M4_USER_WHY(-ESTALE, "reuse check %u C %u: counter=%llu completed=%llu uma=%llu/%llu want %llu; time=%#llx,%#llx receipt %#llx,%#llx",
 			index, prior_index, M4_WHY64(m4_store_read64(nb->counter->map.vaddr)),
 			M4_WHY64(completed), M4_WHY64(receipt->uma_submitted),
 			M4_WHY64(receipt->uma_completed), M4_WHY64(expected[1].submitted),
-			M4_WHY64(m4_store_read64(expected[1].work + 0x8c0)),
-			M4_WHY64(m4_store_read64(expected[1].work + 0x8c8)),
+			M4_WHY64(m4_store_read64(nb->counter->map.vaddr + GPU_M4_EXEC_COMPUTE_STAMPS)),
+			M4_WHY64(m4_store_read64(nb->counter->map.vaddr + GPU_M4_EXEC_COMPUTE_STAMPS + 8)),
 			M4_WHY64(receipt->timestamp_start), M4_WHY64(receipt->timestamp_end));
 	return M4_USER_WHY(gpu_m4_compute_reuse_retired_prefixes(receipt), "reuse check %u C prefixes", index);
 }
@@ -1363,8 +1365,8 @@ static int m4_user_compute_packet_retired_locked(struct m4_user_job *j, u32 inde
 		.pipe_write = m4_ready_read32(pipe + 0x20), .pipe_next = own->pipe_next,
 		.pipe_capacity = 256, .uma_submitted = m4_store_read64(n->counter->map.vaddr),
 		.uma_completed = completed,
-		.timestamp_start = m4_store_read64(work + 0x8c0),
-		.timestamp_end = m4_store_read64(work + 0x8c8),
+		.timestamp_start = m4_store_read64(n->counter->map.vaddr + GPU_M4_EXEC_COMPUTE_STAMPS),
+		.timestamp_end = m4_store_read64(n->counter->map.vaddr + GPU_M4_EXEC_COMPUTE_STAMPS + 8),
 		.ignore_busy = m4_user_wire_overlapped(j),
 	};
 	for (u32 i = 0; i < 3; i++)

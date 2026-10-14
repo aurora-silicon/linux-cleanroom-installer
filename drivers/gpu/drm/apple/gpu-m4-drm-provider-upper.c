@@ -830,7 +830,7 @@ struct gpu_m4_drm_upper_lease *gpu_m4_drm_upper_accept_placed_locked(
 
 	if (!u || !upper_backing_valid(backing) ||
 	    (window != GPU_M4_DRM_UPPER_NORMAL && window != GPU_M4_DRM_UPPER_TS) ||
-	    (class != GPU_M4_DRM_UPPER_FW_ONLY && class != GPU_M4_DRM_UPPER_SHARED) ||
+	    class > GPU_M4_DRM_UPPER_SHARED_CACHED ||
 	    (window == GPU_M4_DRM_UPPER_TS && class != GPU_M4_DRM_UPPER_FW_ONLY) ||
 	    (placement != GPU_M4_DRM_UPPER_ANY_CHILD &&
 	     placement != GPU_M4_DRM_UPPER_EXISTING_ONLY && placement != GPU_M4_DRM_UPPER_NEW_ONLY))
@@ -877,8 +877,7 @@ struct gpu_m4_drm_upper_lease *gpu_m4_drm_upper_accept_placed_locked(
 	l->window = window;
 	l->class = class;
 	l->placement = placement;
-	l->attrs = class == GPU_M4_DRM_UPPER_FW_ONLY ? GPU_M4_DRM_UPPER_FW_ATTRS :
-		GPU_M4_DRM_UPPER_SHARED_ATTRS;
+	l->attrs = gpu_m4_drm_upper_class_attrs(class);
 	l->pa = kcalloc(l->pages, sizeof(*l->pa), GFP_KERNEL);
 	l->update_capacity = l->pages + l->pages / UPPER_ENTRIES + 2;
 	l->updates = kcalloc(l->update_capacity, sizeof(*l->updates), GFP_KERNEL);
@@ -1071,7 +1070,7 @@ struct gpu_m4_drm_upper_lease *gpu_m4_drm_upper_import_seed_locked(
 	int ret;
 
 	if (!u || !upper_backing_valid(backing) || backing->policy != GPU_M4_DRM_CPU_NC ||
-	    (class != GPU_M4_DRM_UPPER_FW_ONLY && class != GPU_M4_DRM_UPPER_SHARED) ||
+	    class > GPU_M4_DRM_UPPER_SHARED_CACHED ||
 	    va < GPU_M4_DRM_UPPER_START || (va & (UPPER_PAGE - 1)))
 		return ERR_PTR(-EINVAL);
 	lockdep_assert_held(u->config.lock);
@@ -1108,7 +1107,7 @@ struct gpu_m4_drm_upper_lease *gpu_m4_drm_upper_import_seed_locked(
 	l->class = class;
 	l->placement = GPU_M4_DRM_UPPER_EXISTING_ONLY;
 	l->allocation_gates = GPU_M4_DRM_UPPER_EXISTING_CHILD;
-	l->attrs = class == GPU_M4_DRM_UPPER_FW_ONLY ? GPU_M4_DRM_UPPER_FW_ATTRS : GPU_M4_DRM_UPPER_SHARED_ATTRS;
+	l->attrs = gpu_m4_drm_upper_class_attrs(class);
 	l->va = va;
 	l->root_value = u->config.middle.pa | 3;
 	l->seeded = l->visible = l->published = true;

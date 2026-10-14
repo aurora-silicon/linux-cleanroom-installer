@@ -226,8 +226,7 @@ static int m4_user_render_predecessor_locked(struct m4_user_job *j, u32 index)
 	for (u32 engine = 0; engine < 2; engine++) {
 		const struct gpu_m4_render_stage_retirement *r = &receipt->render[engine];
 		void *work = n->work[engine]->map.vaddr;
-		void *start = n->firmware[engine ? GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW :
-			GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW]->map.vaddr;
+		void *start = m4_user_render_sequence_cpu(n, engine);
 		u64 work_counter;
 
 		ret = m4_store_packed64(work + 4, &work_counter);
@@ -1130,9 +1129,9 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 	 * strict prior wait +0x380 and the submitted counter +0x500.
 	 */
 	memcpy(n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->map.vaddr, packet->bytes.scene, sizeof(packet->bytes.scene));
-	memcpy(n->firmware[GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW]->map.vaddr,
+	memcpy(m4_user_render_sequence_cpu(n, 0),
 		packet->bytes.tiler_sequence, sizeof(packet->bytes.tiler_sequence));
-	memcpy(n->firmware[GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW]->map.vaddr,
+	memcpy(m4_user_render_sequence_cpu(n, 1),
 		packet->bytes.fragment_sequence, sizeof(packet->bytes.fragment_sequence));
 	memcpy(n->work[0]->map.vaddr, packet->bytes.tiler, sizeof(packet->bytes.tiler));
 	memcpy(n->work[1]->map.vaddr, packet->bytes.fragment, sizeof(packet->bytes.fragment));
@@ -1194,8 +1193,7 @@ static int m4_user_render_stage_sample_locked(struct m4_user_job *j, u32 index,
 	void *pipe = p->ready->buffer[GPU_M4_OBJECT_COUNT + engine * 2].cpu;
 	void *notifier = j->queue->notifier->bo->map.vaddr;
 	void *work = n->work[engine]->map.vaddr;
-	void *start = n->firmware[engine ? GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW :
-		GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW]->map.vaddr;
+	void *start = m4_user_render_sequence_cpu(n, engine);
 	const u8 *image = engine ? j->render[index].bytes.fragment : j->render[index].bytes.tiler;
 	const u16 *pointer = engine ? fs_pointer : ta_pointer;
 	struct gpu_m4_render_stage_retirement s = {
@@ -1401,9 +1399,9 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 	 * They contain every requested endpoint/copy; no CPU readback substitutes
 	 * for their completed hardware sequence.
 	 */
-	if (memcmp(n->firmware[GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW]->map.vaddr,
+	if (memcmp(m4_user_render_sequence_cpu(n, 0),
 		packet->bytes.tiler_sequence, sizeof(packet->bytes.tiler_sequence)) ||
-	    memcmp(n->firmware[GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW]->map.vaddr,
+	    memcmp(m4_user_render_sequence_cpu(n, 1),
 		packet->bytes.fragment_sequence, sizeof(packet->bytes.fragment_sequence)) ||
 	    memcmp(dependency, packet->bytes.fragment_dependency, GPU_M4_EXEC_DEPENDENCY_SIZE) ||
 	    m4_ready_read32(dependency) != 4 ||
@@ -1655,8 +1653,7 @@ static void m4_user_render_fault_snapshot_locked(struct m4_user_job *j, u32 inde
 		struct m4_ready_buffer *q = p->execution->queue[e];
 		void *pipe = p->ready->buffer[GPU_M4_OBJECT_COUNT + e * 2].cpu;
 		void *work = n->work[e]->map.vaddr;
-		void *start = n->firmware[e ? GPU_M4_RENDER_FIRST_FRAGMENT_SEQUENCE_FW :
-			GPU_M4_RENDER_FIRST_TILER_SEQUENCE_FW]->map.vaddr;
+		void *start = m4_user_render_sequence_cpu(n, e);
 		struct gpu_m4_render_stage_retirement s = {
 			.notifier_fw = j->queue->notifier->bo->fw_va,
 			.uma_descriptor_fw = n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->fw_va,

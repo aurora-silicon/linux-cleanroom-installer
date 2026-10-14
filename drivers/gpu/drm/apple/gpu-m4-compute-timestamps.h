@@ -46,6 +46,7 @@ struct gpu_m4_compute_ts_input {
 	const void *work;
 	u64 work_fw;
 	u64 queue_fw;
+	u64 stamps_fw; /* the work's private stamp pair; 0: work_fw + 0x8c0 */
 	/* Independently absent endpoints are all-zero entries. Copies are dense
 	 * and preserve submitted order, even if two entries name the same slice.
 	 */
@@ -206,8 +207,8 @@ static inline int gpu_m4_compute_ts_prepare(void *output,
 	if (get_unaligned_le32(source) != 3 ||
 	    get_unaligned_le64(source + 0x760) != in->work_fw + 0x900 ||
 	    get_unaligned_le32(source + 0x768) != GPU_M4_EXEC_COMPUTE_SEQUENCE_SIZE ||
-	    get_unaligned_le64(source + 0x834) != in->work_fw + 0x8c0 ||
-	    get_unaligned_le64(source + 0x83c) != in->work_fw + 0x8c8 ||
+	    get_unaligned_le64(source + 0x834) != (in->stamps_fw ?: in->work_fw + 0x8c0) ||
+	    get_unaligned_le64(source + 0x83c) != (in->stamps_fw ?: in->work_fw + 0x8c0) + 8 ||
 	    get_unaligned_le64(source + 0x844) || get_unaligned_le64(source + 0x84c) ||
 	    !gpu_m4_compute_ts_record(source + 0xabc, in->work_fw, in->queue_fw, false) ||
 	    !gpu_m4_compute_ts_record(source + 0xb0c, in->work_fw, in->queue_fw, true) ||

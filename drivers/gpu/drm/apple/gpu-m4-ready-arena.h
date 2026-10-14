@@ -50,7 +50,24 @@ struct m4_command_arena {
 	u32 proved_extra;
 	int error;
 	bool prepared, imported, proved;
+	/* Cell upper class, fixed at prepare (cell_cached experiment). */
+	enum gpu_m4_drm_upper_class cell_class;
 };
+
+/* Read once at arena preparation: map the retained command cells ASC-cached
+ * (AttrIndex 0, FW+GPU RW), as native maps its command images and
+ * microsequences; the firmware cleans and invalidates their synchronized
+ * spans at admission and completion. Cells live until ASC stop, so no
+ * cached-mapping teardown is ever needed. 0 restores index 2 (boot only).
+ */
+static bool cell_cached = true;
+module_param(cell_cached, bool, 0444);
+MODULE_PARM_DESC(cell_cached, "Map command cells ASC-cached, as native (boot only, default 1)");
+
+static inline u64 m4_arena_cell_attrs(const struct m4_command_arena *a)
+{
+	return gpu_m4_drm_upper_class_attrs(a->cell_class);
+}
 
 static bool m4_ready_page_overlap(u64 pa, u64 base, u64 size)
 {
@@ -208,7 +225,7 @@ static int m4_arena_backing_ready(void *owner, u64 offset, u64 size,
 	struct m4_command_cell *c = owner;
 	int ret = m4_arena_cell_valid_locked(c);
 
-	if (offset || size != GPU_M4_DRM_PAGE_SIZE || class != GPU_M4_DRM_UPPER_SHARED)
+	if (offset || size != GPU_M4_DRM_PAGE_SIZE || class != c->arena->cell_class)
 		return -EINVAL;
 
 	/* Already-visible pre-RUN aliases are referenced, not republished. Native
@@ -266,6 +283,8 @@ static int m4_arena_prepare(struct m4_gpu_hello *h, struct gpu_m4_drm *frontend)
 	}
 	a->hello = h;
 	a->frontend = frontend; /* Same permanently retained pre-RUN frontend. */
+	a->cell_class = READ_ONCE(cell_cached) ? GPU_M4_DRM_UPPER_SHARED_CACHED :
+		GPU_M4_DRM_UPPER_SHARED;
 	a->upper_start = r->next_va;
 	memcpy(a->before[0], r->expected[M4_LOWER_LEAF], GPU_M4_DRM_PAGE_SIZE);
 	memcpy(a->before[1], r->expected[M4_UPPER_LEAF], GPU_M4_DRM_PAGE_SIZE);
@@ -409,7 +428,7 @@ static int m4_arena_prepare(struct m4_gpu_hello *h, struct gpu_m4_drm *frontend)
 		c->va = GPU_M4_BOOTSTRAP_LOWER + (u64)(first + 2 * i) * GPU_M4_DRM_PAGE_SIZE;
 		c->fw_va = a->upper_start + (u64)2 * i * GPU_M4_DRM_PAGE_SIZE;
 		put_unaligned_le64(c->pa | M4_ARENA_LOWER_ATTRS, a->sealed[0] + (first + 2 * i) * 8);
-		put_unaligned_le64(c->pa | GPU_M4_DRM_UPPER_SHARED_ATTRS,
+		put_unaligned_le64(c->pa | m4_arena_cell_attrs(a),
 			a->sealed[1] + ((c->fw_va - GPU_M4_HOST_START) >> 14) * 8);
 	}
 	memcpy(r->expected[M4_LOWER_LEAF], a->sealed[0], GPU_M4_DRM_PAGE_SIZE);
@@ -433,7 +452,7 @@ static int m4_arena_seed_locked(struct m4_gpu_hello *h,
 	lockdep_assert_held(&h->gpu->lock);
 	if (!a || !a->prepared || a->error || a->hello != h || !h->ready->published ||
 	    h->gpu->firmware_start_attempted || !h->gpu->stopped_verified ||
-	    class != GPU_M4_DRM_UPPER_SHARED)
+	    class != a->cell_class)
 		return -EPERM;
 	/* Match an actual retained owner first, without dereferencing foreign b->owner. */
 	for (u32 i = 0; i < M4_ARENA_CELLS; i++) {
@@ -480,7 +499,7 @@ static int m4_arena_import_locked(struct m4_gpu_hello *h,
 		struct gpu_m4_drm_upper_lease *lease;
 
 		lease = gpu_m4_drm_upper_import_seed_locked(upper, &c->backing,
-			c->fw_va, GPU_M4_DRM_UPPER_SHARED);
+			c->fw_va, a->cell_class);
 		if (IS_ERR(lease)) {
 			ret = PTR_ERR(lease);
 			goto fault;
@@ -528,7 +547,7 @@ static bool m4_arena_inventory_locked(struct m4_gpu_hello *h)
 		    get_unaligned_le64(a->before[1] + (upper + 1) * 8) ||
 		    get_unaligned_le64(a->sealed[0] + lower * 8) != (c->pa | M4_ARENA_LOWER_ATTRS) ||
 		    get_unaligned_le64(a->sealed[1] + upper * 8) !=
-			(c->pa | GPU_M4_DRM_UPPER_SHARED_ATTRS) ||
+			(c->pa | m4_arena_cell_attrs(a)) ||
 		    m4_ready_page_allowed_locked(h, c->pa, NULL))
 			return false;
 		for (u32 j = 0; j < i; j++)
@@ -592,7 +611,7 @@ static bool m4_arena_memory_check(struct m4_gpu_hello *h, bool full)
 			(c->pa | M4_ARENA_LOWER_ATTRS) ||
 		    get_unaligned_le64(page_address(r->table[M4_LOWER_LEAF]) + (lower + 1) * 8) ||
 		    get_unaligned_le64(page_address(r->table[M4_UPPER_LEAF]) + upper * 8) !=
-			(c->pa | GPU_M4_DRM_UPPER_SHARED_ATTRS) ||
+			(c->pa | m4_arena_cell_attrs(a)) ||
 		    get_unaligned_le64(page_address(r->table[M4_UPPER_LEAF]) + (upper + 1) * 8))
 			return false;
 	}
