@@ -1068,8 +1068,10 @@ static void g15_render_pools_init(struct g15_backend *be)
 
 	/*
 	 * PB: 8192 pages of 0x8000 in 2048 blocks of 0x20000 (contract 3); with
-	 * pb_grow the first pb_blocks of them, page limits at pb_max_blocks and
-	 * the block list's real 4096-record capacity (PB growth contract 1).
+	 * pb_grow the first pb_blocks of them and page limits at pb_max_blocks.
+	 * In every profile the block list declares its real 4096-record
+	 * capacity: PB reconstruction (also in recovery) synchronizes 8 * K
+	 * bytes of it (round-9 contract A1).
 	 */
 	r->pb_init_blocks = nb;
 	r->pb_max = mb;
@@ -1096,7 +1098,7 @@ static void g15_render_pools_init(struct g15_backend *be)
 	g15_buf_w64(&r->pb_mgr, 0x1c, r->pb_pages.gva);
 	g15_buf_w32(&r->pb_mgr, 0x24, 0x28000);
 	g15_buf_w32(&r->pb_mgr, 0x28, 4 * nb);
-	g15_buf_w32(&r->pb_mgr, 0x2c, pb_grow ? G15_PB_LIST_RECORDS : 0x26cd);
+	g15_buf_w32(&r->pb_mgr, 0x2c, G15_PB_LIST_RECORDS);
 	g15_buf_w32(&r->pb_mgr, 0x30, nb);
 	g15_buf_w64(&r->pb_mgr, 0x38, r->pb_blocks.gva);
 	g15_buf_w64(&r->pb_mgr, 0x40, r->block_ctl.va);
@@ -3430,6 +3432,7 @@ static void g15_pb_grow(struct g15_backend *be)
 		u32 q[14], n = 0;
 		u8 rec[0x38] = {};
 		bool live = false;
+		u64 epoch;
 		int ret;
 
 		mutex_lock(&gpu->lock);
@@ -3439,6 +3442,8 @@ static void g15_pb_grow(struct g15_backend *be)
 		}
 		memcpy(q, gpu->grow_req[gpu->grow_tail % G15_GROW_QUEUE], sizeof(q));
 		gpu->grow_tail++;
+		epoch = g15_r32(gpu, G15_CONTROL + G15_CTL_HALT_COUNT) |
+			(u64)g15_r32(gpu, G15_CONTROL + G15_CTL_HALT_COUNT + 4) << 32;
 		mutex_unlock(&gpu->lock);
 		be->st_pb_req++;
 		for (u32 k = 0; k < be->fl_count; k++) {
@@ -3446,10 +3451,13 @@ static void g15_pb_grow(struct g15_backend *be)
 
 			live |= f->renders && f->job->vm->asid == q[1];
 		}
-		if (!pb_grow || q[0] != 7 || q[2] || !live || q[3] < r->pb_next_req) {
+		/* A request from before a halt has no authority over the PB now. */
+		if (!pb_grow || q[0] != 7 || q[2] || !live || q[3] < r->pb_next_req ||
+		    (q[5] | (u64)q[6] << 32) != epoch) {
 			be->st_pb_bad++;
-			dev_warn(gpu->dev, "PB growth request not answered: ctx %u slot %u counter %u (next %u) live %d pb_grow %d\n",
-				 q[1], q[2], q[3], r->pb_next_req, live, pb_grow);
+			dev_warn(gpu->dev, "PB growth request not answered: ctx %u slot %u counter %u (next %u) epoch %#llx (now %#llx) live %d pb_grow %d\n",
+				 q[1], q[2], q[3], r->pb_next_req, q[5] | (u64)q[6] << 32, epoch,
+				 live, pb_grow);
 			continue;
 		}
 		r->pb_next_req = q[3] + 1;
@@ -3537,6 +3545,10 @@ static int g15_recover(struct g15_backend *be, bool *recovered)
 	u64 busy, fault;
 
 	*recovered = false;
+	/* Growth requests of the failed epoch are never answered. */
+	mutex_lock(&gpu->lock);
+	gpu->grow_tail = gpu->grow_head;
+	mutex_unlock(&gpu->lock);
 	smp_rmb();
 	g15_engine_state(be, &busy, &fault);
 	err = fault || gpu->err_type == 0 ? -EIO : -ETIMEDOUT;
