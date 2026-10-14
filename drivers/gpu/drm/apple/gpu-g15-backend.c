@@ -152,6 +152,7 @@
 #define G15_LEAF_CACHED		0x00c0000000000c83ULL
 #define G15_LEAF_PB_LIST	0x00e0000000000c03ULL
 #define G15_MAX_CLIENT		320
+#define G15_HORIZON_JOBS	4	/* jobs per compute horizon, and scheduler credits */
 
 static bool wb_sweep;
 module_param(wb_sweep, bool, 0644);
@@ -192,6 +193,19 @@ MODULE_PARM_DESC(pass_full_reset, "Also zero a pass slot's auxiliary, heap-metad
 static bool early_tiling = true;
 module_param(early_tiling, bool, 0444);
 MODULE_PARM_DESC(early_tiling, "Advertise fragment-only render dependencies: a flagged render's tiling may overlap the previous pass's fragments within a prefix");
+
+/*
+ * Compute horizons (round-6 contract B): a compute-only job published while
+ * further compute-only jobs of the same queue and VM are already waiting
+ * ready in the backend takes them into the same prefix, up to this many jobs
+ * in all. One SubmitQueue record then advertises the whole horizon, so the
+ * firmware scans, admits and notifies once for the group instead of once per
+ * job (class 0 keeps its one-work service quantum). Every job keeps its own
+ * slots, fence and error; the group retires together, fences in order.
+ */
+static unsigned int compute_horizon = G15_HORIZON_JOBS;
+module_param(compute_horizon, uint, 0644);
+MODULE_PARM_DESC(compute_horizon, "Ready compute-only jobs of one queue published in one prefix, 1..4 (1: one job per prefix)");
 
 static unsigned int deadline_ms = 5000;
 module_param(deadline_ms, uint, 0644);
@@ -431,6 +445,9 @@ struct g15_flight {
 	struct g15_ct *ct[G15_RENDER_SLOTS];
 	u32 ct_count;
 	bool rotating;
+	/* Whole compute-only jobs published behind job in this prefix (in order). */
+	struct g15_job *group[G15_HORIZON_JOBS - 1];
+	u32 group_count;
 	u64 pub_ns;
 	unsigned long published_at;
 };
@@ -494,6 +511,7 @@ struct g15_backend {
 	u64 st_clustered;			/* clustered render members */
 	u64 st_ct_sync;				/* clustering buffers zeroed at claim */
 	u64 st_slot_sync;			/* compute slots scrubbed at claim */
+	u64 st_grouped;				/* jobs published behind another in a compute horizon */
 	bool chan_wait;		/* a ready prefix waits only for a record's consumption */
 	spinlock_t ct_lock;
 	struct work_struct ct_clear;
@@ -2670,6 +2688,19 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	pf->prev = 2;
 }
 
+static struct g15_flight *g15_oldest(struct g15_backend *be)
+{
+	return be->fl_count ? &be->fl[be->fl_first] : NULL;
+}
+
+/* Host deadline of the oldest published prefix f: deadline_ms per job it runs. */
+static void g15_deadline(struct g15_backend *be, const struct g15_flight *f)
+{
+	u32 jobs = f ? 1 + f->group_count : 1;
+
+	be->deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(deadline_ms), 100U) * jobs);
+}
+
 /*
  * Publish the next prefix of submission job, from its first unpublished
  * command (be->lock held). Members: consecutive commands of one engine, or
@@ -2779,6 +2810,40 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 			goto out;	/* nothing published yet */
 	}
 	/*
+	 * Compute horizon: whole compute-only jobs of the same queue and VM that
+	 * already wait ready (their inputs resolved before drm_sched ran them),
+	 * in queue order, into slots still free. A job of that queue that does
+	 * not qualify ends the group: no later job overtakes it.
+	 */
+	if (!renders && end == job->count) {
+		u32 max = clamp(READ_ONCE(compute_horizon), 1U, (u32)G15_HORIZON_JOBS);
+		struct g15_job *j2, *tmp;
+
+		list_for_each_entry_safe(j2, tmp, &be->pending, link) {
+			bool compute_only = true;
+
+			if (1 + f->group_count >= max)
+				break;
+			if (j2 == job || j2->q != job->q)
+				continue;
+			for (u32 k = 0; k < j2->count; k++)
+				compute_only &= !j2->cmds[k].render;
+			if (!compute_only || j2->vm != job->vm || j2->sent || !j2->count ||
+			    computes + j2->count > free_c)
+				break;
+			for (u32 k = 0; k < j2->count && !ret; k++)
+				ret = g15_prefix_compute(be, j2, &j2->cmds[k], &pf, f);
+			if (ret)
+				goto out;	/* nothing published yet */
+			computes += j2->count;
+			j2->sent = j2->count;
+			j2->q->turn = ++be->turn;
+			list_del_init(&j2->link);
+			f->group[f->group_count++] = j2;
+			be->st_grouped++;
+		}
+	}
+	/*
 	 * Host thresholds/counters after the whole prefix (contract 2 table).
 	 * The notifiers' context (+0x24) is not ours to write: every completing
 	 * work stores its own context there before the service reads it.
@@ -2839,7 +2904,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	if (overlap)
 		be->st_overlaps++;
 	else
-		be->deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(deadline_ms), 100U));
+		g15_deadline(be, f);
 	job->sent = end;
 	be->fl_count++;
 	/* Compute on channel 2, then FS on channel 1, then TA on channel 0 (R8). */
@@ -2881,11 +2946,6 @@ out:
 	kfree(tas);
 	kfree(fss);
 	return ret;
-}
-
-static struct g15_flight *g15_oldest(struct g15_backend *be)
-{
-	return be->fl_count ? &be->fl[be->fl_first] : NULL;
 }
 
 /*
@@ -3098,12 +3158,17 @@ static struct g15_job *g15_pick(struct g15_backend *be)
 static void g15_fail_flights(struct g15_backend *be, int error)
 {
 	for (u32 k = 0; k < be->fl_count; k++) {
-		struct g15_job *job = be->fl[(be->fl_first + k) % G15_FLIGHTS].job;
+		struct g15_flight *f = &be->fl[(be->fl_first + k) % G15_FLIGHTS];
 
-		gpu_m4_drm_vm_error(job->vm->frontend, error);
-		g15_signal(job, error);
-		if (list_empty(&job->link))
-			list_add_tail(&job->link, &be->retained);
+		for (u32 m = 0; m <= f->group_count; m++) {
+			struct g15_job *job = m ? f->group[m - 1] : f->job;
+
+			gpu_m4_drm_vm_error(job->vm->frontend, error);
+			g15_signal(job, error);
+			if (list_empty(&job->link))
+				list_add_tail(&job->link, &be->retained);
+		}
+		f->group_count = 0;
 	}
 	be->fl_count = 0;
 }
@@ -3362,7 +3427,7 @@ static void g15_flight_done(struct g15_backend *be, struct g15_flight *f, int er
 	if (!be->fl_count)
 		be->idle_from_ns = ktime_get_ns();	/* drained: a gap until the next publication */
 	/* The next prefix starts executing about now. */
-	be->deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(deadline_ms), 100U));
+	g15_deadline(be, g15_oldest(be));
 	job->next += f->count;
 	if (error) {
 		gpu_m4_drm_vm_error(job->vm->frontend, error);
@@ -3384,6 +3449,24 @@ static void g15_flight_done(struct g15_backend *be, struct g15_flight *f, int er
 	g15_guard_put(job);
 	g15_signal(job, 0);
 	list_add_tail(&job->link, done);
+	/* The rest of a compute horizon, after the first job (fence order). */
+	for (u32 k = 0; k < f->group_count; k++) {
+		struct g15_job *j2 = f->group[k];
+
+		j2->next = j2->count;
+		if (error) {
+			gpu_m4_drm_vm_error(j2->vm->frontend, error);
+			g15_signal(j2, error);
+		} else {
+			be->st_jobs++;
+			be->st_job_cmds += j2->count;
+			be->st_job_max = max_t(u64, be->st_job_max, j2->count);
+		}
+		g15_guard_put(j2);
+		g15_signal(j2, 0);
+		list_add_tail(&j2->link, done);
+	}
+	f->group_count = 0;
 }
 
 static void g15_poll_work(struct work_struct *work)
@@ -3534,8 +3617,9 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "jobs %llu job_cmds %llu job_max %llu early %llu recoveries %llu hang_kills %llu clustered %llu\n",
 		   be->st_jobs, be->st_job_cmds, be->st_job_max, be->st_early, be->st_recoveries,
 		   be->st_hang_kills, be->st_clustered);
-	seq_printf(m, "ct_sync %llu slot_sync %llu starved_us %llu prep_us %llu\n", be->st_ct_sync,
-		   be->st_slot_sync, div_u64(be->st_starved_ns, 1000), div_u64(be->st_prep_ns, 1000));
+	seq_printf(m, "ct_sync %llu slot_sync %llu starved_us %llu prep_us %llu grouped %llu\n",
+		   be->st_ct_sync, be->st_slot_sync, div_u64(be->st_starved_ns, 1000),
+		   div_u64(be->st_prep_ns, 1000), be->st_grouped);
 	seq_printf(m, "stage: ta_us %llu fs_us %llu cdm_us %llu span_us %llu\n",
 		   div_u64(be->st_ta_ticks, 24), div_u64(be->st_fs_ticks, 24),
 		   div_u64(be->st_cdm_ticks, 24), div_u64(be->st_span_ticks, 24));
@@ -4325,7 +4409,8 @@ static void *g15_queue_create(void *owner, void *cookie, u32 priority, u64 usc_b
 	struct gpu_m4_drm_sched_config config = {
 		.dev = be->gpu->dev, .ops = &g15_sched_ops, .priority = priority,
 		.client_id = (u64)(uintptr_t)vm, .timeout = msecs_to_jiffies(3000),
-		.credit_limit = 2,	/* the next job waits in the backend, ready */
+		/* Further jobs wait ready in the backend: the next prefix, or a compute horizon. */
+		.credit_limit = G15_HORIZON_JOBS,
 	};
 	struct g15_queue *q;
 
