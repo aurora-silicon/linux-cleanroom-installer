@@ -18,7 +18,7 @@ struct gpu_m4_drm_sched_gate {
 };
 
 /*
- * Ordered terminal of one armed job when the queue runs two credits: the
+ * Ordered terminal of one armed job when the queue runs several credits: the
  * scheduler FINISHED fences of one entity share a context, so a later job's
  * must never signal before an earlier one's (dma-fence ordering, dma_resv
  * replacement), success or error. This fence, handed to drm_sched as the
@@ -59,7 +59,7 @@ struct gpu_m4_drm_sched_queue {
 	void *owner;
 	char *name;
 	u64 client_id;
-	struct dma_fence *last_finished; /* newest armed job's FINISHED (credit two) */
+	struct dma_fence *last_finished; /* newest armed job's FINISHED (credits > 1) */
 	u32 credit_limit;
 	bool closed, drained;
 };
@@ -395,7 +395,7 @@ static int gpu_m4_drm_sched_dependency_failed(struct gpu_m4_drm_sched_job *job, 
 
 /*
  * drm_sched never waits for a fence of the job's own entity (its scheduled or
- * finished context): the entity runs its jobs in order and, with two credits,
+ * finished context): the entity runs its jobs in order and, with several credits,
  * an earlier job of this queue may still be executing when a later one that
  * names it is prepared. The provider orders the later packet's first command
  * behind its queue's published window, so such a still-pending input is
@@ -425,8 +425,8 @@ gpu_m4_drm_sched_prepare_job(struct drm_sched_job *base,
 	job = container_of(base, struct gpu_m4_drm_sched_job, base);
 	/* drm_sched resolves dependencies only for an entity's next job that
 	 * already holds scheduling credit: with credit one, every earlier job
-	 * of this queue has completed (with two, every earlier one but the
-	 * newest already ran). The provider may begin unpublished CPU
+	 * of this queue has completed (with more, every earlier one already
+	 * ran, the newest may still execute). The provider may begin unpublished CPU
 	 * preparation now, outside every helper lock; run still waits below.
 	 */
 	if (!job->dependencies_begun) {
@@ -562,7 +562,7 @@ static struct dma_fence *gpu_m4_drm_sched_run_job(struct drm_sched_job *base)
 		fence = ERR_PTR(-EIO);
 	}
 out:
-	/* Two credits: FINISHED stays in entity order, success or error. */
+	/* Several credits: FINISHED stays in entity order, success or error. */
 	if (job->terminal && job->previous) {
 		struct gpu_m4_drm_sched_terminal *t = job->terminal;
 
@@ -700,7 +700,7 @@ gpu_m4_drm_sched_queue_create(const struct gpu_m4_drm_sched_config *config)
 	    !config->ops->fault || !config->ops->release || !config->ops->closed)
 		return ERR_PTR(-EOPNOTSUPP);
 	if (config->timeout <= 0 || config->timeout == MAX_SCHEDULE_TIMEOUT ||
-	    config->credit_limit > (u32)GPU_M4_DRM_SCHED_MAX_CREDITS)
+	    config->credit_limit > (u32)GPU_M4_DRM_SCHED_QUEUE_CREDITS)
 		return ERR_PTR(-EINVAL);
 	args.credit_limit = config->credit_limit ?: 1;
 	/* Host entity levels only: the shared firmware queues and their fields
