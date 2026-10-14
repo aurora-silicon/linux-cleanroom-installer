@@ -95,13 +95,19 @@ MODULE_PARM_DESC(ktrace_mask, "Firmware Ktrace class mask published at initdata 
  * (host-written only at initdata). Bit 4: the scheduling context and the
  * queues' notifier list heads (firmware-written after registration, which
  * synchronizes the context; the host only reads its registration bytes).
+ * Bit 5: the initdata Runtime (channel descriptors, ring/activity/table
+ * pointers and the firmware's runtime state) and Main (configuration and
+ * performance-state tables) records, which the firmware reads on every
+ * scheduling pass; the host writes them only at initdata and reads back only
+ * its own Main performance-state table. Globals (host-written performance
+ * ceilings), FirmwareData, Control and the host-drained rings stay index 2.
  * All of these allocations live until reboot, so no cached-mapping teardown
  * is ever needed. Read once before the bootstrap tables are built (boot
  * only); 0 restores index 2 everywhere.
  */
-static unsigned int queue_cached = 31;
+static unsigned int queue_cached = 63;
 module_param(queue_cached, uint, 0400);
-MODULE_PARM_DESC(queue_cached, "Map session queue records ASC-cached, as native: 1 pipe records, 2 work rings, 4 queue-info, 8 engine activity, 16 context/notifier lists (boot only, default 31)");
+MODULE_PARM_DESC(queue_cached, "Map session queue records ASC-cached, as native: 1 pipe records, 2 work rings, 4 queue-info, 8 engine activity, 16 context/notifier lists, 32 Runtime/Main (boot only, default 63)");
 
 struct m4_ready_buffer {
 	void *cpu;
@@ -176,9 +182,13 @@ static u64 m4_ready_queue_attrs(const struct m4_gpu_ready *r, u32 bit)
 	return r->queue_cached & bit ? 0x00c0000000000443ULL : 0x00c000000000044bULL;
 }
 
-/* queue_cached bit 3: the per-engine activity records of works. */
+/* queue_cached bit 3: the per-engine activity records of works; bit 5: the
+ * Runtime and Main records.
+ */
 static bool m4_ready_object_cached(const struct m4_gpu_ready *r, u32 id)
 {
+	if ((r->queue_cached & 0x20) && (id == GPU_M4_RUNTIME || id == GPU_M4_MAIN))
+		return true;
 	return (r->queue_cached & 8) && (id == GPU_M4_ACTIVITY_TILER ||
 		id == GPU_M4_ACTIVITY_FRAGMENT || id == GPU_M4_ACTIVITY_COMPUTE);
 }
@@ -362,7 +372,7 @@ static int m4_ready_prepare(struct m4_gpu_hello *h)
 	if (ret)
 		return ret;
 	r->next_va = GPU_M4_HOST_START;
-	r->queue_cached = READ_ONCE(queue_cached) & 31;
+	r->queue_cached = READ_ONCE(queue_cached) & 63;
 	for (unsigned int i = 0; i < GPU_M4_OBJECT_COUNT; i++) {
 		ret = m4_ready_buffer(h, i, gpu_m4_object_size[i],
 			 i == GPU_M4_UMA || i == GPU_M4_PARAMETER ? GPU_M4_SHARED_RW :
