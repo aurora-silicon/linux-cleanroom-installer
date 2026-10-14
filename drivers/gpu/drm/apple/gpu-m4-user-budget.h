@@ -21,9 +21,11 @@
 #define M4_ORDINARY_NATIVE_MEMORY_LIMIT (8ULL << 30)
 #define M4_ORDINARY_WORK_CELLS 368U
 /* Arena cells after the work cells hold logical-queue notifier records,
- * 16 notifiers per cell, never recycled (see m4_user_notifier_records).
+ * 16 notifiers per cell, never recycled (see m4_user_notifier_records):
+ * 1024 logical queues per boot, then records on the queue's NC notifier
+ * page. 64 cells (1 MiB) keep CTS-sized churn on the cached records.
  */
-#define M4_NOTIFY_RECORD_CELLS 16U
+#define M4_NOTIFY_RECORD_CELLS 64U
 #define M4_NOTIFY_RECORDS_PER_CELL 16U
 #define M4_NOTIFY_RECORD_SPAN 0x400U
 #define M4_NOTIFY_RECORD_STRIDE 0x140U
