@@ -63,14 +63,6 @@
 #define G15_COMPUTE_SLOTS	16
 #define G15_CWORK_STRIDE	0x4000ULL
 #define G15_PREEMPT_STRIDE	0x10000ULL
-/*
- * Kernel-owned CDM streams: one 16 KiB page per compute slot, GPU read-only
- * in every VM, holding the linear stream of a merged compute work.
- */
-#define G15_CDM_GVA		0x7500000000ULL
-#define G15_CDM_STRIDE		0x4000ULL
-#define G15_CDM_LAUNCH		0x30	/* direct launch + both barriers */
-#define G15_CDM_MERGE_MAX	((G15_CDM_STRIDE - 4) / G15_CDM_LAUNCH)
 
 /* Context-0 lower work alias: owned lower tree, GPU RW NC, non-global (Q3). */
 #define G15_PTE_LOWER		0x00c0000000000c8bULL
@@ -216,22 +208,6 @@ static unsigned int compute_fault_mask = 1;
 module_param(compute_fault_mask, uint, 0644);
 MODULE_PARM_DESC(compute_fault_mask, "Compute Start +0x30: 1 (donor) masks the context's MMU faults (unmapped stores are absorbed), 0 lets them fault");
 
-static bool cdm_merge = true;
-module_param(cdm_merge, bool, 0644);
-MODULE_PARM_DESC(cdm_merge, "Publish consecutive compute commands whose streams are one direct launch, its two barriers and a terminate as one firmware compute work running a kernel-owned copy of their launches and barriers; 0: one work per command");
-
-static unsigned int merge_max = 64;
-module_param(merge_max, uint, 0644);
-MODULE_PARM_DESC(merge_max, "Commands per merged compute work, 2..340 (cdm_merge)");
-
-static bool job_merge = true;
-module_param(job_merge, bool, 0644);
-MODULE_PARM_DESC(job_merge, "With cdm_merge: a submission whose commands are all mergeable computes joins the merged work of the same queue's preceding submission when both are ready, and completes with it");
-
-static unsigned int queue_credits = 32;
-module_param(queue_credits, uint, 0444);
-MODULE_PARM_DESC(queue_credits, "Submissions of one queue handed to the engine before the oldest completes, 1..64 (deeper lets ready submissions merge)");
-
 static unsigned int repoll_us = 15;
 module_param(repoll_us, uint, 0644);
 MODULE_PARM_DESC(repoll_us, "Retry a prefix ready behind the running ones, held only by a channel's unconsumed record, after this many us, 5..100 (0: at the next completion check)");
@@ -272,7 +248,6 @@ static const struct drm_asahi_params_global g15_params = {
 struct g15_buf {
 	u64 va, gva, off, size;
 	u64 client_attrs;	/* client DRIVER leaf (0: GPU-only NC RW) */
-	bool client_ro;		/* client mapping GPU read-only (NC) */
 	u32 count;
 	void **cpu;		/* NULL entries: GPU-only pages without a CPU view */
 	u64 *pa;
@@ -288,7 +263,6 @@ struct g15_graph {
 	struct g15_buf legacy, pools[G15_POOLS], freelist, pool_table, manager, counter;
 	struct g15_buf sched_ctx, notifier, threshold, job_list;
 	struct g15_buf qinfo, qstate, ring, qscratch, user_stamp, fw_stamp;
-	struct g15_buf cdm;	/* merged streams, slot k at k * G15_CDM_STRIDE */
 	struct g15_slot slot[G15_COMPUTE_SLOTS];
 	u32 slots;
 	u32 cursor;				/* next slot to try */
@@ -416,8 +390,6 @@ struct g15_backend {
 	u64 st_clustered;			/* clustered render members */
 	u64 st_ct_sync;				/* clustering buffers zeroed at claim */
 	u64 st_slot_sync;			/* compute slots scrubbed at claim */
-	u64 st_merged, st_merge_works;		/* commands joined into merged works; those works */
-	u64 st_absorbed;			/* submissions absorbed by a predecessor */
 	bool chan_wait;		/* a ready prefix waits only for a record's consumption */
 	spinlock_t ct_lock;
 	struct work_struct ct_clear;
@@ -636,9 +608,6 @@ static int g15_graph_alloc(struct g15_backend *be)
 	ret = ret ?: g15_buf_alloc(be, &g->qscratch, 0x40000, sh, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->user_stamp, 4, sh, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->fw_stamp, 4, sh, 0, 0, false);
-	g->cdm.client_ro = true;
-	ret = ret ?: g15_buf_alloc(be, &g->cdm, G15_COMPUTE_SLOTS * G15_CDM_STRIDE, 0, G15_CDM_GVA,
-				   0, false);
 	/* Distinct mutable command slots; shared queue, stamps and allocator. */
 	g->slots = clamp(compute_slots, 1U, (u32)G15_COMPUTE_SLOTS);
 	for (u32 k = 0; !ret && k < g->slots; k++) {
@@ -1243,7 +1212,7 @@ static int g15_vm_map_graph(struct g15_vm *vm)
 
 		ops[i] = (struct gpu_m4_vm_tree_op) {
 			.va = b->gva - b->off, .size = b->size, .object_size = b->size, .pa = b->pa,
-			.access = DRM_ASAHI_BIND_READ | (b->client_ro ? 0 : DRM_ASAHI_BIND_WRITE),
+			.access = DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE,
 			.flags = GPU_M4_VM_TREE_DRIVER, .identity = b,
 			.cpu_policy = GPU_M4_DRM_CPU_NC, .attrs = b->client_attrs,
 		};
@@ -1308,15 +1277,6 @@ struct g15_queue {
 /* Compute: ts 0/1 start/end. Render: 0/1 vertex start/end, 2/3 fragment. */
 struct g15_cmd {
 	bool render;
-	/*
-	 * Compute: the stream is exactly one direct launch, its two barriers
-	 * and a terminate (merge); cdm holds the validated launch and barriers.
-	 * At publication (its dependencies satisfied) the stream is read again
-	 * (checked) and only merged if unchanged (now). join: published as part
-	 * of the previous command's merged work.
-	 */
-	bool merge, checked, now, join;
-	u8 cdm[G15_CDM_LAUNCH];
 	struct drm_asahi_cmd_compute c;
 	struct drm_asahi_cmd_render r;
 	struct drm_asahi_attachment att[G15_MAX_ATTACHMENTS];
@@ -1328,18 +1288,12 @@ struct g15_cmd {
 struct g15_job {
 	struct kref ref;
 	struct list_head link;
-	/*
-	 * Later submissions of the same queue whose commands were moved into
-	 * this one (job_merge): they complete, in order, right after it.
-	 */
-	struct list_head absorbed;
 	struct g15_queue *q;
 	struct g15_vm *vm;
 	struct g15_cmd *cmds;
 	u32 count, next;		/* next: first command not yet retired */
 	u32 sent;			/* first command not yet published */
 	struct dma_fence *fence;
-	int error;			/* the error its fence was signaled with */
 	bool guard, signaled;
 };
 
@@ -1374,7 +1328,6 @@ static void g15_job_release(struct kref *ref)
 {
 	struct g15_job *job = container_of(ref, struct g15_job, ref);
 
-	WARN_ON(!list_empty(&job->absorbed));
 	g15_guard_put(job);
 	for (u32 i = 0; i < job->count; i++) {
 		for (u32 t = 0; t < 4; t++)
@@ -1551,9 +1504,10 @@ static void g15_stat_retire(struct g15_backend *be, struct g15_flight *f)
  * image and microsequence (contracts 4, 5), slot storage reset.
  */
 static int g15_encode_compute(struct g15_backend *be, struct g15_slot *s,
-			      const struct g15_cmd *cmd, u32 ctx, u64 n, u64 cdm_base, u64 cdm_end)
+			      const struct g15_cmd *cmd, u32 ctx, u64 n)
 {
 	struct g15_graph *g = &be->g;
+	const struct drm_asahi_cmd_compute *c = &cmd->c;
 	u64 W = s->work.va, Q = g->qinfo.va, H = G15_HWDATA, pre = s->preempt.gva;
 	u32 T = g15_stamp(n);
 	u8 *w, *q;
@@ -1563,7 +1517,7 @@ static int g15_encode_compute(struct g15_backend *be, struct g15_slot *s,
 		0x101d1, 0xd479, 0x1a0e9, 0x107a1, 0xa599, 0xd411,
 	};
 	u64 val[22] = {
-		pre, cdm_base, pre + 0x1480, pre + 0x1488, pre + 0x1490,
+		pre, c->cdm_ctrl_stream_base, pre + 0x1480, pre + 0x1488, pre + 0x1490,
 		pre + 0x1498, 0x154024201ULL, 0x10c08860, 0x1c, 0x1c, 0, 0, 0, 0, 0, 0,
 		0, 0, 8, 0xff0000, 0x13200400020ULL, 0x200000001ULL,
 	};
@@ -1591,7 +1545,7 @@ static int g15_encode_compute(struct g15_backend *be, struct g15_slot *s,
 	put_unaligned_le64(s->seq.va, w + 0x760);
 	put_unaligned_le32(G15_SEQ_SIZE, w + 0x768);
 	put_unaligned_le64(pre, w + 0x794);
-	put_unaligned_le64(cdm_end - 4, w + 0x79c);	/* the final terminate */
+	put_unaligned_le64(c->cdm_ctrl_stream_end - 4, w + 0x79c);
 	put_unaligned_le64(0x154024201ULL, w + 0x7c4);
 	put_unaligned_le32(0xffffffff, w + 0x7e0);
 	put_unaligned_le64(g->user_stamp.va, w + 0x7e8);
@@ -2336,39 +2290,21 @@ struct g15_prefix {
  * Compute member: encode into its slot and append to the CDM ring. After a
  * render of the same prefix it first waits on that render's FS (scheduling
  * contract 2, render -> compute): a distinct barrier entry ahead of the work.
- * With m > 1 the m consecutive mergeable commands from cmd run as this one
- * work, in API order.
  */
 static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
-			      const struct g15_cmd *cmd, u32 m, struct g15_prefix *pf,
+			      const struct g15_cmd *cmd, struct g15_prefix *pf,
 			      struct g15_flight *f)
 {
 	struct g15_graph *g = &be->g;
 	const struct drm_asahi_cmd_compute *c = &cmd->c;
-	u64 n = pf->n + 1, base = c->cdm_ctrl_stream_base, end = c->cdm_ctrl_stream_end;
+	u64 n = pf->n + 1;
 	u32 T = g15_stamp(n), index;
 	struct g15_slot *s = g15_slot_claim(be, f, pf->computes, &index);
 	int ret;
 
 	if (!s)
 		return -EBUSY;	/* nothing published yet */
-	if (m > 1) {
-		/*
-		 * Merged work: the members' validated launches, each with its
-		 * own two barriers, in API order, then one terminate, in this
-		 * slot's kernel-owned stream page.
-		 */
-		u64 off = index * G15_CDM_STRIDE;
-
-		for (u32 j = 0; j < m; j++)
-			g15_buf_write(&g->cdm, off + j * G15_CDM_LAUNCH, cmd[j].cdm, G15_CDM_LAUNCH);
-		g15_buf_w32(&g->cdm, off + m * G15_CDM_LAUNCH, 0x40000000);
-		base = g->cdm.gva + off;
-		end = base + m * G15_CDM_LAUNCH + 4;
-		be->st_merged += m - 1;
-		be->st_merge_works++;
-	}
-	ret = g15_encode_compute(be, s, cmd, job->vm->asid, n, base, end);
+	ret = g15_encode_compute(be, s, cmd, job->vm->asid, n);
 	if (ret)
 		return ret;	/* nothing published yet */
 	if (pf->prev == 2) {
@@ -2383,7 +2319,8 @@ static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
 			 n, index, job->vm->asid, c->cdm_ctrl_stream_base,
 			 c->cdm_ctrl_stream_end, c->flags, cmd->att_count, cmd->ts_va[0],
 			 cmd->ts_va[1]);
-		g15_dump_client(be, job->vm, "  cdm", base, end - base);
+		g15_dump_client(be, job->vm, "  cdm", c->cdm_ctrl_stream_base,
+				c->cdm_ctrl_stream_end - c->cdm_ctrl_stream_base);
 	}
 	pf->computes++;
 	pf->n = n;
@@ -2545,79 +2482,6 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 }
 
 /*
- * Client reads through the VM's own translations and the linear map, with
- * the last page translation and the last proven program page cached for one
- * parse (a submission's commands usually share their stream pages).
- */
-struct g15_reader {
-	struct g15_vm *vm;
-	u64 page, prog_page;	/* ~0: none */
-	unsigned long cpu;	/* linear-map address of page */
-};
-
-static void g15_reader_init(struct g15_reader *rd, struct g15_vm *vm)
-{
-	rd->vm = vm;
-	rd->page = rd->prog_page = ~0ULL;
-}
-
-/* Clean+invalidate (never plain invalidate): CPU-written lines may be dirty. */
-static int g15_reader_read(struct g15_reader *rd, u64 va, void *dst, u32 len)
-{
-	while (len) {
-		u64 page = va & ~(G15_PAGE - 1);
-		u32 n = min_t(u64, len, G15_PAGE - (va & (G15_PAGE - 1)));
-		unsigned long cpu;
-
-		if (page != rd->page) {
-			struct gpu_m4_drm_vm_leaf leaf = {};
-
-			if (gpu_m4_vm_tree_page(rd->vm->tree, page, DRM_ASAHI_BIND_READ, &leaf))
-				return -EFAULT;
-			rd->page = page;
-			rd->cpu = (unsigned long)phys_to_virt(leaf.pa);
-		}
-		cpu = rd->cpu + (va & (G15_PAGE - 1));
-		dcache_clean_poc(cpu & ~63UL, ALIGN(cpu + n, 64));
-		dcache_inval_poc(cpu & ~63UL, ALIGN(cpu + n, 64));
-		memcpy(dst, (void *)cpu, n);
-		va += n;
-		dst = (u8 *)dst + n;
-		len -= n;
-	}
-	return 0;
-}
-
-static int g15_client_read(struct g15_vm *vm, u64 va, void *dst, u32 len)
-{
-	struct g15_reader rd;
-
-	g15_reader_init(&rd, vm);
-	return g15_reader_read(&rd, va, dst, len);
-}
-
-/*
- * A mergeable compute whose stream still holds the validated bytes, read
- * after its submission's dependencies are satisfied (a producer named by
- * them may have written it after the submission was accepted): once per
- * command, before it is first considered for a merged work.
- */
-static bool g15_merge_now(struct g15_reader *rd, struct g15_cmd *cmd)
-{
-	u8 b[G15_CDM_LAUNCH + 4];
-
-	if (!cmd->merge)
-		return false;
-	if (!cmd->checked) {
-		cmd->checked = true;
-		cmd->now = !g15_reader_read(rd, cmd->c.cdm_ctrl_stream_base, b, sizeof(b)) &&
-			!memcmp(b, cmd->cdm, G15_CDM_LAUNCH) &&
-			get_unaligned_le32(b + G15_CDM_LAUNCH) == 0x40000000;
-	}
-	return cmd->now;
-}
-
-/*
  * Publish the next prefix of submission job, from its first unpublished
  * command (be->lock held). Members: consecutive commands of one engine, or
  * with mixed_prefix of both engines in API order, each in a free compute or
@@ -2641,45 +2505,26 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	bool overlap = be->fl_count, mixed = READ_ONCE(mixed_prefix);
 	struct g15_prefix pf = { .n = be->ordinal, .draw = r->draw };
 	u32 i = job->sent, ctx = job->vm->asid, computes = 0, renders = 0, end, free_c;
-	u32 group = 0, cap = clamp(READ_ONCE(merge_max), 2U, (u32)G15_CDM_MERGE_MAX);
-	bool render0 = job->cmds[i].render, merge = READ_ONCE(cdm_merge), prev = false;
-	struct g15_reader rd;
+	bool render0 = job->cmds[i].render;
 	u8 *ta = NULL, *fs = NULL, *tas = NULL, *fss = NULL;
 	struct g15_geom geo;
 	int ret = 0;
 
 	be->prep_from_ns = ktime_get_ns();
 	memset(f, 0, sizeof(*f));
-	g15_reader_init(&rd, job->vm);
 	free_c = g15_slots_free(be);
 	for (end = i; end < job->count; end++) {
-		struct g15_cmd *cmd = &job->cmds[end];
+		const struct g15_cmd *cmd = &job->cmds[end];
 		int k;
 
-		cmd->join = false;
 		if (cmd->render != render0 && !mixed)
 			break;
 		if (!cmd->render) {
-			/*
-			 * A mergeable compute right after a mergeable compute of
-			 * this prefix joins its work (and slot): consecutive in API
-			 * order, nothing in between.
-			 */
-			bool now = merge && g15_merge_now(&rd, cmd);
-
-			if (now && prev && group < cap) {
-				cmd->join = true;
-				group++;
-				continue;
-			}
 			if (computes == free_c)
 				break;
 			computes++;
-			group = 1;
-			prev = now;
 			continue;
 		}
-		prev = false;
 		g15_geometry(&cmd->r, 0, &geo);
 		k = g15_pass_pick(r, &geo, f->pass_mask);
 		if (k < 0)
@@ -2733,17 +2578,12 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	f->fs_start = pf.fs_head;
 	for (u32 k = i; k < end; k++) {
 		const struct g15_cmd *cmd = &job->cmds[k];
-		u32 m = 1;
 
-		if (cmd->join)
-			continue;	/* published in its group's work */
 		if (cmd->render) {
 			g15_prefix_render(be, job, cmd, &pf, f, ta, fs, tas, fss);
 			continue;
 		}
-		while (k + m < end && job->cmds[k + m].join)
-			m++;
-		ret = g15_prefix_compute(be, job, cmd, m, &pf, f);
+		ret = g15_prefix_compute(be, job, cmd, &pf, f);
 		if (ret)
 			goto out;	/* nothing published yet */
 	}
@@ -3036,62 +2876,9 @@ static void g15_signal(struct g15_job *job, int error)
 	if (job->signaled)
 		return;
 	job->signaled = true;
-	job->error = error;
 	if (error)
 		dma_fence_set_error(job->fence, error);
 	dma_fence_signal(job->fence);
-}
-
-/*
- * The submissions absorbed by job complete after it, in queue order, with
- * its error; on success their guards drop now, failed ones keep everything
- * until their release (to: done or retained).
- */
-static void g15_absorbed_done(struct g15_job *job, int error, struct list_head *to)
-{
-	struct g15_job *a, *tmp;
-
-	list_for_each_entry_safe(a, tmp, &job->absorbed, link) {
-		list_del_init(&a->link);
-		if (error)
-			gpu_m4_drm_vm_error(a->vm->frontend, error);
-		else
-			g15_guard_put(a);
-		g15_signal(a, error);
-		list_add_tail(&a->link, to);
-	}
-}
-
-/*
- * Cross-submission merge (job_merge): the ready successors of job's queue,
- * in queue order, whose commands are all mergeable computes, move their
- * commands behind job's last one (itself a mergeable compute), so that its
- * prefix publishes them in one merged work. The first successor of the queue
- * that does not qualify ends it. be->lock held; job is in be->pending.
- */
-static void g15_absorb(struct g15_backend *be, struct g15_job *job)
-{
-	struct g15_job *next = job, *tmp;
-
-	if (!READ_ONCE(job_merge) || !READ_ONCE(cdm_merge) || !job->count ||
-	    job->cmds[job->count - 1].render || !job->cmds[job->count - 1].merge)
-		return;
-	list_for_each_entry_safe_continue(next, tmp, &be->pending, link) {
-		bool ok = !next->sent && next->count &&
-			job->count + next->count <= g15_params.max_commands_per_submission;
-
-		if (next->q != job->q)
-			continue;
-		for (u32 k = 0; ok && k < next->count; k++)
-			ok = !next->cmds[k].render && next->cmds[k].merge;
-		if (!ok)
-			break;
-		memcpy(job->cmds + job->count, next->cmds, next->count * sizeof(*next->cmds));
-		job->count += next->count;
-		next->count = 0;	/* its commands (no owned references) moved */
-		list_move_tail(&next->link, &job->absorbed);
-		be->st_absorbed++;
-	}
 }
 
 /*
@@ -3123,7 +2910,6 @@ static void g15_fail_flights(struct g15_backend *be, int error)
 		g15_signal(job, error);
 		if (list_empty(&job->link))
 			list_add_tail(&job->link, &be->retained);
-		g15_absorbed_done(job, error, &be->retained);
 	}
 	be->fl_count = 0;
 }
@@ -3153,7 +2939,6 @@ static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 		if (tail && tail->job != job && !list_empty(&tail->job->link))
 			be->st_yields++;	/* another queue's turn at a prefix boundary */
 		job->q->turn = ++be->turn;
-		g15_absorb(be, job);
 		ret = g15_publish(be, job);
 		if (!ret) {
 			if (job->sent == job->count)
@@ -3172,13 +2957,11 @@ static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 			if (list_empty(&job->link))
 				list_add_tail(&job->link, &be->retained);
 			g15_signal(job, -EIO);
-			g15_absorbed_done(job, -EIO, &be->retained);
 			break;
 		}
 		gpu_m4_drm_vm_error(job->vm->frontend, ret);
 		g15_signal(job, ret);
 		list_add_tail(&job->link, done);
-		g15_absorbed_done(job, ret, done);
 	}
 	if (be->failed) {
 		while (!list_empty(&be->pending)) {
@@ -3188,7 +2971,6 @@ static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 			gpu_m4_drm_vm_error(job->vm->frontend, -EIO);
 			g15_signal(job, -EIO);
 			list_add_tail(&job->link, job->sent ? &be->retained : done);
-			g15_absorbed_done(job, -EIO, job->sent ? &be->retained : done);
 		}
 	}
 }
@@ -3408,7 +3190,6 @@ static void g15_flight_done(struct g15_backend *be, struct g15_flight *f, int er
 	g15_guard_put(job);
 	g15_signal(job, 0);
 	list_add_tail(&job->link, done);
-	g15_absorbed_done(job, job->error, done);
 }
 
 static void g15_poll_work(struct work_struct *work)
@@ -3561,8 +3342,6 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 		   be->st_hang_kills, be->st_clustered);
 	seq_printf(m, "ct_sync %llu slot_sync %llu starved_us %llu prep_us %llu\n", be->st_ct_sync,
 		   be->st_slot_sync, div_u64(be->st_starved_ns, 1000), div_u64(be->st_prep_ns, 1000));
-	seq_printf(m, "merged %llu merge_works %llu absorbed %llu\n", be->st_merged,
-		   be->st_merge_works, be->st_absorbed);
 	seq_printf(m, "stage: ta_us %llu fs_us %llu cdm_us %llu span_us %llu\n",
 		   div_u64(be->st_ta_ticks, 24), div_u64(be->st_fs_ticks, 24),
 		   div_u64(be->st_cdm_ticks, 24), div_u64(be->st_span_ticks, 24));
@@ -3587,6 +3366,58 @@ static int g15_cover(struct g15_vm *vm, u64 start, u64 end, u32 access);
 static bool stream_gate = true;
 module_param(stream_gate, bool, 0644);
 MODULE_PARM_DESC(stream_gate, "Reject CDM/VDM streams outside the qualified f568 HoneyKrisp encodings before publication");
+
+/*
+ * Client reads through the VM's own translations and the linear map, with
+ * the last page translation and the last proven program page cached for one
+ * parse (a submission's commands usually share their stream pages).
+ */
+struct g15_reader {
+	struct g15_vm *vm;
+	u64 page, prog_page;	/* ~0: none */
+	unsigned long cpu;	/* linear-map address of page */
+};
+
+static void g15_reader_init(struct g15_reader *rd, struct g15_vm *vm)
+{
+	rd->vm = vm;
+	rd->page = rd->prog_page = ~0ULL;
+}
+
+/* Clean+invalidate (never plain invalidate): CPU-written lines may be dirty. */
+static int g15_reader_read(struct g15_reader *rd, u64 va, void *dst, u32 len)
+{
+	while (len) {
+		u64 page = va & ~(G15_PAGE - 1);
+		u32 n = min_t(u64, len, G15_PAGE - (va & (G15_PAGE - 1)));
+		unsigned long cpu;
+
+		if (page != rd->page) {
+			struct gpu_m4_drm_vm_leaf leaf = {};
+
+			if (gpu_m4_vm_tree_page(rd->vm->tree, page, DRM_ASAHI_BIND_READ, &leaf))
+				return -EFAULT;
+			rd->page = page;
+			rd->cpu = (unsigned long)phys_to_virt(leaf.pa);
+		}
+		cpu = rd->cpu + (va & (G15_PAGE - 1));
+		dcache_clean_poc(cpu & ~63UL, ALIGN(cpu + n, 64));
+		dcache_inval_poc(cpu & ~63UL, ALIGN(cpu + n, 64));
+		memcpy(dst, (void *)cpu, n);
+		va += n;
+		dst = (u8 *)dst + n;
+		len -= n;
+	}
+	return 0;
+}
+
+static int g15_client_read(struct g15_vm *vm, u64 va, void *dst, u32 len)
+{
+	struct g15_reader rd;
+
+	g15_reader_init(&rd, vm);
+	return g15_reader_read(&rd, va, dst, len);
+}
 
 static int g15_gate_reject(struct g15_vm *vm, const char *what, u64 va, const u32 *w)
 {
@@ -3635,27 +3466,19 @@ static const u32 *g15_window_get(struct g15_window *win, struct g15_reader *rd, 
 	return (const u32 *)win->b;
 }
 
-/* The mergeable stream shape after its direct launch: both barriers, terminate. */
-static const u32 g15_merge_tail[3] = { 0x60000160, 0x600215fe, 0x40000000 };
-
 /*
  * CDM (stream admission addendum 1): walk the stream from its base through
  * no-return links until TERMINATE, admitting only the f568 HK G15S records:
  * direct launch (40), indirect launch (36/24), barriers (4), link (8).
  * Bounded; a stream longer than the bound is admitted unchecked past it.
- * A stream that is exactly [direct launch, 0x60000160, 0x600215fe,
- * terminate] ending at end has its first 0x30 bytes copied to snap.
  */
-static int g15_gate_cdm(struct g15_reader *rd, u64 usc, u64 base, u64 end, u8 *snap,
-			bool *merge)
+static int g15_gate_cdm(struct g15_reader *rd, u64 usc, u64 va)
 {
 	struct g15_vm *vm = rd->vm;
 	struct g15_window window, *win = &window;
 	u32 links = 0, records = 0;
-	u64 va = base;
 	int ret = 0;
 
-	*merge = false;
 	if (!READ_ONCE(stream_gate))
 		return 0;
 	win->len = 0;
@@ -3738,20 +3561,7 @@ static int g15_gate_cdm(struct g15_reader *rd, u64 usc, u64 base, u64 end, u8 *s
 		ret = g15_gate_reject(vm, "CDM", va, w);
 		break;
 	}
-	goto out;
 done:
-	/* Terminated: the single-launch mergeable shape, read in this window? */
-	if (!links && va == base + G15_CDM_LAUNCH && end == va + 4 && win->va <= base &&
-	    va + 4 <= win->va + win->len) {
-		const u8 *b = win->b + (base - win->va);
-
-		if (get_unaligned_le32(b) == 0x00080000 &&
-		    !memcmp(b + 40, g15_merge_tail, sizeof(g15_merge_tail))) {
-			memcpy(snap, b, G15_CDM_LAUNCH);
-			*merge = true;
-		}
-	}
-out:
 	return ret;
 }
 
@@ -3938,8 +3748,7 @@ static int g15_parse(struct g15_job *job, const struct gpu_m4_drm_submit *submit
 				return -EINVAL;
 			ret = g15_cover(job->vm, c->cdm_ctrl_stream_base, c->cdm_ctrl_stream_end,
 					DRM_ASAHI_BIND_READ) ?:
-			      g15_gate_cdm(&rd, job->q->usc_base, c->cdm_ctrl_stream_base,
-					   c->cdm_ctrl_stream_end, cmd->cdm, &cmd->merge) ?:
+			      g15_gate_cdm(&rd, job->q->usc_base, c->cdm_ctrl_stream_base) ?:
 			      g15_parse_att(job, att, att_count, DRM_ASAHI_BIND_WRITE) ?:
 			      g15_parse_ts(submit, &c->ts.start, cmd, 0) ?:
 			      g15_parse_ts(submit, &c->ts.end, cmd, 1);
@@ -3947,8 +3756,6 @@ static int g15_parse(struct g15_job *job, const struct gpu_m4_drm_submit *submit
 				return ret;
 			memcpy(cmd->att, att, sizeof(att[0]) * att_count);
 			cmd->att_count = att_count;
-			/* Merged works carry no attachments or API timestamps. */
-			cmd->merge &= !att_count && !cmd->ts_va[0] && !cmd->ts_va[1];
 		}
 		off += h.size;
 	}
@@ -3966,7 +3773,6 @@ static void *g15_prepare(void *owner, const struct gpu_m4_drm_submit *submit)
 		return ERR_PTR(-ENOMEM);
 	kref_init(&job->ref);	/* scheduler cookie */
 	INIT_LIST_HEAD(&job->link);
-	INIT_LIST_HEAD(&job->absorbed);
 	kref_get(&q->ref);
 	job->q = q;
 	kref_get(&q->vm->ref);
@@ -4325,8 +4131,7 @@ static void *g15_queue_create(void *owner, void *cookie, u32 priority, u64 usc_b
 	struct gpu_m4_drm_sched_config config = {
 		.dev = be->gpu->dev, .ops = &g15_sched_ops, .priority = priority,
 		.client_id = (u64)(uintptr_t)vm, .timeout = msecs_to_jiffies(3000),
-		/* Ready jobs wait in the backend, where ready successors can merge. */
-		.credit_limit = clamp(queue_credits, 1U, 64U),
+		.credit_limit = 2,	/* the next job waits in the backend, ready */
 	};
 	struct g15_queue *q;
 
