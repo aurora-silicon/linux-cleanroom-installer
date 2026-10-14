@@ -18,7 +18,7 @@ struct gpu_m4_drm_timestamp_alias_token;
 #define GPU_M4_DRM_TIMESTAMP_ALIAS_MAX_REQUESTS 4096U
 #define GPU_M4_DRM_TIMESTAMP_ALIAS_MAX_TOKENS 64U
 #define GPU_M4_DRM_TIMESTAMP_ALIAS_JOB_REQUESTS (64U * 12U)
-#define GPU_M4_DRM_TIMESTAMP_ALIAS_MAX_ARMED 2U
+#define GPU_M4_DRM_TIMESTAMP_ALIAS_MAX_ARMED 4U
 
 struct gpu_m4_drm_timestamp_alias_config {
 	struct gpu_m4_drm_provider *provider;

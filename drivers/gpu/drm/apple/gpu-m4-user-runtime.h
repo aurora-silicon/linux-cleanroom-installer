@@ -1662,9 +1662,12 @@ static int m4_user_admit_locked(struct m4_gpu_provider_runtime *p, struct m4_use
 	return 0;
 }
 
-/* inflight2 global-tail barrier: name the last command of the job admitted
- * ahead of j (the lane admits j only once that job published its whole
- * window) and hold its notifier. A head has no predecessor in flight.
+/* inflight2 global-tail barrier: name the last command of the newest job
+ * admitted ahead of j (the lane admits j only once every in-flight job
+ * published its whole window, in admission order) and hold its notifier.
+ * Each admitted job's first command waits on its own predecessor's tail, so
+ * the newest one's last command completes after every earlier in-flight
+ * command. A head has no predecessor in flight.
  */
 static int m4_user_cross_locked(struct m4_gpu_provider_runtime *p, struct m4_user_job *j)
 {
@@ -1683,8 +1686,7 @@ static int m4_user_cross_locked(struct m4_gpu_provider_runtime *p, struct m4_use
 
 		if (!o->item || !o->job || o->job == j->core_job)
 			continue;
-		if (a)
-			return M4_USER_WHY(-EPROTO, "cross two predecessors");
+		/* user_inflight[] is in admission order: the last one wins. */
 		a = m4_user_lane_job_locked(p, o->job);
 		if (IS_ERR(a))
 			return PTR_ERR(a);
@@ -1796,6 +1798,17 @@ static int m4_user_inflight2_admit_locked(struct m4_gpu_provider_runtime *p,
 	gpu_m4_drm_provider_job_view(j->core_job, &view);
 	if (!view.batch || view.batch->count != j->command_count)
 		goto vetoed;
+	{
+		u32 cap = clamp_t(u32, READ_ONCE(inflight_jobs), 2, p->user_inflight_max), n = 0;
+
+		for (u32 i = 0; i < M4_USER_INFLIGHT_MAX; i++)
+			n += p->user_inflight[i].item && p->user_inflight[i].job &&
+				p->user_inflight[i].job != j->core_job;
+		if (n >= cap) {
+			veto = M4_USER_VETO_DEPTH;
+			goto vetoed;
+		}
+	}
 	for (u32 i = 0; i < M4_USER_INFLIGHT_MAX; i++) {
 		const struct m4_user_inflight *o = &p->user_inflight[i];
 
@@ -2607,6 +2620,7 @@ static noinline ssize_t m4_user_inflight2_show(struct m4_gpu_power *gpu, char *b
 {
 	static const char *const veto_name[M4_USER_VETOES] = {
 		"disabled", "state", "publishing", "queue", "bank", "asid", "class", "ring", "pipe",
+		"depth",
 	};
 	static const char *const next_name[GPU_M4_DRM_QUEUE_NEXTS] = {
 		"none", "waiting", "own", "gated", "building", "enqueued",

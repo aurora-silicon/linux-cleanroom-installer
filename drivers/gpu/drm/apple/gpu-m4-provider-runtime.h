@@ -227,6 +227,9 @@ struct m4_user_inflight {
  */
 #define M4_USER_INFLIGHT2_BANKS 2U
 #define M4_USER_INFLIGHT2_BANK_SIZE 16U
+/* Three or four packets in flight: four banks of 8 per class. */
+#define M4_USER_INFLIGHT4_BANKS 4U
+#define M4_USER_INFLIGHT4_BANK_SIZE 8U
 
 /* Admission vetoes of a successor beside the in-flight head, in the order
  * they are tested (the first one stops admission, head-of-line).
@@ -244,6 +247,7 @@ enum m4_user_veto {
 	M4_USER_VETO_CLASS,
 	M4_USER_VETO_RING,	/* work-ring credit (< 128 vs all four consumers) */
 	M4_USER_VETO_PIPE,	/* submit-pipe READ/CFI capacity */
+	M4_USER_VETO_DEPTH,	/* inflight_jobs packets already in flight */
 	M4_USER_VETOES,
 };
 
@@ -395,6 +399,7 @@ struct m4_gpu_provider_runtime {
 	 * each whole domain and every successor is vetoed.
 	 */
 	bool user_inflight2, user_inflight2_wide;
+	u32 user_inflight_max; /* packet cap fixed at init: bank count, credits */
 	u32 user_bank_count, user_bank_size;
 	/* Positions used per bank: the largest per-class window of any queue
 	 * created so far (0: the whole bank).

@@ -68,9 +68,10 @@ struct gpu_m4_drm_provider_lane_item {
 #define GPU_M4_DRM_LANE_PRIORITIES 4U
 
 /* Hard representation bound of the in-flight set: [0] is the head, the only
- * item serviced, timed and retired; [1] is an admitted successor.
+ * item serviced, timed and retired; [1..] are admitted successors, in
+ * admission (= publication) order.
  */
-#define GPU_M4_DRM_LANE_MAX_INFLIGHT 2U
+#define GPU_M4_DRM_LANE_MAX_INFLIGHT 4U
 
 /* Optional runtime admission policy, set once before any item exists. Without
  * one a lane never admits beyond its head. admit_locked runs only while

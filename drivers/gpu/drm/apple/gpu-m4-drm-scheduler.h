@@ -99,8 +99,10 @@ struct gpu_m4_drm_sched_ops {
 	void (*closed)(void *owner);
 };
 
-/* At most this many credits per queue (two packets in flight). */
-enum { GPU_M4_DRM_SCHED_MAX_CREDITS = 2 };
+/* At most this many credits per queue (up to four packets in flight; every
+ * armed job's FINISHED fence is ordered behind its predecessor's).
+ */
+enum { GPU_M4_DRM_SCHED_MAX_CREDITS = 4 };
 
 struct gpu_m4_drm_sched_config {
 	struct device *dev;

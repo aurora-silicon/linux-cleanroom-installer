@@ -36,6 +36,7 @@ struct m4_user_queue {
 	struct m4_user_notifier *notifier;
 	u64 usc_base, client_id, native_idle_bytes;
 	u32 priority; /* DRM_ASAHI_PRIORITY_*, privilege checked by the frontend */
+	u32 execution_window; /* commands per child window, fixed at creation */
 	/* The UMA slot bank of its latest accepted job: its warm units lie
 	 * there, so its next stage prefers it (inflight2); and its accepted or
 	 * in-flight jobs per bank.
@@ -508,8 +509,12 @@ static void m4_user_init(struct m4_gpu_provider_runtime *p)
 	INIT_DELAYED_WORK(&p->user_collect, m4_user_collect_work);
 	p->user_inflight2 = inflight2;
 	p->user_inflight2_wide = inflight2 && inflight2_wide;
-	p->user_bank_count = inflight2 ? M4_USER_INFLIGHT2_BANKS : M4_USER_BANK_COUNT;
-	p->user_bank_size = inflight2 ? M4_USER_INFLIGHT2_BANK_SIZE : M4_USER_BANK_SIZE;
+	p->user_inflight_max = !inflight2 ? 1 :
+		clamp_t(u32, READ_ONCE(inflight_jobs), 2, M4_USER_INFLIGHT_MAX);
+	p->user_bank_count = !inflight2 ? M4_USER_BANK_COUNT :
+		p->user_inflight_max > 2 ? M4_USER_INFLIGHT4_BANKS : M4_USER_INFLIGHT2_BANKS;
+	p->user_bank_size = !inflight2 ? M4_USER_BANK_SIZE :
+		p->user_inflight_max > 2 ? M4_USER_INFLIGHT4_BANK_SIZE : M4_USER_INFLIGHT2_BANK_SIZE;
 }
 
 static void *m4_user_vm_create(void *owner, struct gpu_m4_drm_vm *frontend,
@@ -671,6 +676,13 @@ static void *m4_user_queue_create(void *owner, void *backend, u32 priority, u64 
 		refcount_inc(&vm->refs);
 		window = window && window <= GPU_M4_DRM_PROVIDER_WINDOW_MAX_COMMANDS ?
 			window : GPU_M4_DRM_PROVIDER_WINDOW_MAX_COMMANDS;
+		/* Commands of one class in a child each lease a distinct slot of
+		 * its one bank: banks of 8 (more than two packets in flight)
+		 * bound the whole child window to the bank.
+		 */
+		q->execution_window = window;
+		if (p->user_bank_size && p->user_bank_size < GPU_M4_DRM_PROVIDER_WINDOW_MAX_PER_CLASS)
+			q->execution_window = window = min_t(u32, window, p->user_bank_size);
 		window = min_t(u32, window, GPU_M4_DRM_PROVIDER_WINDOW_MAX_PER_CLASS);
 		if (window > p->user_bank_used)
 			p->user_bank_used = window;
@@ -703,13 +715,11 @@ static void *m4_user_queue_create(void *owner, void *backend, u32 priority, u64 
 		 * class) at a time. Public UAPI acceptance remains
 		 * max_commands_per_submission.
 		 */
-		.execution_window = window_commands &&
-			window_commands <= GPU_M4_DRM_PROVIDER_WINDOW_MAX_COMMANDS ?
-			window_commands : GPU_M4_DRM_PROVIDER_WINDOW_MAX_COMMANDS,
-		/* Two packets in flight: the next batch of this queue may run
-		 * (and materialize) while the previous one executes.
+		.execution_window = q->execution_window,
+		/* Packets in flight: the next batches of this queue may run
+		 * (and materialize) while earlier ones execute.
 		 */
-		.credit_limit = p->user_inflight2 ? 2 : 0,
+		.credit_limit = p->user_inflight2 ? p->user_inflight_max : 0,
 		.runtime_queue = q, .runtime = p->user_runtime,
 	};
 	q->provider_queue = gpu_m4_drm_provider_queue_create(&config);

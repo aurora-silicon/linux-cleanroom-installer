@@ -43,6 +43,18 @@ MODULE_PARM_DESC(inflight2, "Two ordinary packets in flight (default 1; 0: one a
  * with these; off keeps the r65 rules (whole window published, same queue
  * only render-only behind a render tail).
  */
+/* Packets in flight with inflight2 (A/B switch, read per admission): 2 is
+ * the working runtime's pair. Up to four, each in its own host UMA slot
+ * bank: with three or more the runtime splits each class domain into four
+ * banks of 8 slots instead of two of 16, at load. Every admitted packet
+ * still publishes its whole window first and its first command waits on
+ * the newest in-flight packet's last command (a chain), so a run of small
+ * submissions keeps the firmware fed instead of turning over two at a time
+ * behind each host receipt.
+ */
+static unsigned int inflight_jobs = 4;
+module_param(inflight_jobs, uint, 0644);
+MODULE_PARM_DESC(inflight_jobs, "inflight2: packets in flight, 2..4 (default 4; banks of 8 slots when the load value is >2)");
 static bool inflight2_wide;
 module_param(inflight2_wide, bool, 0400);
 MODULE_PARM_DESC(inflight2_wide, "inflight2: also overlap partial windows and same-queue mixed/compute windows (default 0)");
