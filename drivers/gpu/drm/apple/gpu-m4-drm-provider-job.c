@@ -81,6 +81,7 @@ struct gpu_m4_drm_provider_job {
 	struct gpu_m4_drm_mixed_config decode;
 	struct gpu_m4_drm_mixed_batch batch;
 	struct gpu_m4_drm_job_command *commands;
+	u32 commands_capacity; /* entries allocated at commands */
 	struct gpu_m4_drm_cache_job *cache;
 	struct gpu_m4_drm_resv_job *resv;
 	struct gpu_m4_drm_provider_fence *retirement;
@@ -2727,6 +2728,38 @@ static int gpu_m4_provider_merge_compute(struct gpu_m4_drm_provider_job *job)
 
 static void *gpu_m4_provider_prepare_inner(void *cookie, const struct gpu_m4_drm_submit *submit);
 
+/* Decode arrays sized by the submission's actual command count (a bounded
+ * header walk; a malformed stream keeps the full capacity and the decoder's
+ * own validation rejects it), with room for a few coalesced joiners. Two
+ * zeroed full-capacity arrays (~2.3 KiB per entry) cost every submission
+ * ~0.3 MiB of page clearing and memsets.
+ */
+#define GPU_M4_PROVIDER_COMMANDS_MIN 8U
+static bool decode_fit = true;
+module_param(decode_fit, bool, 0644);
+MODULE_PARM_DESC(decode_fit, "Size per-submission decode arrays by its command count (default 1)");
+
+static u32 gpu_m4_provider_command_capacity(const u8 *bytes, u32 size, u32 capacity)
+{
+	u32 offset = 0, count = 0;
+
+	while (READ_ONCE(decode_fit) && bytes && offset < size) {
+		struct drm_asahi_cmd_header h;
+
+		if (size - offset < sizeof(h))
+			return capacity;
+		memcpy(&h, bytes + offset, sizeof(h));
+		offset += sizeof(h);
+		if (h.size > size - offset)
+			return capacity;
+		offset += h.size;
+		count += h.cmd_type < DRM_ASAHI_SET_VERTEX_ATTACHMENTS;
+	}
+	if (!bytes || !count || count > capacity)
+		return capacity;
+	return clamp(count, min(GPU_M4_PROVIDER_COMMANDS_MIN, capacity), capacity);
+}
+
 static void *gpu_m4_provider_prepare(void *cookie, const struct gpu_m4_drm_submit *submit)
 {
 	u64 start = ktime_get_ns();
@@ -2776,8 +2809,10 @@ static void *gpu_m4_provider_prepare_inner(void *cookie, const struct gpu_m4_drm
 	ret = gpu_m4_provider_retirement_init(job);
 	if (ret)
 		goto fail;
+	capacity = gpu_m4_provider_command_capacity(job->bytes, job->size, capacity);
 	commands = kvcalloc(capacity, sizeof(*commands), GFP_KERNEL);
 	job->commands = commands;
+	job->commands_capacity = commands ? capacity : 0;
 	scratch = kvcalloc(capacity, sizeof(*scratch), GFP_KERNEL);
 	if (!job->bytes || !job->retirement || !commands || !scratch) {
 		ret = -ENOMEM;
@@ -4304,7 +4339,7 @@ static int gpu_m4_provider_coalesce(void *cookie, void *target_owner, void *job_
 	 */
 	first = READ_ONCE(t->batch.count);
 	if (!gpu_m4_provider_coalescible(j) || !gpu_m4_provider_coalescible(t) ||
-	    first + j->batch.count > capacity) {
+	    first + j->batch.count > capacity || first > READ_ONCE(t->commands_capacity)) {
 		submit_coalesce_stats[1]++;
 		return -EOPNOTSUPP;
 	}
@@ -4317,6 +4352,14 @@ static int gpu_m4_provider_coalesce(void *cookie, void *target_owner, void *job_
 	ret = gpu_m4_merge_commands(queue->vm, combined, &count, &streams);
 	if (ret)
 		goto free;
+	/* The target's own array must hold the result: its allocation is
+	 * sized by its submission (plus GPU_M4_PROVIDER_COMMANDS_MIN).
+	 */
+	if (count > t->commands_capacity) {
+		submit_coalesce_stats[1]++;
+		ret = -EOPNOTSUPP;
+		goto free;
+	}
 	mutex_lock(lock);
 	if (queue->closed || t->state != GPU_M4_PROVIDER_PREPARED || !t->accepted ||
 	    t->window_work_ref || queue->early == t || t->batch.count != first ||
