@@ -274,6 +274,22 @@ static bool manager_cached = true;
 module_param(manager_cached, bool, 0444);
 MODULE_PARM_DESC(manager_cached, "Map the UMA managers, PB manager, block control and misc records ASC-cached (firmware AttrIndex 0); 0: AttrIndex 2");
 
+/*
+ * Render queue scheduling class (queue-info +0x30..+0x48, the firmware's
+ * recognized policy rows). The donor's class 0 has an admission-service
+ * quantum of one: every ready TA/FS node requests a scheduling service
+ * pass of its own, so a prefix of N renders pays N insertion passes at
+ * admission and service passes between every stage. Class 2, the common
+ * backend's default render row, requests service after eight ready nodes:
+ * the prefix's works are inserted back to back and the TA/FS cycle runs
+ * without the intermediate passes. The compute queue keeps class 0, whose
+ * policy the common backend also uses for compute to keep compute
+ * preemption off.
+ */
+static unsigned int render_queue_class = 2;
+module_param(render_queue_class, uint, 0444);
+MODULE_PARM_DESC(render_queue_class, "TA/FS queue-info scheduling row: 2 (default, quantum 8) or 0 (donor row, quantum 1)");
+
 static unsigned int resnap_us = 100;
 module_param(resnap_us, uint, 0644);
 MODULE_PARM_DESC(resnap_us, "Completion re-check interval while a command is published, 25..1000 us (EP0x20 events wake earlier)");
@@ -1020,9 +1036,17 @@ static void g15_render_init(struct g15_backend *be)
 		g15_buf_w64(&r->qinfo[e], 0x10, r->job_list.va);
 		g15_buf_w64(&r->qinfo[e], 0x18, r->qscratch[e].va);
 		g15_buf_w32(&r->qinfo[e], 0x2c, 0xffffffff);
-		g15_buf_w64(&r->qinfo[e], 0x38, 0xffffffffffff0000ULL);
-		g15_buf_w32(&r->qinfo[e], 0x40, 1);
-		g15_buf_w32(&r->qinfo[e], 0x48, 1);
+		if (render_queue_class == 2) {
+			/* Recognized row 2: class/policy 2, mask, +0x40/+0x44 0. */
+			g15_buf_w32(&r->qinfo[e], 0x30, 2);
+			g15_buf_w32(&r->qinfo[e], 0x34, 2);
+			g15_buf_w64(&r->qinfo[e], 0x38, 0xffff000000000000ULL);
+			g15_buf_w32(&r->qinfo[e], 0x48, 2);
+		} else {
+			g15_buf_w64(&r->qinfo[e], 0x38, 0xffffffffffff0000ULL);
+			g15_buf_w32(&r->qinfo[e], 0x40, 1);
+			g15_buf_w32(&r->qinfo[e], 0x48, 1);
+		}
 		g15_buf_w32(&r->qinfo[e], 0x4c, 0xffffffff);
 		g15_buf_w32(&r->qinfo[e], 0x50, uuid[e]);
 		g15_buf_w64(&r->qinfo[e], 0xa4, r->sched_ctx.va);
