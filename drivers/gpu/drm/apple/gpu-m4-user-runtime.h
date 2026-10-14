@@ -1205,7 +1205,7 @@ static int m4_user_compute_packet_publish_locked(struct m4_user_job *j, u32 inde
 		},
 	};
 	for (u32 i = 0; i < 3; i++)
-		r->chronology.queue_consumer[i] = m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x20 + 4 * i);
+		r->chronology.queue_consumer[i] = m4_user_qi_consumer(p, q, i);
 	ret = m4_user_compute_prior_expected(j, index, &r->prior);
 	if (!ret)
 		ret = m4_user_compute_reuse_prepare_locked(j, index, r);
@@ -1353,7 +1353,7 @@ static int m4_user_compute_packet_retired_locked(struct m4_user_job *j, u32 inde
 		.next = own->queue_next,
 		.queue_read = m4_ready_read32(queue[M4_EXEC_QUEUE_STATE].cpu + 0x30),
 		.queue_write = m4_ready_read32(queue[M4_EXEC_QUEUE_STATE].cpu + 0x40),
-		.queue_busy = m4_ready_read32(queue[M4_EXEC_QUEUE_INFO].cpu + 0x80),
+		.queue_busy = m4_user_qi_busy(p, queue),
 		.pipe_read = m4_ready_read32(pipe), .pipe_cfi = m4_ready_read32(pipe + 0x10),
 		.pipe_write = m4_ready_read32(pipe + 0x20), .pipe_next = own->pipe_next,
 		.pipe_capacity = 256, .uma_submitted = m4_store_read64(n->counter->map.vaddr),
@@ -1363,7 +1363,7 @@ static int m4_user_compute_packet_retired_locked(struct m4_user_job *j, u32 inde
 		.ignore_busy = m4_user_wire_overlapped(j),
 	};
 	for (u32 i = 0; i < 3; i++)
-		observed.queue_consumer[i] = m4_ready_read32(queue[M4_EXEC_QUEUE_INFO].cpu + 0x20 + i * 4);
+		observed.queue_consumer[i] = m4_user_qi_consumer(p, queue, i);
 	if (observed.uma_submitted != r->chronology.submitted)
 		return M4_USER_WHY(-ESTALE, "compute retire %u submitted=%llu want %llu", index,
 			M4_WHY64(observed.uma_submitted), M4_WHY64(r->chronology.submitted));

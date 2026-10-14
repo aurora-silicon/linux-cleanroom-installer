@@ -2,6 +2,32 @@
 #ifndef APPLE_GPU_M4_USER_WIRE_H
 #define APPLE_GPU_M4_USER_WIRE_H
 
+/* Live queue observations. With queue-info ASC-cached (queue_cached bit 2)
+ * the firmware writes its scan/advertised-horizon words +0x20/+0x24/+0x28
+ * and busy +0x80 back only at the drain-to-idle terminal CIVAC of the QI
+ * prefix, not at every step (retained cache ownership contract fcef2f890
+ * s4): during continuous publication an AP read can stay stale. Credits and
+ * receipts then use the NC queue-state READ (+0x30) in place of the three
+ * consumers and treat busy as unobserved; the per-work stamps, counters and
+ * ring/pipe ledgers remain the proof.
+ */
+static bool m4_user_qi_cached(const struct m4_gpu_provider_runtime *p)
+{
+	return p->ready->queue_cached & 4;
+}
+
+static u32 m4_user_qi_consumer(const struct m4_gpu_provider_runtime *p,
+	struct m4_ready_buffer *q, u32 i)
+{
+	return m4_user_qi_cached(p) ? m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x30) :
+		m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x20 + 4 * i);
+}
+
+static u32 m4_user_qi_busy(const struct m4_gpu_provider_runtime *p, struct m4_ready_buffer *q)
+{
+	return m4_user_qi_cached(p) ? 0 : m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x80);
+}
+
 /* Actual ordinary runtime ring glue. A command is exposed whole, never one
  * render stage at a time; a bounded window can publish successors behind it.
  * Its native owners and the entire copied public batch were captured before
@@ -207,13 +233,12 @@ static int m4_user_wire_window_locked(struct m4_user_job *j, u32 engine, u32 lim
 	/* Without an owned outstanding command this is the exact idle rule;
 	 * busy alone is no evidence while another job is in flight.
 	 */
-	if (!oldest && m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x80) &&
-	    !m4_user_wire_overlapped(j))
+	if (!oldest && m4_user_qi_busy(p, q) && !m4_user_wire_overlapped(j))
 		return M4_USER_WHY(-EBUSY, "wire window %u/%u busy=%u without owned start", engine, limit,
-			m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x80));
+			m4_user_qi_busy(p, q));
 	consumer[0] = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x30);
 	for (u32 i = 0; i < 3; i++)
-		consumer[i + 1] = m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x20 + 4 * i);
+		consumer[i + 1] = m4_user_qi_consumer(p, q, i);
 	for (u32 i = 0; i < 4; i++) {
 		if (consumer[i] >= 256 || ((consumer[i] - start) & 255) > span)
 			return M4_USER_WHY(-EBUSY, "wire window %u/%u consumer[%u]=%u outside %u..%u (oldest=%d)",

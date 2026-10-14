@@ -1360,7 +1360,7 @@ static int m4_user_render_stage_sample_locked(struct m4_user_job *j, u32 index,
 		.queue_begin = wire->queue_before, .queue_entries = wire->count, .queue_next = wire->queue_next,
 		.queue_read = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x30),
 		.queue_producer = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x40),
-		.queue_busy = m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x80), .queue_capacity = 256,
+		.queue_busy = m4_user_qi_busy(p, q), .queue_capacity = 256,
 		.pipe_begin = wire->pipe_before, .pipe_next = wire->pipe_next,
 		.pipe_read = m4_ready_read32(pipe), .pipe_cfi = m4_ready_read32(pipe + 0x10),
 		.pipe_producer = m4_ready_read32(pipe + 0x20), .pipe_capacity = 256,
@@ -1393,7 +1393,7 @@ static int m4_user_render_stage_sample_locked(struct m4_user_job *j, u32 index,
 		if (get_unaligned_le64(work + pointer[i]) != get_unaligned_le64(image + pointer[i]))
 			return -ESTALE;
 	for (u32 i = 0; i < 3; i++)
-		s.queue_consumer[i] = m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x20 + i * 4);
+		s.queue_consumer[i] = m4_user_qi_consumer(p, q, i);
 	if (!ret)
 		*out = s;
 	return ret;
@@ -1854,7 +1854,7 @@ static void m4_user_render_fault_snapshot_locked(struct m4_user_job *j, u32 inde
 			.queue_begin = w->queue_before, .queue_entries = w->count, .queue_next = w->queue_next,
 			.queue_read = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x30),
 			.queue_producer = m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x40),
-			.queue_busy = m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x80), .queue_capacity = 256,
+			.queue_busy = m4_user_qi_busy(p, q), .queue_capacity = 256,
 			.pipe_begin = w->pipe_before, .pipe_next = w->pipe_next,
 			.pipe_read = m4_ready_read32(pipe), .pipe_cfi = m4_ready_read32(pipe + 0x10),
 			.pipe_producer = m4_ready_read32(pipe + 0x20), .pipe_capacity = 256,
@@ -1865,7 +1865,7 @@ static void m4_user_render_fault_snapshot_locked(struct m4_user_job *j, u32 inde
 
 		ret = m4_store_packed64(work + 4, &s.work_counter);
 		for (u32 i = 0; i < 3; i++)
-			s.queue_consumer[i] = m4_ready_read32(q[M4_EXEC_QUEUE_INFO].cpu + 0x20 + i * 4);
+			s.queue_consumer[i] = m4_user_qi_consumer(p, q, i);
 		if (!ret)
 			ret = gpu_m4_render_stage_retired(&s, e);
 		dev_err(p->hello->gpu->dev,
