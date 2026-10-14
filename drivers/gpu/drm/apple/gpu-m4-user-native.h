@@ -232,7 +232,60 @@ struct m4_user_render_native {
 	struct m4_user_native_bo *firmware[GPU_M4_RENDER_FIRST_FW_COUNT];
 	struct m4_user_native_bo *gpu[GPU_M4_RENDER_FIRST_GPU_COUNT];
 	struct m4_user_native_bo *manager, *tpc;
+	/* records_in_cell: the InitBuffer and opcode-4 records live in the
+	 * unit's ASC-cached work cells, not in its index-2 scene page.
+	 */
+	bool records_in_cell;
 };
+
+/* The render's dependency/InitBuffer records (retained cache ownership
+ * contract fcef2f890 s5): the firmware reads them only at admission, after a
+ * CIVAC of the record (opcode-4 0x40, opcode-6 0x20), and never writes them;
+ * so they may sit in the unit's cached work cells beyond the microsequence,
+ * disjoint from the work image, sequence and completion metadata. The scene
+ * header (firmware/GPU outputs) stays index 2.
+ */
+#define M4_USER_RENDER_RECORD_OFFSET 0x3000U
+enum m4_user_render_record {
+	M4_RREC_INIT,		/* TA queue: opcode-6 InitBuffer */
+	M4_RREC_PRIOR_TA,	/* TA queue: strict prior wait */
+	M4_RREC_OWN_TA,		/* FS queue: own-TA wait */
+	M4_RREC_PRIOR_FS,	/* FS queue: early-tiling prior-FS wait */
+};
+static bool records_in_cell = true;
+module_param(records_in_cell, bool, 0644);
+MODULE_PARM_DESC(records_in_cell, "New render units keep their InitBuffer/dependency records in their cached work cells (default 1)");
+
+static struct m4_user_native_bo *m4_user_render_record_bo(const struct m4_user_render_native *n,
+	enum m4_user_render_record which, u32 *offset)
+{
+	static const u16 scene_offset[] = { 0x300, 0x380, 0x340, 0x440 };
+
+	if (n->records_in_cell) {
+		*offset = M4_USER_RENDER_RECORD_OFFSET + (which & 1) * GPU_M4_EXEC_DEPENDENCY_SIZE;
+		return n->work[which >= M4_RREC_OWN_TA];
+	}
+	*offset = scene_offset[which];
+	return n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW];
+}
+
+static u64 m4_user_render_record_fw(const struct m4_user_render_native *n,
+	enum m4_user_render_record which)
+{
+	u32 offset;
+	struct m4_user_native_bo *b = m4_user_render_record_bo(n, which, &offset);
+
+	return b->fw_va + offset;
+}
+
+static void *m4_user_render_record_cpu(const struct m4_user_render_native *n,
+	enum m4_user_render_record which)
+{
+	u32 offset;
+	struct m4_user_native_bo *b = m4_user_render_record_bo(n, which, &offset);
+
+	return b->map.vaddr + offset;
+}
 
 /* render_shared (boot parameter): every render of a queue runs on that
  * queue's ONE retained render allocator (q10 contract,
@@ -2465,8 +2518,15 @@ static int m4_user_native_render_allocate(struct m4_user_native_stage *s, u32 in
 	}
 	o->manager = m4_user_native_fw(n->manager, 0, GPU_M4_RENDER_PARAMETER_MANAGER_SIZE);
 	b = n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW];
-	o->init_buffer = m4_user_native_fw(b, 0x300, GPU_M4_RENDER_INIT_BUFFER_SIZE);
-	o->fragment_dependency = m4_user_native_fw(b, 0x340, GPU_M4_EXEC_DEPENDENCY_SIZE);
+	n->records_in_cell = in_cell && READ_ONCE(records_in_cell);
+	{
+		u32 off;
+		struct m4_user_native_bo *rb = m4_user_render_record_bo(n, M4_RREC_INIT, &off);
+
+		o->init_buffer = m4_user_native_fw(rb, off, GPU_M4_RENDER_INIT_BUFFER_SIZE);
+		rb = m4_user_render_record_bo(n, M4_RREC_OWN_TA, &off);
+		o->fragment_dependency = m4_user_native_fw(rb, off, GPU_M4_EXEC_DEPENDENCY_SIZE);
+	}
 	o->stage_owner = s;
 	o->vm = s->queue->vm->provider_vm;
 	o->render.context = o->render.asid = s->queue->vm->asid;
@@ -2918,7 +2978,7 @@ static int m4_user_native_render_history_owner_locked(void *cookie,
 	    r->render_dependency[0].record_fw != n->owner.fragment_dependency.span.va ||
 	    (r->render_dependency_count >= 2 &&
 	     (r->render_dependency[1].record_fw !=
-		n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x380 ||
+		m4_user_render_record_fw(n, M4_RREC_PRIOR_TA) ||
 	      r->render_dependency[1].engine ||
 	      /* In-window prior render (early tiling: its TA), a mixed
 	       * window's prior compute, or the first command's global-tail
@@ -2944,7 +3004,7 @@ static int m4_user_native_render_history_owner_locked(void *cookie,
 	     ((!sample->index && h->cross_stamp_fw != s->notifier->bo->fw_va + 0x630) ||
 	      r->render_dependency[1].event != 0x70 ||
 	      r->render_dependency[2].record_fw !=
-		n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x440 ||
+		m4_user_render_record_fw(n, M4_RREC_PRIOR_FS) ||
 	      r->render_dependency[2].engine != 1 || r->render_dependency[2].event != 0x71 ||
 	      r->render_dependency[2].stamp_fw != s->notifier->bo->fw_va + 0x630)) ||
 	    pair->uma_descriptor_fw != n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->fw_va ||

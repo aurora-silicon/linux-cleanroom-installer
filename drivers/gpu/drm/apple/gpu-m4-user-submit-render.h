@@ -366,7 +366,7 @@ static int m4_user_render_prior_expected(struct m4_user_job *j, u32 index,
 		if (!n)
 			return -ESTALE;
 		prior[0] = (struct gpu_m4_render_prior_dependency) {
-			.firmware = { n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x380,
+			.firmware = { m4_user_render_record_fw(n, M4_RREC_PRIOR_TA),
 				GPU_M4_EXEC_DEPENDENCY_SIZE },
 			.predecessor_stamp_fw = early ? j->queue->notifier->bo->fw_va + 0x620 :
 				j->cross.stamp_fw,
@@ -377,7 +377,7 @@ static int m4_user_render_prior_expected(struct m4_user_job *j, u32 index,
 		};
 		if (early)
 			prior[1] = (struct gpu_m4_render_prior_dependency) {
-				.firmware = { n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x440,
+				.firmware = { m4_user_render_record_fw(n, M4_RREC_PRIOR_FS),
 					GPU_M4_EXEC_DEPENDENCY_SIZE },
 				.predecessor_stamp_fw = j->cross.stamp_fw,
 				.predecessor_target = j->cross.target,
@@ -397,7 +397,7 @@ static int m4_user_render_prior_expected(struct m4_user_job *j, u32 index,
 		    !j->queue->notifier || !j->queue->notifier->bo)
 			return -ESTALE;
 		prior[0] = (struct gpu_m4_render_prior_dependency) {
-			.firmware = { n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x380,
+			.firmware = { m4_user_render_record_fw(n, M4_RREC_PRIOR_TA),
 				GPU_M4_EXEC_DEPENDENCY_SIZE },
 			.predecessor_stamp_fw = j->queue->notifier->bo->fw_va + 0x640,
 			.predecessor_target = j->cmd[index - 1].final_target,
@@ -412,7 +412,7 @@ static int m4_user_render_prior_expected(struct m4_user_job *j, u32 index,
 		return -ESTALE;
 	early = m4_user_render_early_tiling(j, index);
 	prior[0] = (struct gpu_m4_render_prior_dependency) {
-		.firmware = { n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x380,
+		.firmware = { m4_user_render_record_fw(n, M4_RREC_PRIOR_TA),
 			GPU_M4_EXEC_DEPENDENCY_SIZE },
 		.predecessor_stamp_fw = j->queue->notifier->bo->fw_va + (early ? 0x620 : 0x630),
 		.predecessor_target = j->render_reservation[index - 1].chronology.target_stamp,
@@ -421,7 +421,7 @@ static int m4_user_render_prior_expected(struct m4_user_job *j, u32 index,
 	};
 	if (early)
 		prior[1] = (struct gpu_m4_render_prior_dependency) {
-			.firmware = { n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x440,
+			.firmware = { m4_user_render_record_fw(n, M4_RREC_PRIOR_FS),
 				GPU_M4_EXEC_DEPENDENCY_SIZE },
 			.predecessor_stamp_fw = j->queue->notifier->bo->fw_va + 0x630,
 			.predecessor_target = prior[0].predecessor_target,
@@ -1285,6 +1285,22 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 	 * strict prior wait +0x380 and the submitted counter +0x500.
 	 */
 	memcpy(n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->map.vaddr, packet->bytes.scene, sizeof(packet->bytes.scene));
+	/* Records in the cached work cells: written with the works, before
+	 * any producer, immutable until this render retires.
+	 */
+	if (n->records_in_cell) {
+		memcpy(m4_user_render_record_cpu(n, M4_RREC_OWN_TA), packet->bytes.fragment_dependency,
+			sizeof(packet->bytes.fragment_dependency));
+		if (init)
+			memcpy(m4_user_render_record_cpu(n, M4_RREC_INIT), packet->bytes.init_buffer,
+				sizeof(packet->bytes.init_buffer));
+		if (res->chronology.prior[0].firmware.va)
+			memcpy(m4_user_render_record_cpu(n, M4_RREC_PRIOR_TA),
+				packet->bytes.prior_dependency[0], GPU_M4_EXEC_DEPENDENCY_SIZE);
+		if (res->chronology.prior[1].firmware.va)
+			memcpy(m4_user_render_record_cpu(n, M4_RREC_PRIOR_FS),
+				packet->bytes.prior_dependency[1], GPU_M4_EXEC_DEPENDENCY_SIZE);
+	}
 	memcpy(m4_user_render_sequence_cpu(n, 0),
 		packet->bytes.tiler_sequence, sizeof(packet->bytes.tiler_sequence));
 	memcpy(m4_user_render_sequence_cpu(n, 1),
@@ -1436,7 +1452,7 @@ static int m4_user_render_pair_owner_locked(void *cookie,
 	    (fragment->firmware.va &&
 	     (sample->dependency[2].record_fw != fragment->firmware.va ||
 	      sample->dependency[2].record_fw !=
-		n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x440 ||
+		m4_user_render_record_fw(n, M4_RREC_PRIOR_FS) ||
 	      sample->dependency[2].stamp_fw != fragment->predecessor_stamp_fw ||
 	      sample->dependency[2].expected_target != fragment->predecessor_target ||
 	      sample->dependency[2].event != 0x71 || sample->dependency[2].engine != 1)))
@@ -1450,7 +1466,7 @@ static int m4_user_render_pair_owner_locked(void *cookie,
 	    (prior->firmware.va &&
 	     (sample->dependency[1].record_fw != prior->firmware.va ||
 	      sample->dependency[1].record_fw !=
-		n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x380 ||
+		m4_user_render_record_fw(n, M4_RREC_PRIOR_TA) ||
 	      sample->dependency[1].stamp_fw != prior->predecessor_stamp_fw ||
 	      sample->dependency[1].expected_target != prior->predecessor_target ||
 	      sample->dependency[1].event != prior->predecessor_event ||
@@ -1540,9 +1556,9 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 		return -ESTALE;
 	uma = n->gpu[GPU_M4_RENDER_FIRST_UMA_GPU]->map.vaddr;
 	scene = n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->map.vaddr;
-	dependency = scene + 0x340;
-	wait = scene + 0x380;
-	fragment_wait = scene + 0x440;
+	dependency = m4_user_render_record_cpu(n, M4_RREC_OWN_TA);
+	wait = m4_user_render_record_cpu(n, M4_RREC_PRIOR_TA);
+	fragment_wait = m4_user_render_record_cpu(n, M4_RREC_PRIOR_FS);
 	ret = m4_store_packed64(uma + 0x4c, &counter);
 	if (!ret)
 		ret = m4_store_packed64(uma + 0x54, &completed);
@@ -1593,7 +1609,7 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 		return -ESTALE;
 	/* The retained strict prior-command wait, unchanged since publication. */
 	if (prior->firmware.va &&
-	    (prior->firmware.va != n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x380 ||
+	    (prior->firmware.va != m4_user_render_record_fw(n, M4_RREC_PRIOR_TA) ||
 	     memcmp(wait, packet->bytes.prior_dependency[0], GPU_M4_EXEC_DEPENDENCY_SIZE) ||
 	     m4_ready_read32(wait) != 4 ||
 	     get_unaligned_le64(wait + 4) != prior->predecessor_stamp_fw ||
@@ -1605,7 +1621,7 @@ static int m4_user_render_packet_retired_locked(struct m4_user_job *j, u32 index
 		return -ESTALE;
 	/* An early-tiling render's retained FS strict wait on the previous FS. */
 	if (fragment->firmware.va &&
-	    (fragment->firmware.va != n->firmware[GPU_M4_RENDER_FIRST_SCENE_FW]->fw_va + 0x440 ||
+	    (fragment->firmware.va != m4_user_render_record_fw(n, M4_RREC_PRIOR_FS) ||
 	     memcmp(fragment_wait, packet->bytes.prior_dependency[1], GPU_M4_EXEC_DEPENDENCY_SIZE) ||
 	     m4_ready_read32(fragment_wait) != 4 ||
 	     get_unaligned_le64(fragment_wait + 4) != fragment->predecessor_stamp_fw ||
