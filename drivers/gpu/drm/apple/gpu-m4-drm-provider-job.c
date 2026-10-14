@@ -81,7 +81,6 @@ struct gpu_m4_drm_provider_job {
 	struct gpu_m4_drm_mixed_config decode;
 	struct gpu_m4_drm_mixed_batch batch;
 	struct gpu_m4_drm_job_command *commands;
-	u32 commands_capacity; /* entries allocated at commands */
 	struct gpu_m4_drm_cache_job *cache;
 	struct gpu_m4_drm_resv_job *resv;
 	struct gpu_m4_drm_provider_fence *retirement;
@@ -2730,11 +2729,9 @@ static void *gpu_m4_provider_prepare_inner(void *cookie, const struct gpu_m4_drm
 
 /* Decode arrays sized by the submission's actual command count (a bounded
  * header walk; a malformed stream keeps the full capacity and the decoder's
- * own validation rejects it), with room for a few coalesced joiners. Two
- * zeroed full-capacity arrays (~2.3 KiB per entry) cost every submission
- * ~0.3 MiB of page clearing and memsets.
+ * own validation rejects it). Two zeroed full-capacity arrays (~2.3 KiB per
+ * entry) cost every submission ~0.3 MiB of page clearing and memsets.
  */
-#define GPU_M4_PROVIDER_COMMANDS_MIN 8U
 static bool decode_fit = true;
 module_param(decode_fit, bool, 0644);
 MODULE_PARM_DESC(decode_fit, "Size per-submission decode arrays by its command count (default 1)");
@@ -2757,7 +2754,7 @@ static u32 gpu_m4_provider_command_capacity(const u8 *bytes, u32 size, u32 capac
 	}
 	if (!bytes || !count || count > capacity)
 		return capacity;
-	return clamp(count, min(GPU_M4_PROVIDER_COMMANDS_MIN, capacity), capacity);
+	return count;
 }
 
 static void *gpu_m4_provider_prepare(void *cookie, const struct gpu_m4_drm_submit *submit)
@@ -2812,7 +2809,6 @@ static void *gpu_m4_provider_prepare_inner(void *cookie, const struct gpu_m4_drm
 	capacity = gpu_m4_provider_command_capacity(job->bytes, job->size, capacity);
 	commands = kvcalloc(capacity, sizeof(*commands), GFP_KERNEL);
 	job->commands = commands;
-	job->commands_capacity = commands ? capacity : 0;
 	scratch = kvcalloc(capacity, sizeof(*scratch), GFP_KERNEL);
 	if (!job->bytes || !job->retirement || !commands || !scratch) {
 		ret = -ENOMEM;
@@ -4286,106 +4282,6 @@ static void gpu_m4_provider_release(void *cookie, void *owner, bool uncertain)
 	WARN_ON(gpu_m4_drm_provider_job_put(job));
 }
 
-/*
- * Submission coalescing. A queue kept busy with small compute submissions
- * (one dispatch each) pays a whole firmware work per submission, plus the
- * host's window build, publication and retirement, ~140 us at any depth.
- * A plain compute submission without inputs that arrives while this
- * queue's newest submission is still waiting to run joins it: its commands
- * are appended and merged with the target's (one firmware work for the
- * straight-line run), and it completes with the target's FINISHED fence.
- * Only a target that has started nothing qualifies (prepared, no window
- * built or reserved), so the joined work runs exactly where the new
- * submission would have, in queue order; the earlier submission's fence
- * may signal later than alone, never earlier.
- */
-static bool submit_coalesce = true;
-module_param(submit_coalesce, bool, 0644);
-MODULE_PARM_DESC(submit_coalesce, "Join plain compute submissions into the queue's newest not-yet-run plain compute submission (default 1)");
-
-/* REMOVE-DEBUG: [0] joined, [1] refused (shape), [2] refused (target started). */
-static unsigned long submit_coalesce_stats[3];
-static int submit_coalesce_stats_count = ARRAY_SIZE(submit_coalesce_stats);
-module_param_array(submit_coalesce_stats, ulong, &submit_coalesce_stats_count, 0444);
-MODULE_PARM_DESC(submit_coalesce_stats, "joined, refused shape, refused started");
-
-static bool gpu_m4_provider_coalescible(const struct gpu_m4_drm_provider_job *job)
-{
-	if (!job->aggregate || !job->tree || job->implicit || job->window_parent ||
-	    !job->batch.count || job->batch.commands != job->commands)
-		return false;
-	for (u32 i = 0; i < job->batch.count; i++)
-		if (!gpu_m4_merge_plain(&job->batch.commands[i]))
-			return false;
-	return true;
-}
-
-static int gpu_m4_provider_coalesce(void *cookie, void *target_owner, void *job_owner)
-{
-	struct gpu_m4_drm_provider_queue *queue = cookie;
-	struct gpu_m4_drm_provider_job *t = target_owner, *j = job_owner;
-	struct mutex *lock = gpu_m4_provider_job_lock(t);
-	u32 capacity = queue->params.max_commands_per_submission, first, count;
-	struct gpu_m4_drm_job_command *combined;
-	u8 *streams = NULL, *old;
-	int ret = 0;
-
-	if (!READ_ONCE(submit_coalesce) || !READ_ONCE(compute_merge) || t == j ||
-	    t->queue != queue || j->queue != queue || queue->private_candidate ||
-	    capacity > GPU_M4_DRM_JOB_MAX_COMMANDS)
-		return -EOPNOTSUPP;
-	/* A target read without the mutex is only a candidate: the install
-	 * below rechecks that it is still untouched and unchanged.
-	 */
-	first = READ_ONCE(t->batch.count);
-	if (!gpu_m4_provider_coalescible(j) || !gpu_m4_provider_coalescible(t) ||
-	    first + j->batch.count > capacity || first > READ_ONCE(t->commands_capacity)) {
-		submit_coalesce_stats[1]++;
-		return -EOPNOTSUPP;
-	}
-	combined = kvcalloc(capacity, sizeof(*combined), GFP_KERNEL);
-	if (!combined)
-		return -ENOMEM;
-	memcpy(combined, t->batch.commands, first * sizeof(*combined));
-	memcpy(combined + first, j->batch.commands, j->batch.count * sizeof(*combined));
-	count = first + j->batch.count;
-	ret = gpu_m4_merge_commands(queue->vm, combined, &count, &streams);
-	if (ret)
-		goto free;
-	/* The target's own array must hold the result: its allocation is
-	 * sized by its submission (plus GPU_M4_PROVIDER_COMMANDS_MIN).
-	 */
-	if (count > t->commands_capacity) {
-		submit_coalesce_stats[1]++;
-		ret = -EOPNOTSUPP;
-		goto free;
-	}
-	mutex_lock(lock);
-	if (queue->closed || t->state != GPU_M4_PROVIDER_PREPARED || !t->accepted ||
-	    t->window_work_ref || queue->early == t || t->batch.count != first ||
-	    t->batch.commands != t->commands) {
-		ret = -EBUSY;
-	} else {
-		ret = gpu_m4_drm_provider_error_locked(queue->provider);
-	}
-	if (!ret) {
-		/* Plain commands own no leases: the copies are the commands. */
-		memcpy(t->commands, combined, count * sizeof(*combined));
-		if (count < first)
-			memset(t->commands + count, 0, (first - count) * sizeof(*combined));
-		t->batch.count = count;
-		old = t->merge_streams;
-		t->merge_streams = streams;
-		streams = old;
-	}
-	mutex_unlock(lock);
-	submit_coalesce_stats[ret ? 2 : 0]++;
-free:
-	kfree(streams);
-	kvfree(combined);
-	return ret;
-}
-
 static void gpu_m4_provider_closed(void *cookie)
 {
 	gpu_m4_drm_provider_queue_put(cookie); /* scheduler-owned queue ref */
@@ -4399,7 +4295,6 @@ static const struct gpu_m4_drm_sched_ops gpu_m4_provider_sched_ops = {
 	.dependency_error = gpu_m4_provider_dependency_error,
 	.timedout = gpu_m4_provider_timedout,
 	.release = gpu_m4_provider_release, .closed = gpu_m4_provider_closed,
-	.coalesce = gpu_m4_provider_coalesce,
 };
 
 static void gpu_m4_provider_queue_free(struct kref *ref)

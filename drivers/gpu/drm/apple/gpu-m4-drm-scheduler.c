@@ -863,23 +863,6 @@ gpu_m4_drm_sched_submit(struct gpu_m4_drm_sched_queue *queue,
 		job->cookie = NULL;
 		goto fail_locked;
 	}
-	/* Coalescing: a plain submission without inputs joins the newest armed
-	 * job of this queue that has not run yet; its FINISHED fence completes
-	 * both. The provider refuses unless that job has started nothing.
-	 */
-	if (queue->ops.coalesce && !job->submit.input_count && !list_empty(&queue->jobs)) {
-		struct gpu_m4_drm_sched_job *last =
-			list_last_entry(&queue->jobs, struct gpu_m4_drm_sched_job, node);
-
-		if (last->cookie && !last->published && !last->canceled &&
-		    !queue->ops.coalesce(queue->owner, last->cookie, job->cookie)) {
-			finished = dma_fence_get(&last->base.s_fence->finished);
-			mutex_unlock(&queue->lock);
-			drm_sched_job_cleanup(&job->base);
-			gpu_m4_drm_sched_job_put(job);
-			return finished;
-		}
-	}
 	/* POINT OF NO RETURN: every armed job is pushed, no fallible operation. */
 	drm_sched_job_arm(&job->base);
 	finished = dma_fence_get(&job->base.s_fence->finished);

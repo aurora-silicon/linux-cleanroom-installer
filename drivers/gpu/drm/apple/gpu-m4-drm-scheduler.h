@@ -30,16 +30,6 @@ struct gpu_m4_drm_sched_ops {
 	 */
 	void (*publish_finished)(void *owner, void *job, struct dma_fence *finished);
 	/*
-	 * Optional submission coalescing. job is freshly prepared and never
-	 * armed, without inputs; target is this queue's newest armed job, not
-	 * yet run. Return 0 only after moving ALL of job's work into target
-	 * (which must not have started anything for it), leaving job holding no
-	 * work: job is then released and its submission completes with target's
-	 * FINISHED fence. Any error leaves both unchanged and job is armed as
-	 * usual. Called under the helper queue mutex; no wait.
-	 */
-	int (*coalesce)(void *owner, void *target, void *job);
-	/*
 	 * Enumerate OWNED exact implicit dma_resv snapshots captured in prepare
 	 * under the same locks as reserve/publish_finished. NULL ends enumeration;
 	 * ERR_PTR aborts before GPU publication. Never reread current reservations.
