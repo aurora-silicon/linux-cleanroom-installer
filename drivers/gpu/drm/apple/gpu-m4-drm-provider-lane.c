@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Dependency-ready global lane and independent full-retirement drain. */
 #include <linux/atomic.h>
+#include <linux/cpufreq.h>
+#include <linux/cpumask.h>
 #include <linux/err.h>
 #include <linux/hrtimer.h>
 #include <linux/jiffies.h>
@@ -485,9 +487,73 @@ static struct workqueue_struct *gpu_m4_lane_wq(void)
 	return READ_ONCE(lane_highpri) ? system_highpri_wq : system_unbound_wq;
 }
 
+/* The DT gives every T8132 core the same capacity, so an unbound worker runs
+ * in whichever cache pod queued it: a submission from an E core, or a poll
+ * timer armed there, keeps publication and retirement on the E cluster,
+ * where a render publication costs about twice as long (kbench passes 66 vs
+ * 52 us, alternate 110 vs 99, throughput 60 vs 50 per job; replay unchanged,
+ * 43.67 vs 43.51 and 79.70 vs 79.59 FPS). Queue every pass to the pod of the
+ * fastest cluster by cpufreq maximum instead: the current CPU when it belongs
+ * to it, else any online one. A symmetric system (one maximum) and a system
+ * without cpufreq keep the waker's pod.
+ */
+static bool lane_fast_pod = true;
+module_param(lane_fast_pod, bool, 0644);
+MODULE_PARM_DESC(lane_fast_pod, "Queue lane passes to the fastest CPU cluster's pod (default 1)");
+
+static struct cpumask gpu_m4_lane_fast_mask;
+static bool gpu_m4_lane_fast_known;
+
+/* Fastest cluster by cpufreq maximum, sampled once every possible CPU has a
+ * policy (cpufreq may bind after this module).
+ */
+static bool gpu_m4_lane_fast_sample(void)
+{
+	struct cpumask mask;
+	unsigned int best = 0;
+	int cpu;
+
+	if (smp_load_acquire(&gpu_m4_lane_fast_known))
+		return true;
+	cpumask_clear(&mask);
+	for_each_possible_cpu(cpu) {
+		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+		unsigned int max;
+
+		if (!policy)
+			return false;
+		max = policy->cpuinfo.max_freq;
+		cpufreq_cpu_put(policy);
+		if (max > best) {
+			best = max;
+			cpumask_clear(&mask);
+		}
+		if (max == best)
+			cpumask_set_cpu(cpu, &mask);
+	}
+	cpumask_copy(&gpu_m4_lane_fast_mask, &mask);
+	smp_store_release(&gpu_m4_lane_fast_known, true);
+	return true;
+}
+
+static void gpu_m4_lane_queue(struct gpu_m4_drm_provider_lane *lane, unsigned long delay)
+{
+	int cpu = raw_smp_processor_id();
+
+	if (READ_ONCE(lane_fast_pod) && gpu_m4_lane_fast_sample() &&
+	    !cpumask_test_cpu(cpu, &gpu_m4_lane_fast_mask)) {
+		cpu = cpumask_any_and(&gpu_m4_lane_fast_mask, cpu_online_mask);
+		if (cpu < nr_cpu_ids) {
+			mod_delayed_work_on(cpu, gpu_m4_lane_wq(), &lane->work, delay);
+			return;
+		}
+	}
+	mod_delayed_work(gpu_m4_lane_wq(), &lane->work, delay);
+}
+
 static void gpu_m4_lane_schedule(struct gpu_m4_drm_provider_lane *lane, u32 delay)
 {
-	mod_delayed_work(gpu_m4_lane_wq(), &lane->work, msecs_to_jiffies(delay));
+	gpu_m4_lane_queue(lane, msecs_to_jiffies(delay));
 }
 
 /* Timer expiry is only a request to inspect progress, never completion. */
@@ -499,7 +565,7 @@ static enum hrtimer_restart gpu_m4_lane_poll_timer(struct hrtimer *timer)
 	/* A destroyed lane's stop state is visible to timer/notify entrances. */
 	atomic64_inc(&lane->timer_wakes);
 	if (!READ_ONCE(lane->closing))
-		mod_delayed_work(gpu_m4_lane_wq(), &lane->work, 0);
+		gpu_m4_lane_queue(lane, 0);
 	return HRTIMER_NORESTART;
 }
 
@@ -519,7 +585,7 @@ void gpu_m4_drm_provider_lane_notify(struct gpu_m4_drm_provider_lane *lane)
 		return;
 	/* Coalesced firmware ring activity: an immediate wake always wins. */
 	atomic_inc(&lane->notify_seq);
-	mod_delayed_work(gpu_m4_lane_wq(), &lane->work, 0);
+	gpu_m4_lane_queue(lane, 0);
 }
 EXPORT_SYMBOL_GPL(gpu_m4_drm_provider_lane_notify);
 
