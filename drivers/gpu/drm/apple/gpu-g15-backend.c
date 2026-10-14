@@ -215,6 +215,22 @@ static unsigned int pb_max_blocks = G15_PB_BLOCKS;
 module_param(pb_max_blocks, uint, 0444);
 MODULE_PARM_DESC(pb_max_blocks, "Maximum PB blocks with pb_grow, pb_blocks..2048");
 
+/*
+ * Cross-engine waits inside one prefix (round-9 contract B): a render's TA
+ * wait on a compute of the same prefix uses type 0 (the FW-stamp wait,
+ * without the predecessor software-job hold) when the prefix has no InitBM
+ * or FS resynchronization and neither side has API timestamps; first members
+ * and prefix boundaries keep type 1. A compute's wait on the FS of a render
+ * of the same prefix that a later render follows can be type 0 too, but not
+ * together with the TA one: with both, CTS memory_model message-passing
+ * cases (render/compute alternation) hit firmware timeouts within seconds;
+ * either alone passes. Bit 0 keeps type 1 for FS -> compute (default), bit 1
+ * for compute -> TA.
+ */
+static unsigned int cross_engine_hold = 1;
+module_param(cross_engine_hold, uint, 0644);
+MODULE_PARM_DESC(cross_engine_hold, "Keep the type-1 predecessor hold on internal cross-engine waits: bit 0 FS->compute, bit 1 compute->TA (default 1: compute->TA type 0 inside a prefix; never clear both)");
+
 static bool early_tiling = true;
 module_param(early_tiling, bool, 0444);
 MODULE_PARM_DESC(early_tiling, "Advertise fragment-only render dependencies: a flagged render's tiling may overlap the previous pass's fragments within a prefix");
@@ -564,6 +580,7 @@ struct g15_backend {
 	u64 st_first_ns[3], st_last_ns[3];	/* publish to first / last stage event */
 	u64 st_jobs, st_job_cmds, st_job_max;	/* retired jobs and their command counts */
 	u64 st_early;				/* early-tiled render members */
+	u64 st_fs2c0, st_c2ta0;			/* type-0 FS->compute / compute->TA waits */
 	u64 st_pb_req, st_pb_grown, st_pb_refused, st_pb_bad;	/* PB growth requests/blocks */
 	u64 st_clustered;			/* clustered render members */
 	u64 st_ct_sync;				/* clustering buffers zeroed at claim */
@@ -2565,6 +2582,7 @@ struct g15_prefix {
 	u32 c_head, ta_head, fs_head;
 	u64 n, draw;		/* last compute ordinal / last draw ordinal */
 	u32 last_ct, last_fs;
+	bool ct_ts, fs_ts;	/* the last compute / render member has API timestamps */
 };
 
 /*
@@ -2574,7 +2592,7 @@ struct g15_prefix {
  */
 static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
 			      const struct g15_cmd *cmd, struct g15_prefix *pf,
-			      struct g15_flight *f)
+			      struct g15_flight *f, bool later_render)
 {
 	struct g15_graph *g = &be->g;
 	const struct drm_asahi_cmd_compute *c = &cmd->c;
@@ -2589,7 +2607,18 @@ static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
 	if (ret)
 		return ret;	/* nothing published yet */
 	if (pf->prev == 2) {
-		g15_barrier(&s->barrier, be->r.fw_stamp[1].va, pf->last_fs, 1, T, G15_UUID, 1);
+		/*
+		 * Type 0 (round-9 contract B3) when the FS is of this prefix and a
+		 * later render of the prefix follows it: its X names a later
+		 * scene, so this FS takes no PB catch-up at this point.
+		 */
+		bool type0 = pf->renders && later_render && !pf->initbm && !be->fs_resync &&
+			!pf->fs_ts && !cmd->ts_va[0] && !cmd->ts_va[1] &&
+			!(READ_ONCE(cross_engine_hold) & 1);
+
+		g15_barrier(&s->barrier, be->r.fw_stamp[1].va, pf->last_fs, 1, T, G15_UUID,
+			    type0 ? 0 : 1);
+		be->st_fs2c0 += type0;
 		g15_buf_w64(&g->ring, 8ULL * pf->c_head, s->barrier.va);
 		pf->c_head = (pf->c_head + 1) % G15_QUEUE_CAP;
 	}
@@ -2606,6 +2635,7 @@ static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
 	pf->computes++;
 	pf->n = n;
 	pf->last_ct = T;
+	pf->ct_ts = cmd->ts_va[0] || cmd->ts_va[1];
 	pf->prev = 1;
 	return 0;
 }
@@ -2702,9 +2732,19 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	put_unaligned_le64(r->mgr_misc.va, scene + 0x40);
 	g15_buf_write(&p->scene, 0, scene, sizeof(scene));
 	if (pf->prev == 1) {
-		/* Compute -> render: the TA waits on the previous compute. */
+		/*
+		 * Compute -> render: the TA waits on the previous compute; type 0
+		 * (round-9 contract B3) when that compute is of this prefix and
+		 * this render starts no InitBM.
+		 */
+		bool type0 = pf->computes && !pf->initbm && !be->fs_resync &&
+			n != 1 && !(!pf->renders && r->reinit) && !pf->ct_ts &&
+			!cmd->ts_va[0] && !cmd->ts_va[1] && !cmd->ts_va[2] && !cmd->ts_va[3] &&
+			!(READ_ONCE(cross_engine_hold) & 2);
+
 		g15_barrier(&p->prev_barrier, be->g.fw_stamp.va, pf->last_ct, G15_EVENT_SLOT, Tta,
-			    0x3d420, 1);
+			    0x3d420, type0 ? 0 : 1);
+		be->st_c2ta0 += type0;
 	} else if (early) {
 		g15_barrier(&p->prev_barrier, r->fw_stamp[0].va,
 			    g15_stamp_seed(G15_TA_SEED, n - 1), 0, Tta, 0x3d420, 1);
@@ -2764,6 +2804,7 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	pf->renders++;
 	pf->draw = n;
 	pf->last_fs = Tfs;
+	pf->fs_ts = cmd->ts_va[0] || cmd->ts_va[1] || cmd->ts_va[2] || cmd->ts_va[3];
 	pf->prev = 2;
 }
 
@@ -2806,6 +2847,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	bool overlap = be->fl_count, mixed = READ_ONCE(mixed_prefix), ahead;
 	struct g15_prefix pf = { .n = be->ordinal, .draw = r->draw };
 	u32 i = job->sent, ctx = job->vm->asid, computes = 0, renders = 0, end, free_c;
+	u32 last_render = U32_MAX;	/* index of the prefix's last render member */
 	bool render0 = job->cmds[i].render;
 	u8 *ta = NULL, *fs = NULL, *tas = NULL, *fss = NULL;
 	struct g15_geom geo;
@@ -2887,6 +2929,9 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	f->c_start = pf.c_head;
 	f->ta_start = pf.ta_head;
 	f->fs_start = pf.fs_head;
+	for (u32 k = i; k < end; k++)
+		if (job->cmds[k].render)
+			last_render = k;
 	for (u32 k = i; k < end; k++) {
 		const struct g15_cmd *cmd = &job->cmds[k];
 
@@ -2894,7 +2939,8 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 			g15_prefix_render(be, job, cmd, &pf, f, ta, fs, tas, fss);
 			continue;
 		}
-		ret = g15_prefix_compute(be, job, cmd, &pf, f);
+		ret = g15_prefix_compute(be, job, cmd, &pf, f,
+					 last_render != U32_MAX && k < last_render);
 		if (ret)
 			goto out;	/* nothing published yet */
 	}
@@ -2921,7 +2967,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 			    computes + j2->count > free_c)
 				break;
 			for (u32 k = 0; k < j2->count && !ret; k++)
-				ret = g15_prefix_compute(be, j2, &j2->cmds[k], &pf, f);
+				ret = g15_prefix_compute(be, j2, &j2->cmds[k], &pf, f, false);
 			if (ret)
 				goto out;	/* nothing published yet */
 			computes += j2->count;
@@ -3834,6 +3880,7 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "ct_sync %llu slot_sync %llu starved_us %llu prep_us %llu grouped %llu\n",
 		   be->st_ct_sync, be->st_slot_sync, div_u64(be->st_starved_ns, 1000),
 		   div_u64(be->st_prep_ns, 1000), be->st_grouped);
+	seq_printf(m, "type0: fs2c %llu c2ta %llu\n", be->st_fs2c0, be->st_c2ta0);
 	seq_printf(m, "pb: blocks %u/%u/%u requests %llu grown %llu refused %llu bad %llu\n",
 		   be->r.pb_init_blocks, be->r.pb_posted, be->r.pb_max, be->st_pb_req,
 		   be->st_pb_grown, be->st_pb_refused, be->st_pb_bad);
