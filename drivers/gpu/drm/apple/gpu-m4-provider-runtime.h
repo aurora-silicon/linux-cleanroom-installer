@@ -443,6 +443,8 @@ struct m4_gpu_provider_runtime {
 	u64 user_native_bytes;
 	u64 user_pb_grow_area; /* PB growth hint: smallest partially rendered area */
 	struct m4_user_native_unit *user_cell_owner[M4_ORDINARY_WORK_CELLS];
+	/* Next never-used notifier record slot in the record cells. */
+	u32 user_record_next;
 	struct m4_user_native_unit *user_unit_last[3];
 	/* Per UMA slot (compute 1..32, render 33..64): the unit of its latest
 	 * committed use (receipt_complete), cleared when that unit is cut cold

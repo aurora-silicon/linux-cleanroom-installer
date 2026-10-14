@@ -533,7 +533,9 @@ static int m4_user_compute_check_locked(struct m4_user_compute_packet *out)
 	    in->work.counter_fw != n->counter->fw_va ||
 	    in->work.notifier_fw != res->notifier->fw_va + 0x400 ||
 	    in->work.firmware_stamp_fw != res->notifier->fw_va + 0x640 ||
-	    in->work.user_stamp_fw != res->notifier->fw_va + 0x648)
+	    in->work.user_stamp_fw != res->notifier->fw_va + 0x648 ||
+	    in->work.record_fw != (out->job->queue->notifier->bo == res->notifier ?
+		out->job->queue->notifier->record_fw[2] : 0))
 		return M4_USER_WHY(-ESTALE, "compute check %u work aliases work=%#llx/%#llx counter=%#llx/%#llx notifier=%#llx/%#llx",
 			out->command_index, M4_WHY64(in->work.work_fw),
 			M4_WHY64(n->private[GPU_M4_COMPUTE_PRIVATE_WORK]->fw_va),
@@ -765,6 +767,8 @@ static int m4_user_compute_prepare_locked(struct m4_user_job *j, u32 index,
 		.counter_fw = n->counter->fw_va,
 		.stamps_fw = n->counter->fw_va + GPU_M4_EXEC_COMPUTE_STAMPS,
 		.notifier_fw = res->notifier->fw_va + 0x400,
+		.record_fw = j->queue->notifier->bo == res->notifier ?
+			j->queue->notifier->record_fw[2] : 0,
 		.firmware_stamp_fw = res->notifier->fw_va + 0x640,
 		.user_stamp_fw = res->notifier->fw_va + 0x648,
 		.pool_state_gpu = n->private[GPU_M4_COMPUTE_PRIVATE_POOL_STATE]->va,

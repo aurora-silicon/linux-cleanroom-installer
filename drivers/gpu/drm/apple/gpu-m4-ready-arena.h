@@ -14,8 +14,8 @@
  * These are session baselines, not a second job/cell-retirement lifecycle.
  */
 #define M4_ARENA_MAX_COMMANDS GPU_M4_DRM_JOB_MAX_COMMANDS
-#define M4_ARENA_CELLS M4_ORDINARY_WORK_CELLS
-static_assert(M4_ARENA_CELLS >= 2U * M4_ARENA_MAX_COMMANDS + 3U);
+#define M4_ARENA_CELLS (M4_ORDINARY_WORK_CELLS + M4_NOTIFY_RECORD_CELLS)
+static_assert(M4_ORDINARY_WORK_CELLS >= 2U * M4_ARENA_MAX_COMMANDS + 3U);
 #define M4_ARENA_LOWER_ATTRS 0x00c0000000000c8bULL
 
 struct m4_command_cell {

@@ -53,6 +53,10 @@ struct gpu_m4_render_packet_chronology {
 	 * leases with no rebuild/growth/rebind and full prior-pair retirement.
 	 */
 	bool init_buffer;
+	/* TA/FS notifier records the works name (W+0x10 / W+0x20) when they
+	 * are not the notifier page's own +0/+0x200: cached record cells.
+	 */
+	u64 record_fw[2];
 };
 
 struct gpu_m4_render_packet_input;
@@ -164,6 +168,8 @@ static inline int gpu_m4_render_chronology_fields_validate(
 		    e->threshold_to_publish != e->reservation_sequence + 1 ||
 		    (e->previous_target & 0xff) || e->previous_target >= c->target_stamp ||
 		    (e->reservation_sequence && !e->previous_target))
+			return -EINVAL;
+		if (c->record_fw[i] && !gpu_m4_exec_fw_range(c->record_fw[i], 0x118, 0x40))
 			return -EINVAL;
 		if (!d->firmware.va && !d->firmware.size && !d->predecessor_stamp_fw &&
 		    !d->predecessor_target && !d->predecessor_event && !d->fragment_internal &&
@@ -330,7 +336,7 @@ static inline void gpu_m4_render_packet_tiler(struct gpu_m4_render_packet_output
 
 	put_unaligned_le64(c ? c->engine[0].counter : 2, work + 4);
 	put_unaligned_le32(r->owner.asid, work + 0xc);
-	put_unaligned_le64(notifier, work + 0x10);
+	put_unaligned_le64(c && c->record_fw[0] ? c->record_fw[0] : notifier, work + 0x10);
 	put_unaligned_le32(c ? c->parameter_id : 0, work + 0x18);
 	put_unaligned_le64(manager, work + 0x20);
 	put_unaligned_le64(scene, work + 0x28);
@@ -417,7 +423,7 @@ static inline void gpu_m4_render_packet_fragment(struct gpu_m4_render_packet_out
 	put_unaligned_le32(r->owner.asid, work + 0xc);
 	put_unaligned_le64(sequence, work + 0x14);
 	put_unaligned_le32(GPU_M4_RENDER_FRAGMENT_SEQUENCE_SIZE, work + 0x1c);
-	put_unaligned_le64(notifier + 0x200, work + 0x20);
+	put_unaligned_le64(c && c->record_fw[1] ? c->record_fw[1] : notifier + 0x200, work + 0x20);
 	put_unaligned_le64(manager, work + 0x28);
 	put_unaligned_le64(scene, work + 0x30);
 	put_unaligned_le64(scene + 0x100, work + 0x38);

@@ -562,6 +562,10 @@ static int m4_user_render_reservation_check_locked(struct m4_user_job *j, u32 in
 		u64 sequence = notifier->sequence[engine];
 		u64 threshold = published ? t->threshold_to_publish : e->threshold_before;
 		void *record = notifier->bo->map.vaddr + engine * 0x200;
+		/* Cached record cells are firmware-owned after exposure: their
+		 * identity is the host ledger, never a live AP read.
+		 */
+		bool cached = notifier->record_fw[engine] != 0;
 
 		if (e->reservation_sequence == ~0ULL || e->threshold_before != e->reservation_sequence ||
 		    e->threshold_to_publish != e->reservation_sequence + 1 ||
@@ -573,11 +577,13 @@ static int m4_user_render_reservation_check_locked(struct m4_user_job *j, u32 in
 		    m4_store_read64(notifier->bo->map.vaddr + 0x600 + 8 * engine) != sequence ||
 		    (published ? !m4_user_wire_target_tail(j, engine, tail->target_stamp) :
 			p->user_target[engine] != e->previous_target) ||
-		    m4_store_read64(record) != notifier->bo->fw_va + 0x600 + engine * 8 ||
-		    m4_ready_read32(record + 8) || m4_ready_read32(record + 0x10) != 0x50 ||
+		    c->record_fw[engine] != notifier->record_fw[engine] ||
+		    (!cached && (m4_store_read64(record) != notifier->bo->fw_va + 0x600 + engine * 8 ||
+		     m4_ready_read32(record + 8) || m4_ready_read32(record + 0x10) != 0x50 ||
+		     m4_ready_read32(record + 0x24) != notifier->asid ||
+		     m4_ready_read32(record + 0x114) != 1)) ||
 		    /* The notifier's own (and the job's) user context, set once. */
-		    notifier->asid != j->asid || m4_ready_read32(record + 0x24) != notifier->asid ||
-		    m4_ready_read32(record + 0x114) != 1 ||
+		    notifier->asid != j->asid ||
 		    (!published && !sequence &&
 			(m4_ready_read32(notifier->bo->map.vaddr + 0x620 + engine * 16) ||
 			 m4_ready_read32(notifier->bo->map.vaddr + 0x628 + engine * 16))))
@@ -1143,7 +1149,8 @@ static int m4_user_render_packet_publish_locked(struct m4_user_job *j, u32 index
 		.chronology = { .uma_submitted_before = before, .uma_completed_before = before,
 			.uma_submitted = before + 2, .target_stamp = target, .init_buffer = init,
 			.parameter_id = m4_user_native_slot_parameter(DRM_ASAHI_CMD_RENDER,
-				m4_user_render_fw_slot(j, index)) },
+				m4_user_render_fw_slot(j, index)),
+			.record_fw = { notifier->record_fw[0], notifier->record_fw[1] } },
 	};
 	for (u32 e = 0; e < 2; e++)
 		res->chronology.engine[e] = (struct gpu_m4_render_engine_chronology) {

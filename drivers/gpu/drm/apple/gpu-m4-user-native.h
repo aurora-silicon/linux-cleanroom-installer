@@ -203,7 +203,20 @@ struct m4_user_notifier {
 	 */
 	u32 asid;
 	refcount_t refs;
+	/* notifier_cached: the three records (TA, FS, compute) live in a slot of
+	 * an ASC-cached record cell, written once before first exposure and
+	 * owned by the firmware afterwards (never read back, never recycled);
+	 * bo keeps the thresholds and stamps (index 2). Zero: the records at
+	 * bo +0/+0x200/+0x400, as before.
+	 */
+	u64 record_fw[3];
 };
+
+/* The firmware address a work names as its notifier record. */
+static u64 m4_user_notifier_record(const struct m4_user_notifier *n, u32 engine)
+{
+	return n->record_fw[engine] ?: n->bo->fw_va + engine * 0x200;
+}
 
 struct m4_user_compute_native {
 	struct m4_user_native_bo *private[GPU_M4_COMPUTE_PRIVATE_COUNT], *counter;
@@ -816,7 +829,7 @@ static void m4_user_native_unit_free_locked(struct m4_gpu_provider_runtime *p,
 	/* An arena reservation can precede a failed BO factory. The immutable
 	 * unit, not an eventually-created BO, owns that unpublished reservation.
 	 */
-	for (u32 c = 0; c < M4_ARENA_CELLS; c++)
+	for (u32 c = 0; c < M4_ORDINARY_WORK_CELLS; c++)
 		if (p->user_cell_owner[c] == u)
 			p->user_cell_owner[c] = NULL;
 	m4_user_native_slot_forget_locked(p, u);
@@ -907,7 +920,7 @@ static bool m4_user_native_rollback_defer_locked(struct m4_gpu_provider_runtime 
 				u->bo[kept++] = b;
 				continue;
 			}
-			for (u32 c = 0; c < M4_ARENA_CELLS; c++)
+			for (u32 c = 0; c < M4_ORDINARY_WORK_CELLS; c++)
 				if (b->cell == &p->ready->arena->cell[c] && p->user_cell_owner[c] == u)
 					p->user_cell_owner[c] = NULL;
 			if (b->upper)
@@ -919,7 +932,7 @@ static bool m4_user_native_rollback_defer_locked(struct m4_gpu_provider_runtime 
 		u->bo_count = kept;
 	}
 	/* Unbound reserved credits never had a claim. */
-	for (u32 c = 0; c < M4_ARENA_CELLS; c++) {
+	for (u32 c = 0; c < M4_ORDINARY_WORK_CELLS; c++) {
 		bool bound = false;
 
 		if (p->user_cell_owner[c] != u)
@@ -1567,7 +1580,7 @@ static int m4_user_native_add(struct m4_user_native_stage *s, u64 size,
 			mutex_unlock(lock);
 			return -EPERM;
 		}
-		for (u32 i = 0; !cell && i < M4_ARENA_CELLS; i++) {
+		for (u32 i = 0; !cell && i < M4_ORDINARY_WORK_CELLS; i++) {
 			bool bound = false;
 
 			if (p->user_cell_owner[i] != s->building)
@@ -1716,6 +1729,49 @@ static int m4_user_native_bo_check_locked(struct m4_user_native_bo *b,
 		M4_WHY64(b->fw_va), M4_WHY64(b->size));
 }
 
+/* Cached notifier records (retained cache ownership contract fcef2f890 s1):
+ * the completing work supplies record +0x24 itself and the firmware owns the
+ * record after exposure (catch-up CIVACs [N, N+0xc8)), so a record page may
+ * be ASC-cached once the host never stores to or polls it after its first
+ * exposure and it is never recycled. Thresholds and stamps stay on the
+ * index-2 notifier page.
+ */
+static bool notifier_cached = true;
+module_param(notifier_cached, bool, 0644);
+MODULE_PARM_DESC(notifier_cached, "New queues' notifier records in ASC-cached, never recycled record cells while slots last (default 1)");
+
+static void m4_user_notifier_records_locked(struct m4_gpu_provider_runtime *p,
+	struct m4_user_notifier *n)
+{
+	struct m4_command_arena *a = p->ready->arena;
+	struct m4_command_cell *c;
+	u32 slot = p->user_record_next;
+	u8 *base;
+
+	lockdep_assert_held(&p->hello->gpu->lock);
+	if (!READ_ONCE(notifier_cached) || !a || !a->imported ||
+	    slot >= M4_NOTIFY_RECORD_CELLS * M4_NOTIFY_RECORDS_PER_CELL)
+		return;
+	c = &a->cell[M4_ORDINARY_WORK_CELLS + slot / M4_NOTIFY_RECORDS_PER_CELL];
+	if (!c->initialized || !c->mapped || !c->upper || !c->fw_va ||
+	    iosys_map_is_null(&c->map))
+		return;
+	p->user_record_next++;
+	base = c->map.vaddr + (slot % M4_NOTIFY_RECORDS_PER_CELL) * M4_NOTIFY_RECORD_SPAN;
+	memset(base, 0, M4_NOTIFY_RECORD_SPAN);
+	for (u32 i = 0; i < 3; i++) {
+		u8 *record = base + i * M4_NOTIFY_RECORD_STRIDE;
+
+		put_unaligned_le64(n->bo->fw_va + 0x600 + i * 8, record);
+		put_unaligned_le32(0x50, record + 0x10);
+		put_unaligned_le32(n->asid, record + 0x24);
+		memset(record + 0xa8, 0xff, 8);
+		put_unaligned_le32(1, record + 0x114);
+		n->record_fw[i] = c->fw_va + (slot % M4_NOTIFY_RECORDS_PER_CELL) *
+			M4_NOTIFY_RECORD_SPAN + i * M4_NOTIFY_RECORD_STRIDE;
+	}
+}
+
 static struct m4_user_notifier *m4_user_notifier_create(struct m4_user_queue *q)
 {
 	struct m4_gpu_provider_runtime *p = q->runtime;
@@ -1783,6 +1839,9 @@ static struct m4_user_notifier *m4_user_notifier_create(struct m4_user_queue *q)
 		memset(record + 0xa8, 0xff, 8);
 		put_unaligned_le32(1, record + 0x114);
 	}
+	mutex_lock(&p->hello->gpu->lock);
+	m4_user_notifier_records_locked(p, n);
+	mutex_unlock(&p->hello->gpu->lock);
 	dma_wmb();
 	return n;
 }
@@ -4363,7 +4422,7 @@ static u32 m4_user_native_cells_free_locked(struct m4_gpu_provider_runtime *p, u
 	u32 free = 0, state;
 
 	*pending = 0;
-	for (u32 i = 0; i < M4_ARENA_CELLS; i++) {
+	for (u32 i = 0; i < M4_ORDINARY_WORK_CELLS; i++) {
 		struct m4_user_native_unit *u = p->user_cell_owner[i];
 
 		free += !u;
@@ -4388,7 +4447,7 @@ static u32 m4_user_native_cells_busy_locked(struct m4_gpu_provider_runtime *p)
 {
 	u32 busy = 0;
 
-	for (u32 i = 0; i < M4_ARENA_CELLS; i++) {
+	for (u32 i = 0; i < M4_ORDINARY_WORK_CELLS; i++) {
 		struct m4_user_native_unit *u = p->user_cell_owner[i];
 
 		busy += u && !u->cold && (u->accepted || !u->history || !u->history->complete);
@@ -4682,7 +4741,7 @@ static void m4_user_native_witness_advance_locked(struct m4_gpu_provider_runtime
 	list_for_each_entry(u, &p->user_native_units, retained) {
 		if (!open && !u->queue->closed)
 			continue;
-		for (u32 step = 0; step < M4_ARENA_CELLS; step++) {
+		for (u32 step = 0; step < M4_ORDINARY_WORK_CELLS; step++) {
 			struct m4_user_native_history *a = u->history, *b = u->displacement, *nb;
 			const struct m4_user_native_receipt *ra, *rn;
 
@@ -5151,7 +5210,7 @@ static u32 m4_user_native_cell_state_locked(struct m4_gpu_provider_runtime *p,
 	int ret;
 	u64 pa;
 
-	for (u32 i = 0; i < M4_ARENA_CELLS && b->cell; i++)
+	for (u32 i = 0; i < M4_ORDINARY_WORK_CELLS && b->cell; i++)
 		if (b->cell == &a->cell[i]) {
 			c = b->cell;
 			*index = i;
@@ -5196,7 +5255,7 @@ static void m4_user_native_cells_census_locked(struct m4_gpu_provider_runtime *p
 {
 	if (!p->ready->arena || !p->ready->arena->imported)
 		return;
-	for (u32 i = 0; i < M4_ARENA_CELLS; i++) {
+	for (u32 i = 0; i < M4_ORDINARY_WORK_CELLS; i++) {
 		struct m4_user_native_unit *u = p->user_cell_owner[i];
 
 		if (!u) {
@@ -5368,7 +5427,7 @@ static void m4_user_native_cells_report_locked(struct m4_gpu_provider_runtime *p
 	struct m4_user_native_unit *u;
 	u32 owners = 0, state[M4_USER_NATIVE_STATES] = { }, candidates = 0, held = 0;
 
-	for (u32 i = 0; i < M4_ARENA_CELLS; i++) {
+	for (u32 i = 0; i < M4_ORDINARY_WORK_CELLS; i++) {
 		u = p->user_cell_owner[i];
 		if (!u)
 			continue;
@@ -5389,7 +5448,7 @@ static void m4_user_native_cells_report_locked(struct m4_gpu_provider_runtime *p
 		defers, state[M4_USER_NATIVE_INFLIGHT], state[M4_USER_NATIVE_CURRENT],
 		state[M4_USER_NATIVE_IDLE], candidates, state[M4_USER_NATIVE_COLD], held,
 		m4_user_native_unit_stats.cells_released_held);
-	for (u32 i = 0; i < M4_ARENA_CELLS && owners < 8; i++) {
+	for (u32 i = 0; i < M4_ORDINARY_WORK_CELLS && owners < 8; i++) {
 		struct m4_user_native_bo *b = NULL;
 		bool first = true;
 
@@ -5454,7 +5513,7 @@ static bool m4_user_native_unit_named_locked(struct m4_gpu_provider_runtime *p,
 
 	if (refcount_read(&u->refs) != 1)
 		return true;
-	for (u32 c = 0; c < M4_ARENA_CELLS; c++)
+	for (u32 c = 0; c < M4_ORDINARY_WORK_CELLS; c++)
 		if (p->user_cell_owner[c] == u)
 			return true;
 	for (u32 e = 0; e < 3; e++)
@@ -5692,7 +5751,7 @@ static int m4_user_native_cells_reserve(struct m4_user_native_stage *s,
 		 */
 		if (defers == 1 || defers == 8 || !(defers % 256)) {
 			pr_warn("GPU native capacity: arena cells=%u free=%u pending=%u need=%u bytes_free=%llu need_bytes=%llu commands=%u deferred=%u evicted=%u defers=%u\n",
-				M4_ARENA_CELLS, free, pending, need, bytes, need_bytes, s->count,
+				M4_ORDINARY_WORK_CELLS, free, pending, need, bytes, need_bytes, s->count,
 				s->deferred_materialization, evicted, defers);
 			if (free < need) {
 				m4_user_native_cells_report_locked(p, defers);
@@ -5713,7 +5772,7 @@ static int m4_user_native_cells_reserve(struct m4_user_native_stage *s,
 		if (!s->unit[i] || m4_user_native_reused(s, i))
 			continue;
 		cells = m4_user_native_command_cells(s->command[i].type);
-		for (; cells && next < M4_ARENA_CELLS; next++)
+		for (; cells && next < M4_ORDINARY_WORK_CELLS; next++)
 			if (!p->user_cell_owner[next]) {
 				p->user_cell_owner[next] = s->unit[i];
 				cells--;

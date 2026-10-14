@@ -527,6 +527,7 @@ struct gpu_m4_exec_compute_input {
 	u64 counter_fw;
 	u64 stamps_fw; /* private start/end stamp pair; 0: work_fw + 0x8c0 */
 	u64 notifier_fw;
+	u64 record_fw; /* notifier record W+0x10 names; 0: notifier_fw */
 	u64 firmware_stamp_fw;
 	u64 user_stamp_fw;
 	u64 pool_state_gpu;
@@ -585,6 +586,7 @@ static inline int gpu_m4_exec_first_compute(void *output,
 	    !gpu_m4_exec_fw_range(in->notifier_fw - 0x400, GPU_M4_EXEC_NOTIFY_SIZE, 8) ||
 	    in->firmware_stamp_fw != in->notifier_fw + 0x240 ||
 	    in->user_stamp_fw != in->notifier_fw + 0x248 ||
+	    (in->record_fw && !gpu_m4_exec_fw_range(in->record_fw, 0x118, 0x40)) ||
 	    (in->work_gpu & 0x3fff) || (in->auxiliary_gpu & 0x3fff) ||
 	    (in->context_store_gpu & 0x3fff) || in->registers.preemption_size < 0x4000 ||
 	    !gpu_m4_exec_cdm_span_valid(in->registers.cdm_base, in->registers.cdm_end))
@@ -635,7 +637,7 @@ static inline int gpu_m4_exec_first_compute(void *output,
 	put_unaligned_le32(3, work);
 	/* +4..+11 are zero: the UMA submission counter is a separate allocation. */
 	put_unaligned_le32(1, work + 0xc);
-	put_unaligned_le64(in->notifier_fw, work + 0x10);
+	put_unaligned_le64(in->record_fw ?: in->notifier_fw, work + 0x10);
 	put_unaligned_le64(in->work_gpu + 0x20, work + 0x720);
 	put_unaligned_le16(count, work + 0x728);
 	put_unaligned_le16(count * 12, work + 0x72a);

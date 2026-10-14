@@ -19,7 +19,14 @@
  * bookkeeping, snapshots and tables, never backing pages.
  */
 #define M4_ORDINARY_NATIVE_MEMORY_LIMIT (8ULL << 30)
-#define M4_ORDINARY_WORK_CELLS 384U
+#define M4_ORDINARY_WORK_CELLS 368U
+/* Arena cells after the work cells hold logical-queue notifier records,
+ * 16 notifiers per cell, never recycled (see m4_user_notifier_records).
+ */
+#define M4_NOTIFY_RECORD_CELLS 16U
+#define M4_NOTIFY_RECORDS_PER_CELL 16U
+#define M4_NOTIFY_RECORD_SPAN 0x400U
+#define M4_NOTIFY_RECORD_STRIDE 0x140U
 /* Conservative per-NEW-unit backing estimate, for the native backing budgets
  * (runtime native and GEM factory; never provider metadata): one 32-MiB
  * allocator pool plus its smaller private/firmware owners. A render unit adds
