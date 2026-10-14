@@ -154,7 +154,7 @@
 #define G15_LEAF_CACHED		0x00c0000000000c83ULL
 #define G15_LEAF_PB_LIST	0x00e0000000000c03ULL
 #define G15_MAX_CLIENT		320
-#define G15_HORIZON_JOBS	8	/* jobs per compute horizon, and scheduler credits */
+#define G15_HORIZON_JOBS	16	/* jobs per compute horizon, and scheduler credits */
 #define G15_AHEAD_RECORDS	64	/* unconsumed records per 256-entry channel ring */
 
 static bool wb_sweep;
@@ -230,7 +230,7 @@ MODULE_PARM_DESC(early_tiling, "Advertise fragment-only render dependencies: a f
  */
 static unsigned int compute_horizon = G15_HORIZON_JOBS;
 module_param(compute_horizon, uint, 0644);
-MODULE_PARM_DESC(compute_horizon, "Ready compute-only jobs of one queue published in one prefix, 1..8 (1: one job per prefix)");
+MODULE_PARM_DESC(compute_horizon, "Ready compute-only jobs of one queue published in one prefix, 1..16 (1: one job per prefix)");
 
 /*
  * Render prefixes of half the pass slots, posted ahead (round-5 contract D1,
