@@ -700,7 +700,7 @@ gpu_m4_drm_sched_queue_create(const struct gpu_m4_drm_sched_config *config)
 	    !config->ops->fault || !config->ops->release || !config->ops->closed)
 		return ERR_PTR(-EOPNOTSUPP);
 	if (config->timeout <= 0 || config->timeout == MAX_SCHEDULE_TIMEOUT ||
-	    config->credit_limit > (u32)GPU_M4_DRM_SCHED_MAX_CREDITS)
+	    config->credit_limit > (u32)GPU_M4_DRM_SCHED_PROVIDER_MAX_CREDITS)
 		return ERR_PTR(-EINVAL);
 	args.credit_limit = config->credit_limit ?: 1;
 	/* Host entity levels only: the shared firmware queues and their fields

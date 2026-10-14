@@ -104,6 +104,12 @@ struct gpu_m4_drm_sched_ops {
  */
 enum { GPU_M4_DRM_SCHED_MAX_CREDITS = 4 };
 
+/* Bound of what a provider may configure for its own queues: a provider that
+ * keeps more ready jobs (the G15 backend's compute horizons) asks for up to
+ * this many; the others keep GPU_M4_DRM_SCHED_MAX_CREDITS.
+ */
+enum { GPU_M4_DRM_SCHED_PROVIDER_MAX_CREDITS = 16 };
+
 struct gpu_m4_drm_sched_config {
 	struct device *dev;
 	void *owner;
@@ -116,7 +122,8 @@ struct gpu_m4_drm_sched_config {
 	u64 client_id;
 	long timeout; /* positive finite jiffies, provider recovery is mandatory */
 	/* Scheduler credits (jobs run, i.e. handed to the provider, at once):
-	 * 0 or 1 serial, 2 when the provider runs two packets in flight.
+	 * 0 or 1 serial, 2 when the provider runs two packets in flight; at most
+	 * GPU_M4_DRM_SCHED_PROVIDER_MAX_CREDITS, set by the provider itself.
 	 */
 	u32 credit_limit;
 };
