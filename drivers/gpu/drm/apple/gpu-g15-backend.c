@@ -152,7 +152,7 @@
 #define G15_LEAF_CACHED		0x00c0000000000c83ULL
 #define G15_LEAF_PB_LIST	0x00e0000000000c03ULL
 #define G15_MAX_CLIENT		320
-#define G15_HORIZON_JOBS	4	/* jobs per compute horizon, and scheduler credits */
+#define G15_HORIZON_JOBS	8	/* jobs per compute horizon, and scheduler credits */
 #define G15_AHEAD_RECORDS	64	/* unconsumed records per 256-entry channel ring */
 
 static bool wb_sweep;
@@ -206,7 +206,7 @@ MODULE_PARM_DESC(early_tiling, "Advertise fragment-only render dependencies: a f
  */
 static unsigned int compute_horizon = G15_HORIZON_JOBS;
 module_param(compute_horizon, uint, 0644);
-MODULE_PARM_DESC(compute_horizon, "Ready compute-only jobs of one queue published in one prefix, 1..4 (1: one job per prefix)");
+MODULE_PARM_DESC(compute_horizon, "Ready compute-only jobs of one queue published in one prefix, 1..8 (1: one job per prefix)");
 
 /*
  * Render prefixes of half the pass slots, posted ahead (round-5 contract D1,
@@ -511,6 +511,8 @@ struct g15_backend {
 	u32 ta_target, fs_target, ta_head, fs_head, stage_seen;
 	u32 producer[3];	/* host channels 0 TA, 1 FS, 2 compute */
 	unsigned long deadline;	/* of the oldest published prefix */
+	u64 progress_flight;	/* oldest prefix (publication ns) and its stamps at the last poll */
+	u32 progress[3];
 	u64 st_overlaps;	/* prefixes published while another ran */
 	/*
 	 * Statistics (be->lock): commands per engine (0 compute, 1 render);
@@ -2717,12 +2719,14 @@ static struct g15_flight *g15_oldest(struct g15_backend *be)
 	return be->fl_count ? &be->fl[be->fl_first] : NULL;
 }
 
-/* Host deadline of the oldest published prefix f: deadline_ms per job it runs. */
-static void g15_deadline(struct g15_backend *be, const struct g15_flight *f)
+/*
+ * Host deadline of the oldest published prefix: deadline_ms after it started
+ * or last made progress (g15_progress), so a compute horizon of several jobs
+ * has a budget per job without hiding a stall behind an unrelated retirement.
+ */
+static void g15_deadline(struct g15_backend *be)
 {
-	u32 jobs = f ? 1 + f->group_count : 1;
-
-	be->deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(deadline_ms), 100U) * jobs);
+	be->deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(deadline_ms), 100U));
 }
 
 /*
@@ -2936,7 +2940,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	if (overlap)
 		be->st_overlaps++;
 	else
-		g15_deadline(be, f);
+		g15_deadline(be);
 	job->sent = end;
 	be->fl_count++;
 	/* Compute on channel 2, then FS on channel 1, then TA on channel 0 (R8). */
@@ -3060,6 +3064,39 @@ static void g15_report(struct g15_backend *be, const char *what)
 static bool g15_stamp_reached(u32 obs, u32 own, u32 tail)
 {
 	return obs && !(obs & 0xff) && obs - own <= tail - own;
+}
+
+/*
+ * Progress of the oldest prefix f: a FW stamp of an engine on which f still
+ * has unreached work moved since the last poll (later prefixes' work on other
+ * engines does not count). Renews the deadline; the first call for a prefix
+ * only records its position.
+ */
+static void g15_progress(struct g15_backend *be, const struct g15_flight *f)
+{
+	struct g15_render *r = &be->r;
+	u32 c = 0, ta = 0, fs = 0;
+
+	if (f->computes) {
+		c = g15_buf_r32(&be->g.fw_stamp, 0);
+		if (g15_stamp_reached(c, f->target, be->target))
+			c = 0;	/* its computes are done: later work does not count */
+	}
+	if (f->renders) {
+		ta = g15_buf_r32(&r->fw_stamp[0], 0);
+		fs = g15_buf_r32(&r->fw_stamp[1], 0);
+		if (g15_stamp_reached(ta, f->ta_target, be->ta_target))
+			ta = 0;
+		if (g15_stamp_reached(fs, f->fs_target, be->fs_target))
+			fs = 0;
+	}
+	if (be->progress_flight == f->pub_ns &&
+	    (c != be->progress[0] || ta != be->progress[1] || fs != be->progress[2]))
+		g15_deadline(be);
+	be->progress_flight = f->pub_ns;
+	be->progress[0] = c;
+	be->progress[1] = ta;
+	be->progress[2] = fs;
 }
 
 /* Cursor c of a ring of m entries passed end h of entries from b, within tail t. */
@@ -3459,7 +3496,7 @@ static void g15_flight_done(struct g15_backend *be, struct g15_flight *f, int er
 	if (!be->fl_count)
 		be->idle_from_ns = ktime_get_ns();	/* drained: a gap until the next publication */
 	/* The next prefix starts executing about now. */
-	g15_deadline(be, g15_oldest(be));
+	g15_deadline(be);
 	job->next += f->count;
 	if (error) {
 		gpu_m4_drm_vm_error(job->vm->frontend, error);
@@ -3554,6 +3591,8 @@ static void g15_poll_work(struct work_struct *work)
 	if (!be->fl_count)
 		goto next;
 	f = g15_oldest(be);
+	if (!be->preempt_global)
+		g15_progress(be, f);
 	if (!ret && !READ_ONCE(gpu->error) &&
 	    atomic_read(&gpu->event_errors) == be->errors_seen &&
 	    time_after(jiffies, be->deadline) && !be->preempt_global &&
