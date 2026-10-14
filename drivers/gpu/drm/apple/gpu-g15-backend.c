@@ -228,13 +228,29 @@ MODULE_PARM_DESC(repoll_us, "Retry a prefix ready behind the running ones, held 
  * working storage, which the common backend allocates firmware-private
  * cached: it becomes firmware-only (GPU inaccessible) as well.
  * Host-polled or host-updated cells (stamps, queue state, thresholds,
- * counters, notifiers, timestamp cells) and GPU-written storage keep
- * AttrIndex 2. All of these objects are retained until reboot, so no cached
- * mapping is ever torn down.
+ * counters, timestamp cells) and GPU-written storage keep AttrIndex 2. All
+ * of these objects are retained until reboot, so no cached mapping is ever
+ * torn down.
+ *
+ * The notifiers are firmware-owned once initialized: each completing work
+ * stores its own context into notifier +0x24, and the service cleans and
+ * invalidates the first 0xc0 bytes when its count catches up with the
+ * threshold. The host initializes them once, before their first exposure,
+ * and never stores to them again (a host store into a line the ASC may hold
+ * dirty can be lost or lose firmware updates, even with an unchanged
+ * value); the threshold they point to stays a separate host-written
+ * AttrIndex 2 cell. notifier_cached maps the render notifier AttrIndex 0 by
+ * default. The compute notifier stays AttrIndex 2: a stream of single-work
+ * compute prefixes catches up (and cleans the record) at every work, which
+ * costs more than the cached reads save there.
  */
 static bool fw_cached = true;
 module_param(fw_cached, bool, 0444);
 MODULE_PARM_DESC(fw_cached, "Map microsequences, work images, barriers/InitBM, queue-info, queue scratch, scheduling contexts and job lists ASC-cached (firmware AttrIndex 0); 0: AttrIndex 2 (inner non-cacheable)");
+
+static unsigned int notifier_cached = 2;
+module_param(notifier_cached, uint, 0444);
+MODULE_PARM_DESC(notifier_cached, "Map notifiers ASC-cached (firmware AttrIndex 0, firmware-only): bit 0 compute, bit 1 render (default 2); others AttrIndex 2");
 
 static unsigned int resnap_us = 100;
 module_param(resnap_us, uint, 0644);
@@ -618,6 +634,12 @@ static u64 g15_cmd_shared(void)
 	return fw_cached ? G15_PTE_SHARED_CACHED : G15_PTE_SHARED;
 }
 
+/* Notifiers: firmware-only, cached as selected by notifier_cached. */
+static u64 g15_notifier_class(u32 bit)
+{
+	return notifier_cached & bit ? G15_PTE_FW_CACHED : G15_PTE_FW;
+}
+
 /* Queue scratch: firmware-private cached, or the previous shared index-2 class. */
 static u64 g15_queue_scratch(void)
 {
@@ -641,7 +663,7 @@ static int g15_graph_alloc(struct g15_backend *be)
 	ret = ret ?: g15_buf_alloc(be, &g->manager, 0x84, sh, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->counter, 0x40, sh, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->sched_ctx, 0x40, cfw, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &g->notifier, 0x108, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &g->notifier, 0x108, g15_notifier_class(1), 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->threshold, 4, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->job_list, 0x18, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->qinfo, 0xb4, cfw, 0, 0, false);
@@ -772,7 +794,7 @@ static int g15_render_alloc(struct g15_backend *be)
 		ret = ret ?: g15_buf_alloc(be, &r->fw_stamp[e], 4, sh, 0, 0, false);
 	}
 	ret = ret ?: g15_buf_alloc(be, &r->sched_ctx, 0x40, cfw, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &r->notifier, 0x108, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &r->notifier, 0x108, g15_notifier_class(2), 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->threshold, 4, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->job_list, 0x18, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->block_ctl, 0x40, fw, 0, 0, false);
@@ -2631,16 +2653,18 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 		if (ret)
 			goto out;	/* nothing published yet */
 	}
-	/* Host thresholds/counters after the whole prefix (contract 2 table). */
+	/*
+	 * Host thresholds/counters after the whole prefix (contract 2 table).
+	 * The notifiers' context (+0x24) is not ours to write: every completing
+	 * work stores its own context there before the service reads it.
+	 */
 	if (computes) {
 		g15_buf_w32(&g->threshold, 0, (u32)pf.n);
 		g15_buf_w32(&g->counter, 0, (u32)pf.n);
-		g15_buf_w32(&g->notifier, 0x24, ctx);
 	}
 	if (renders) {
 		g15_buf_w32(&r->threshold, 0, 2 * (u32)pf.draw);
 		g15_buf_w32(&r->pb_counter, 0, (u32)pf.draw);
-		g15_buf_w32(&r->notifier, 0x24, ctx);
 		if (!r->c1_written) {
 			u8 c1[16] = {};
 
