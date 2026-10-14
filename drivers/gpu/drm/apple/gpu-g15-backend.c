@@ -212,6 +212,25 @@ static unsigned int repoll_us = 15;
 module_param(repoll_us, uint, 0644);
 MODULE_PARM_DESC(repoll_us, "Retry a prefix ready behind the running ones, held only by a channel's unconsumed record, after this many us, 5..100 (0: at the next completion check)");
 
+/*
+ * Firmware cache policy (cache contract 1): the firmware's MAIR makes
+ * AttrIndex 2 inner non-cacheable for the ASC, so every firmware step that
+ * reads our command objects through it misses its caches. The objects the
+ * firmware itself cleans and invalidates around each use are mapped with
+ * AttrIndex 0 instead, keeping their access class: microsequences (encoded
+ * length at completion), compute/TA/FS work images (0x880/0x920/0xc60 at
+ * admission and completion; each image ends inside the last line of that
+ * span, so every byte is in a maintained line), barriers (0x30 of the
+ * one-line 0x3e record) and InitBM (0x20). Queue-info is firmware-private
+ * after its initialization. Host-polled or host-updated cells (stamps, queue
+ * state, thresholds, counters, notifiers, timestamp cells) and GPU-written
+ * storage keep AttrIndex 2. All of these objects are retained until reboot,
+ * so no cached mapping is ever torn down.
+ */
+static bool fw_cached = true;
+module_param(fw_cached, bool, 0444);
+MODULE_PARM_DESC(fw_cached, "Map microsequences, work images, barriers/InitBM and queue-info ASC-cached (firmware AttrIndex 0), as the firmware maintains them; 0: AttrIndex 2 (inner non-cacheable)");
+
 static unsigned int resnap_us = 100;
 module_param(resnap_us, uint, 0644);
 MODULE_PARM_DESC(resnap_us, "Completion re-check interval while a command is published, 25..1000 us (EP0x20 events wake earlier)");
@@ -583,11 +602,23 @@ static int g15_buf_alloc(struct g15_backend *be, struct g15_buf *b, u64 size, u6
 
 /* ------------------------------------------------------ compute graph --- */
 
+/* Leaf classes of firmware-maintained command objects (see fw_cached). */
+static u64 g15_cmd_fw(void)
+{
+	return fw_cached ? G15_PTE_FW_CACHED : G15_PTE_FW;
+}
+
+static u64 g15_cmd_shared(void)
+{
+	return fw_cached ? G15_PTE_SHARED_CACHED : G15_PTE_SHARED;
+}
+
 static int g15_graph_alloc(struct g15_backend *be)
 {
 	struct g15_graph *g = &be->g;
 	struct g15_slot *s;
 	const u64 sh = G15_PTE_SHARED, fw = G15_PTE_FW;
+	const u64 cfw = g15_cmd_fw(), csh = g15_cmd_shared();
 	int ret;
 
 	ret = g15_buf_alloc(be, &g->legacy, 0x4000, sh, 0, 0, false);
@@ -602,7 +633,7 @@ static int g15_graph_alloc(struct g15_backend *be)
 	ret = ret ?: g15_buf_alloc(be, &g->notifier, 0x108, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->threshold, 4, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->job_list, 0x18, fw, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &g->qinfo, 0xb4, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &g->qinfo, 0xb4, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->qstate, 0x60, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->ring, G15_QUEUE_CAP * 8, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->qscratch, 0x40000, sh, 0, 0, false);
@@ -616,10 +647,10 @@ static int g15_graph_alloc(struct g15_backend *be)
 		ret = ret ?: g15_buf_alloc(be, &s->uts, 16, fw, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &s->preempt, 0x10000, sh,
 					   G15_PREEMPT_GVA + k * G15_PREEMPT_STRIDE, 0, false);
-		ret = ret ?: g15_buf_alloc(be, &s->work, G15_WORK_SIZE, sh,
+		ret = ret ?: g15_buf_alloc(be, &s->work, G15_WORK_SIZE, csh,
 					   G15_WORK_PAGE + k * G15_CWORK_STRIDE, G15_WORK_OFF, true);
 		ret = ret ?: g15_buf_alloc(be, &s->tail, 0x10000, sh, 0, 0, false);
-		ret = ret ?: g15_buf_alloc(be, &s->seq, 0x1000, fw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &s->seq, 0x1000, cfw, 0, 0, false);
 		for (u32 i = 0; !ret && i < 5; i++)
 			ret = g15_buf_alloc(be, &s->scratch[i], 0x10000, sh, 0, 0, false);
 	}
@@ -708,6 +739,7 @@ static int g15_render_alloc(struct g15_backend *be)
 {
 	struct g15_render *r = &be->r;
 	const u64 sh = G15_PTE_SHARED, fw = G15_PTE_FW;
+	const u64 cfw = g15_cmd_fw(), csh = g15_cmd_shared();
 	int ret = 0;
 
 	for (u32 e = 0; !ret && e < 2; e++) {
@@ -720,7 +752,7 @@ static int g15_render_alloc(struct g15_backend *be)
 					   G15_UMA_TABLE_PAGE(e), 0x3000, false);
 		ret = ret ?: g15_buf_alloc(be, &r->uma_mgr[e], 0x84, sh, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->uma_counter[e], 0x40, sh, 0, 0, false);
-		ret = ret ?: g15_buf_alloc(be, &r->qinfo[e], 0xb4, fw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &r->qinfo[e], 0xb4, cfw, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->qstate[e], 0x60, fw, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->ring[e], G15_QUEUE_CAP * 8, fw, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->qscratch[e], 0x40000, sh, 0, 0, false);
@@ -737,7 +769,7 @@ static int g15_render_alloc(struct g15_backend *be)
 	ret = ret ?: g15_buf_alloc(be, &r->scene_list, 0xc0, sh, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->pb_mgr, 0xac, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->legacy_empty, 0x40, sh, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &r->initbm, 0x20, fw, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &r->initbm, 0x20, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->pb_pages, 0x28000, sh, G15_PB_PAGE_LIST_GVA, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->pb_blocks, 0x8000, sh, G15_PB_BLOCK_LIST_GVA, 0, false);
 	ret = ret ?: __g15_buf_alloc(be, &r->pb_heap, G15_PB_HEAP_SIZE, sh, G15_PB_HEAP_GVA, 0,
@@ -773,20 +805,20 @@ static int g15_render_alloc(struct g15_backend *be)
 					   0, false);
 		ret = ret ?: g15_buf_alloc(be, &p->fs_scratch, 0x10000, sh, G15_FS_SCRATCH_GVA + ps,
 					   0, false);
-		ret = ret ?: g15_buf_alloc(be, &p->fs_work, G15_FS_WORK_SIZE, sh,
+		ret = ret ?: g15_buf_alloc(be, &p->fs_work, G15_FS_WORK_SIZE, csh,
 					   G15_FS_WORK_PAGE + ws, G15_FS_WORK_OFF, true);
-		ret = ret ?: g15_buf_alloc(be, &p->ta_work, G15_TA_WORK_SIZE, sh,
+		ret = ret ?: g15_buf_alloc(be, &p->ta_work, G15_TA_WORK_SIZE, csh,
 					   G15_TA_WORK_PAGE + ws, G15_TA_WORK_OFF, true);
-		ret = ret ?: g15_buf_alloc(be, &p->ta_seq, 0x1000, fw, 0, 0, false);
-		ret = ret ?: g15_buf_alloc(be, &p->fs_seq, 0x1000, fw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &p->ta_seq, 0x1000, cfw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &p->fs_seq, 0x1000, cfw, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &p->ta_scratch, 0x10000, sh, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &p->scene, 0x80, sh, 0, 0, false);
 		/* Internal TA start/end, FS start/end; legacy user cells likewise. */
 		ret = ret ?: g15_buf_alloc(be, &p->its, 32, sh, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &p->uts, 32, fw, 0, 0, false);
-		ret = ret ?: g15_buf_alloc(be, &p->own_barrier, G15_BARRIER_SIZE, fw, 0, 0, false);
-		ret = ret ?: g15_buf_alloc(be, &p->prev_barrier, G15_BARRIER_SIZE, fw, 0, 0, false);
-		ret = ret ?: g15_buf_alloc(be, &p->fs_dep, G15_BARRIER_SIZE, fw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &p->own_barrier, G15_BARRIER_SIZE, cfw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &p->prev_barrier, G15_BARRIER_SIZE, cfw, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &p->fs_dep, G15_BARRIER_SIZE, cfw, 0, 0, false);
 		if (ret)
 			break;
 		/* Client leaf classes (GPU-only NC is the default). */
@@ -4247,7 +4279,7 @@ int g15_backend_start(struct g15_gpu *gpu)
 	ret = g15_graph_alloc(be) ?: g15_render_alloc(be);
 	/* Mixed-prefix compute barriers, after the render graph's firmware VAs. */
 	for (u32 k = 0; !ret && k < be->g.slots; k++)
-		ret = g15_buf_alloc(be, &be->g.slot[k].barrier, G15_BARRIER_SIZE, G15_PTE_FW, 0, 0,
+		ret = g15_buf_alloc(be, &be->g.slot[k].barrier, G15_BARRIER_SIZE, g15_cmd_fw(), 0, 0,
 				    false);
 	/* Clustering storage: GPU-cached client view and shared upper alias. */
 	for (u32 k = 0; !ret && be->r.pre_records == 3 && k < 2 * be->r.slots; k++) {

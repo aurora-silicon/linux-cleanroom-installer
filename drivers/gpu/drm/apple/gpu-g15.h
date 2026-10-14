@@ -26,6 +26,9 @@ struct g15_backend;
 /* UAT leaf attributes (contract section 3). */
 #define G15_PTE_FW		0x00c000000000044bULL	/* firmware-only shared RW data */
 #define G15_PTE_SHARED		0x00e000000000040bULL	/* FW+GPU shared auxiliary */
+/* The same two classes with firmware AttrIndex 0 (inner+outer write-back for the ASC). */
+#define G15_PTE_FW_CACHED	0x00c0000000000443ULL
+#define G15_PTE_SHARED_CACHED	0x00e0000000000403ULL
 #define G15_PTE_MMIO		0x00c0000000000447ULL	/* firmware Device RW */
 #define G15_PTE_TABLE		3ULL
 
