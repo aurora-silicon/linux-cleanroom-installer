@@ -4813,15 +4813,6 @@ int gpu_m4_drm_provider_vm_covers(struct gpu_m4_drm_provider_vm *vm, u64 va, u64
 }
 EXPORT_SYMBOL_GPL(gpu_m4_drm_provider_vm_covers);
 
-int gpu_m4_drm_provider_vm_read(struct gpu_m4_drm_provider_vm *vm, u64 va, u32 size,
-	u32 access, void *dst)
-{
-	if (!vm || !vm->authority)
-		return -EOPNOTSUPP;
-	return gpu_m4_vm_tree_read(vm->tree, va, size, access, dst);
-}
-EXPORT_SYMBOL_GPL(gpu_m4_drm_provider_vm_read);
-
 void gpu_m4_drm_provider_vm_set_asid_locked(struct gpu_m4_drm_provider_vm *vm, u32 asid)
 {
 	if (!vm)

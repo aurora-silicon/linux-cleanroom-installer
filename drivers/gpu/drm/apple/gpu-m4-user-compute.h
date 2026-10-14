@@ -50,22 +50,6 @@ static int m4_user_compute_status(int ret)
 	return ret > 0 ? -EPROTO : ret;
 }
 
-/* The CDM range this command's work executes: its user stream, or for a
- * kernel-merged command the owned copy in its private work page.
- */
-static bool m4_user_compute_cdm(const struct gpu_m4_drm_job_compute *command, u64 work_gpu,
-	u64 *base, u64 *end)
-{
-	if (!command->merge_count) {
-		*base = command->cdm_base;
-		*end = command->cdm_end;
-		return false;
-	}
-	*base = work_gpu + GPU_M4_DRM_MERGE_OFFSET;
-	*end = *base + command->merge_size;
-	return true;
-}
-
 static int m4_user_compute_ts_hold(void *cookie,
 	const struct gpu_m4_compute_ts_destination *destination, void **held)
 {
@@ -407,9 +391,8 @@ static int m4_user_compute_check_locked(struct m4_user_compute_packet *out)
 	const struct gpu_m4_compute_packet_admitted_input *in = &out->input;
 	const struct m4_user_compute_native *n;
 	struct gpu_m4_drm_provider_job_view view = { };
-	u64 epoch, low, high, cdm_base = 0, cdm_end = 0;
+	u64 epoch, low, high;
 	u32 timestamps;
-	bool owned = false;
 	u8 wire;
 	int ret;
 
@@ -487,20 +470,13 @@ static int m4_user_compute_check_locked(struct m4_user_compute_packet *out)
 		return M4_USER_WHY(-EOPNOTSUPP, "compute check %u record=%u flags=%#x", out->command_index,
 			res->completion_record, in->command->flags);
 	n = m4_user_native_compute(j->native_stage, out->command_index);
-	if (n && n->private[GPU_M4_COMPUTE_PRIVATE_WORK])
-		owned = m4_user_compute_cdm(in->command,
-			n->private[GPU_M4_COMPUTE_PRIVATE_WORK]->va, &cdm_base, &cdm_end);
 	if (!n || !n->counter || out->native != n || !res->notifier ||
 	    in->counter != n->counter->object || in->counter_offset != n->counter->backing.offset ||
 	    in->notifier_page_fw != res->notifier->fw_va ||
 	    in->timestamp != res->timestamp || in->work.queue_fw != res->queue_fw ||
 	    in->work.stats_fw != res->stats_fw ||
-	    in->work.registers.cdm_base != cdm_base || in->work.registers.cdm_end != cdm_end ||
-	    in->work.cdm_owned != owned ||
-	    (owned && (!in->command->merge_stream || in->command->merge_count < 2 ||
-		       in->command->merge_size < 8 ||
-		       in->command->merge_size > GPU_M4_DRM_MERGE_MAX_SIZE ||
-		       (in->command->merge_size & 3))) ||
+	    in->work.registers.cdm_base != in->command->cdm_base ||
+	    in->work.registers.cdm_end != in->command->cdm_end ||
 	    in->work.registers.usc_base != j->queue->usc_base ||
 	    in->command->usc_base != j->queue->usc_base ||
 	    in->work.attachments != in->command->attachments ||
@@ -511,8 +487,8 @@ static int m4_user_compute_check_locked(struct m4_user_compute_packet *out)
 			!!res->notifier, res->notifier && in->notifier_page_fw == res->notifier->fw_va,
 			in->timestamp == res->timestamp, in->work.queue_fw == res->queue_fw,
 			in->work.stats_fw == res->stats_fw,
-			in->work.registers.cdm_base == cdm_base &&
-			in->work.registers.cdm_end == cdm_end &&
+			in->work.registers.cdm_base == in->command->cdm_base &&
+			in->work.registers.cdm_end == in->command->cdm_end &&
 			in->work.registers.usc_base == j->queue->usc_base &&
 			in->command->usc_base == j->queue->usc_base,
 			in->work.attachments == in->command->attachments &&
@@ -715,9 +691,7 @@ static int m4_user_compute_prepare_locked(struct m4_user_job *j, u32 index,
 	const struct gpu_m4_drm_job_compute *command;
 	const struct m4_user_compute_native *n;
 	struct m4_gpu_provider_runtime *p;
-	u64 cdm_base, cdm_end;
 	u32 count, seen = 0;
-	bool owned;
 	int ret;
 
 	if (!j || !j->runtime || !j->queue || !j->core_job || !res || !out)
@@ -775,16 +749,13 @@ static int m4_user_compute_prepare_locked(struct m4_user_job *j, u32 index,
 	in->timestamp = res->timestamp;
 	in->owner_cookie = out;
 	in->check_owner = m4_user_compute_owner_locked;
-	owned = m4_user_compute_cdm(command, n->private[GPU_M4_COMPUTE_PRIVATE_WORK]->va,
-		&cdm_base, &cdm_end);
 	in->work = (struct gpu_m4_exec_compute_input) {
 		.vm = &out->vm, .registers = {
 			.preemption = n->private[GPU_M4_COMPUTE_PRIVATE_PREEMPT]->va,
 			.preemption_size = n->private[GPU_M4_COMPUTE_PRIVATE_PREEMPT]->size,
-			.cdm_base = cdm_base, .cdm_end = cdm_end,
+			.cdm_base = command->cdm_base, .cdm_end = command->cdm_end,
 			.usc_base = j->queue->usc_base,
 		},
-		.cdm_owned = owned,
 		.work_fw = n->private[GPU_M4_COMPUTE_PRIVATE_WORK]->fw_va,
 		.work_gpu = n->private[GPU_M4_COMPUTE_PRIVATE_WORK]->va,
 		.queue_fw = res->queue_fw, .stats_fw = res->stats_fw,

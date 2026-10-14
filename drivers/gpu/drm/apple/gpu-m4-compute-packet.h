@@ -693,10 +693,7 @@ static inline int gpu_m4_compute_packet_admitted_validate_checked(
 	client[GPU_M4_COMPUTE_PRIVATE_COUNT] = (struct gpu_m4_exec_interval) {
 		w->registers.cdm_base, w->registers.cdm_end - w->registers.cdm_base,
 	};
-	/* A merged command's owned stream lies inside its own work page. */
-	if (w->cdm_owned && !gpu_m4_exec_cdm_owned_valid(w))
-		return -EINVAL;
-	if (!gpu_m4_exec_disjoint(client, GPU_M4_COMPUTE_PRIVATE_COUNT + !w->cdm_owned))
+	if (!gpu_m4_exec_disjoint(client, GPU_M4_COMPUTE_PRIVATE_COUNT + 1))
 		return -EINVAL;
 	for (i = 0; i < w->attachment_count; i++) {
 		const struct gpu_m4_exec_attachment *a = &w->attachments[i];

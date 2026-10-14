@@ -34,25 +34,7 @@ struct gpu_m4_drm_job_compute {
 	struct gpu_m4_exec_attachment attachments[GPU_M4_EXEC_ATTACHMENT_MAX];
 	/* Start, end, then eight end-copy destinations. Each owns a stable lease. */
 	struct gpu_m4_drm_job_timestamp timestamps[GPU_M4_DRM_JOB_TIMESTAMPS];
-	/* Kernel compute merge (provider decode): merge_count >= 2 consecutive
-	 * straight-line commands of this submission became this one command.
-	 * merge_stream is the owned copy of their CDM records (each member's
-	 * stream minus its final terminate, in order, then one terminate),
-	 * merge_size bytes, held by the submission's public job. The runtime
-	 * executes it from the command's own private work page; cdm_base/end
-	 * keep the first member's validated user range for diagnostics only.
-	 */
-	const u8 *merge_stream;
-	u32 merge_size;
-	u32 merge_count;
 };
-
-/* Owned merged stream placement inside the compute unit's 16 KiB private
- * work page: the firmware work image uses [0, 0x2000), the stream starts at
- * GPU_M4_DRM_MERGE_OFFSET and ends below the page end.
- */
-#define GPU_M4_DRM_MERGE_OFFSET 0x3000U
-#define GPU_M4_DRM_MERGE_MAX_SIZE 0x1000U
 
 struct gpu_m4_drm_job_batch {
 	void *vm_snapshot;
