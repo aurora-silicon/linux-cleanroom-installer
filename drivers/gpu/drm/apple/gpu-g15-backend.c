@@ -98,6 +98,8 @@
 #define G15_BARRIER_SIZE	0x3e
 #define G15_PB_PAGES		8192
 #define G15_PB_BLOCKS		2048
+#define G15_PB_LIST_RECORDS	4096	/* 8-byte records in the 0x8000-byte block list */
+#define G15_PB_GROW_STEP	10	/* blocks per growth request (native growImmediately) */
 #define G15_PB_HEAP_GVA		0x7800000000ULL
 #define G15_PB_HEAP_SIZE	0x10000000ULL
 #define G15_PB_PAGE_LIST_GVA	0x1074000000ULL
@@ -190,6 +192,28 @@ MODULE_PARM_DESC(slot_rotate, "Give each prefix's computes the slots after the p
 static bool pass_full_reset = true;
 module_param(pass_full_reset, bool, 0644);
 MODULE_PARM_DESC(pass_full_reset, "Also zero a pass slot's auxiliary, heap-metadata and scene-user buffers on every use (per-use reset contract)");
+
+/*
+ * PB growth (PB growth contract 1-3): the PB starts with pb_blocks of the
+ * 2048 0x20000-byte blocks of the mapped 256 MiB heap and may grow, ten
+ * blocks per firmware request (event type 7), up to pb_max_blocks; every
+ * request is answered with DEVCTL 7: success after the blocks are posted,
+ * or at the limit a refusal, after which the firmware completes the scene
+ * with partial renders (Mesa's partial EOT/BG programs spill and reload the
+ * tile buffer). The block list declares its real capacity (4096 records),
+ * block control is a live index-2 cell, and the manager's page limits name
+ * the maximum, so the firmware can ask. pb_grow=0 keeps the previous fixed
+ * 2048-block PB, whose TA stalls for good when one scene exceeds it.
+ */
+static bool pb_grow = true;
+module_param(pb_grow, bool, 0444);
+MODULE_PARM_DESC(pb_grow, "Let the firmware grow the PB from pb_blocks up to pb_max_blocks (event 7 / DEVCTL 7), then render larger scenes partially; 0: fixed 2048-block PB");
+static unsigned int pb_blocks = G15_PB_BLOCKS / 2;
+module_param(pb_blocks, uint, 0444);
+MODULE_PARM_DESC(pb_blocks, "Initial PB blocks of 0x20000 with pb_grow, 64..2048");
+static unsigned int pb_max_blocks = G15_PB_BLOCKS;
+module_param(pb_max_blocks, uint, 0444);
+MODULE_PARM_DESC(pb_max_blocks, "Maximum PB blocks with pb_grow, pb_blocks..2048");
 
 static bool early_tiling = true;
 module_param(early_tiling, bool, 0444);
@@ -447,6 +471,13 @@ struct g15_render {
 	bool spare_ready;
 	u64 draw;		/* cumulative host draw ordinal of the last publication */
 	bool registered, c1_written;
+	/*
+	 * PB growth ledger (pb_grow): initial/current/maximum blocks, posted
+	 * blocks (block_ctl+4 producer, cumulative) and the next expected
+	 * request counter (P+0x60) since the last initialization.
+	 */
+	u32 pb_init_blocks, pb_max, pb_posted, pb_next_req;
+	bool pb_refusal_logged;
 };
 
 struct g15_job;
@@ -533,6 +564,7 @@ struct g15_backend {
 	u64 st_first_ns[3], st_last_ns[3];	/* publish to first / last stage event */
 	u64 st_jobs, st_job_cmds, st_job_max;	/* retired jobs and their command counts */
 	u64 st_early;				/* early-tiled render members */
+	u64 st_pb_req, st_pb_grown, st_pb_refused, st_pb_bad;	/* PB growth requests/blocks */
 	u64 st_clustered;			/* clustered render members */
 	u64 st_ct_sync;				/* clustering buffers zeroed at claim */
 	u64 st_slot_sync;			/* compute slots scrubbed at claim */
@@ -913,7 +945,9 @@ static int g15_render_alloc(struct g15_backend *be)
 	ret = ret ?: g15_buf_alloc(be, &r->notifier, 0x108, g15_notifier_class(2), 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->threshold, 4, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->job_list, 0x18, cfw, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &r->block_ctl, 0x40, g15_manager_class(fw), 0, 0, false);
+	/* A live producer with pb_grow: firmware index 2 (PB growth contract 1.2). */
+	ret = ret ?: g15_buf_alloc(be, &r->block_ctl, 0x40, pb_grow ? fw : g15_manager_class(fw),
+				   0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->pb_counter, 0x40, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->mgr_misc, 0x40, g15_manager_class(fw), 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &r->scene_list, 0xc0, sh, 0, 0, false);
@@ -1006,6 +1040,8 @@ static int g15_render_alloc(struct g15_backend *be)
 static void g15_render_pools_init(struct g15_backend *be)
 {
 	struct g15_render *r = &be->r;
+	u32 nb = pb_grow ? clamp(pb_blocks, 64U, (u32)G15_PB_BLOCKS) : G15_PB_BLOCKS;
+	u32 mb = pb_grow ? clamp(pb_max_blocks, nb, (u32)G15_PB_BLOCKS) : G15_PB_BLOCKS;
 
 	for (u32 e = 0; e < 2; e++) {
 		u32 entry = 0;
@@ -1030,32 +1066,47 @@ static void g15_render_pools_init(struct g15_backend *be)
 		g15_buf_w32(&r->uma_counter[e], 0, 1);
 	}
 
-	/* PB: 8192 pages of 0x8000 in 2048 blocks of 0x20000 (contract 3). */
+	/*
+	 * PB: 8192 pages of 0x8000 in 2048 blocks of 0x20000 (contract 3); with
+	 * pb_grow the first pb_blocks of them, page limits at pb_max_blocks and
+	 * the block list's real 4096-record capacity (PB growth contract 1).
+	 */
+	r->pb_init_blocks = nb;
+	r->pb_max = mb;
+	r->pb_posted = nb;
+	r->pb_next_req = 0;
+	r->pb_refusal_logged = false;
+	if (pb_grow)
+		r->c1_written = false;	/* C1 names the initial pages again */
 	g15_buf_fill(&r->pb_mgr, 0, 0, 0xac);
 	g15_buf_fill(&r->block_ctl, 0, 0, 0x40);
 	g15_buf_fill(&r->mgr_misc, 0, 0, 0x40);
 	g15_buf_fill(&r->pb_counter, 0, 0, 0x40);
 	g15_buf_fill(&r->scene_list, 0, 0, 0xc0);
-	for (u32 i = 0; i < G15_PB_PAGES; i++)
+	if (pb_grow) {
+		g15_buf_fill(&r->pb_pages, 0, 0, 0x28000);
+		g15_buf_fill(&r->pb_blocks, 0, 0, 0x8000);
+	}
+	for (u32 i = 0; i < 4 * nb; i++)
 		g15_buf_w32(&r->pb_pages, 4ULL * i,
 			    (u32)(g15_compact(r->pb_heap.gva + i * 0x8000ULL) / 0x8000));
-	for (u32 i = 0; i < G15_PB_BLOCKS; i++)
+	for (u32 i = 0; i < nb; i++)
 		g15_buf_w32(&r->pb_blocks, 8ULL * i,
 			    (u32)(g15_compact(r->pb_heap.gva + i * 0x20000ULL) / 0x8000));
 	g15_buf_w64(&r->pb_mgr, 0x1c, r->pb_pages.gva);
 	g15_buf_w32(&r->pb_mgr, 0x24, 0x28000);
-	g15_buf_w32(&r->pb_mgr, 0x28, G15_PB_PAGES);
-	g15_buf_w32(&r->pb_mgr, 0x2c, 0x26cd);
-	g15_buf_w32(&r->pb_mgr, 0x30, G15_PB_BLOCKS);
+	g15_buf_w32(&r->pb_mgr, 0x28, 4 * nb);
+	g15_buf_w32(&r->pb_mgr, 0x2c, pb_grow ? G15_PB_LIST_RECORDS : 0x26cd);
+	g15_buf_w32(&r->pb_mgr, 0x30, nb);
 	g15_buf_w64(&r->pb_mgr, 0x38, r->pb_blocks.gva);
 	g15_buf_w64(&r->pb_mgr, 0x40, r->block_ctl.va);
-	g15_buf_w32(&r->pb_mgr, 0x48, G15_PB_PAGES - 1);
+	g15_buf_w32(&r->pb_mgr, 0x48, 4 * nb - 1);
 	g15_buf_w32(&r->pb_mgr, 0x4c, 0x20000);
 	g15_buf_w64(&r->pb_mgr, 0x58, r->pb_counter.va);
-	g15_buf_w32(&r->pb_mgr, 0x70, G15_PB_PAGES);
-	g15_buf_w32(&r->pb_mgr, 0x74, G15_PB_PAGES);
-	g15_buf_w32(&r->block_ctl, 0, G15_PB_BLOCKS);
-	g15_buf_w32(&r->block_ctl, 4, G15_PB_BLOCKS);
+	g15_buf_w32(&r->pb_mgr, 0x70, 4 * mb);
+	g15_buf_w32(&r->pb_mgr, 0x74, 4 * mb);
+	g15_buf_w32(&r->block_ctl, 0, nb);
+	g15_buf_w32(&r->block_ctl, 4, nb);
 	g15_buf_w32(&r->mgr_misc, 0x20, 1);
 	g15_buf_w32(&r->pb_counter, 0, 1);
 	wmb();
@@ -2034,7 +2085,7 @@ static void g15_encode_ta(struct g15_backend *be, struct g15_pass *p, const stru
 		g15_compact(u->vdm_ctrl_stream_base), 0, 0, 0,
 		1, 0, g15_compact(geo->layer_metadata), g15_compact(geo->layer_metadata), 0, 0,
 		0, 0,
-		G15_PB_PAGES, 0, 0, 0, 0, 0, 0, 0,
+		4 * r->pb_init_blocks, 0, 0, 0, 0, 0, 0, 0,
 		0x8860, geo->region_stride, geo->region_stride, 0x88, 2 | (u->ppp_ctrl & 0x201),
 		geo->pixels, geo->screen, geo->x_blocks,
 		geo->y_blocks, geo->blocks, geo->tpc_stride, 0x100, geo->layer_mode, 0x1c, 0x1c, 0,
@@ -2677,7 +2728,7 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 		pf->initbm = true;
 		put_unaligned_le32(6, bm + 0x0);
 		put_unaligned_le32(ctx, bm + 0x4);
-		put_unaligned_le32(G15_PB_BLOCKS, bm + 0x10);
+		put_unaligned_le32(r->pb_init_blocks, bm + 0x10);
 		put_unaligned_le64(r->pb_mgr.va, bm + 0x14);
 		put_unaligned_le32(Tta, bm + 0x1c);
 		g15_buf_write(&r->initbm, 0, bm, sizeof(bm));
@@ -2895,7 +2946,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 			u8 c1[16] = {};
 
 			put_unaligned_le32(0x07400000, c1 + 0x0);
-			put_unaligned_le32(G15_PB_PAGES, c1 + 0x4);
+			put_unaligned_le32(4 * r->pb_init_blocks, c1 + 0x4);
 			ret = g15_write(gpu, G15_C1, c1, sizeof(c1));
 			if (ret)
 				goto out;
@@ -3359,6 +3410,85 @@ static int g15_preempt_set(struct g15_backend *be, u32 offset, u32 divisor)
 	return ret;
 }
 
+/*
+ * Answer the firmware's PB-growth requests (PB growth contract 2-3), be->lock
+ * held, outside the event drain. A request names PB slot 0, the context of a
+ * published render prefix and the next request counter; anything else is
+ * logged and left unanswered (its TA then stays stalled and the deadline
+ * applies, as before). With pb_grow up to ten more blocks of the mapped heap
+ * are written to unposted block-list records, then the live block_ctl+4
+ * producer advances and DEVCTL 7 reports success; at pb_max_blocks the reply
+ * is the refusal (+4 = 0), which lets the firmware continue without new
+ * pages. The firmware imports the blocks itself: P is never rewritten.
+ */
+static void g15_pb_grow(struct g15_backend *be)
+{
+	struct g15_gpu *gpu = be->gpu;
+	struct g15_render *r = &be->r;
+
+	for (;;) {
+		u32 q[14], n = 0;
+		u8 rec[0x38] = {};
+		bool live = false;
+		int ret;
+
+		mutex_lock(&gpu->lock);
+		if (gpu->grow_tail == gpu->grow_head) {
+			mutex_unlock(&gpu->lock);
+			return;
+		}
+		memcpy(q, gpu->grow_req[gpu->grow_tail % G15_GROW_QUEUE], sizeof(q));
+		gpu->grow_tail++;
+		mutex_unlock(&gpu->lock);
+		be->st_pb_req++;
+		for (u32 k = 0; k < be->fl_count; k++) {
+			struct g15_flight *f = &be->fl[(be->fl_first + k) % G15_FLIGHTS];
+
+			live |= f->renders && f->job->vm->asid == q[1];
+		}
+		if (!pb_grow || q[0] != 7 || q[2] || !live || q[3] < r->pb_next_req) {
+			be->st_pb_bad++;
+			dev_warn(gpu->dev, "PB growth request not answered: ctx %u slot %u counter %u (next %u) live %d pb_grow %d\n",
+				 q[1], q[2], q[3], r->pb_next_req, live, pb_grow);
+			continue;
+		}
+		r->pb_next_req = q[3] + 1;
+		n = min_t(u32, G15_PB_GROW_STEP, r->pb_max - r->pb_posted);
+		for (u32 i = 0; i < n; i++) {
+			u32 b = r->pb_posted + i;
+
+			g15_buf_w64(&r->pb_blocks, 8ULL * (b % G15_PB_LIST_RECORDS),
+				    (u32)(g15_compact(r->pb_heap.gva + b * 0x20000ULL) / 0x8000));
+		}
+		if (n) {
+			wmb();	/* records before their producer */
+			r->pb_posted += n;
+			g15_buf_w32(&r->block_ctl, 4, r->pb_posted % G15_PB_LIST_RECORDS);
+			wmb();	/* producer before the reply */
+			be->st_pb_grown += n;
+		} else {
+			be->st_pb_refused++;
+		}
+		put_unaligned_le32(7, rec + 0x0);
+		put_unaligned_le32(n ? 1 : 0, rec + 0x4);
+		put_unaligned_le32(q[2], rec + 0x8);
+		put_unaligned_le32(q[1], rec + 0xc);
+		put_unaligned_le32(q[3], rec + 0x10);
+		put_unaligned_le32(q[4], rec + 0x14);
+		put_unaligned_le64(q[5] | (u64)q[6] << 32, rec + 0x18);
+		mutex_lock(&gpu->lock);
+		ret = g15_devctl_record(gpu, rec);
+		mutex_unlock(&gpu->lock);
+		if (ret || q[3] < 2 || (!n && r->pb_posted == r->pb_max && !r->pb_refusal_logged))
+			dev_info(gpu->dev, "PB growth request %u ctx %u position %u: +%u blocks (%u of %u), DEVCTL 7: %d\n",
+				 q[3], q[1], q[4], n, r->pb_posted, r->pb_max, ret);
+		else
+			dev_dbg(gpu->dev, "PB growth request %u ctx %u position %u: +%u blocks (%u of %u), DEVCTL 7: %d\n",
+				q[3], q[1], q[4], n, r->pb_posted, r->pb_max, ret);
+		r->pb_refusal_logged |= !n;
+	}
+}
+
 static void g15_preempt_disarm(struct g15_backend *be)
 {
 	if (be->preempt_global) {
@@ -3588,6 +3718,7 @@ static void g15_poll_work(struct work_struct *work)
 			break;
 		udelay(5);
 	}
+	g15_pb_grow(be);
 	if (!be->fl_count)
 		goto next;
 	f = g15_oldest(be);
@@ -3691,6 +3822,9 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "ct_sync %llu slot_sync %llu starved_us %llu prep_us %llu grouped %llu\n",
 		   be->st_ct_sync, be->st_slot_sync, div_u64(be->st_starved_ns, 1000),
 		   div_u64(be->st_prep_ns, 1000), be->st_grouped);
+	seq_printf(m, "pb: blocks %u/%u/%u requests %llu grown %llu refused %llu bad %llu\n",
+		   be->r.pb_init_blocks, be->r.pb_posted, be->r.pb_max, be->st_pb_req,
+		   be->st_pb_grown, be->st_pb_refused, be->st_pb_bad);
 	seq_printf(m, "stage: ta_us %llu fs_us %llu cdm_us %llu span_us %llu\n",
 		   div_u64(be->st_ta_ticks, 24), div_u64(be->st_fs_ticks, 24),
 		   div_u64(be->st_cdm_ticks, 24), div_u64(be->st_span_ticks, 24));

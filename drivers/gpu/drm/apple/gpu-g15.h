@@ -79,6 +79,7 @@ struct g15_page {
 struct g15_fw_build;
 
 #define G15_MAX_PAGES	2048
+#define G15_GROW_QUEUE	8
 #define G15_MAX_L3	128
 
 struct g15_gpu {
@@ -114,6 +115,13 @@ struct g15_gpu {
 	/* Last firmware error event (type 0 fault, 4 timeout): copied before event_errors++. */
 	u32 err_type, err_raw[14];
 	s32 err_slot;
+	/*
+	 * PB-growth requests (event type 7, 0x38 bytes), copied whole by the
+	 * event drain for the backend, which answers each with DEVCTL 7 outside
+	 * the drain. grow_head/grow_tail count requests (gpu->lock).
+	 */
+	u32 grow_req[G15_GROW_QUEUE][14];
+	u32 grow_head, grow_tail, grow_lost;
 	struct g15_backend *be;
 	int error;
 	bool started, voted, ready;

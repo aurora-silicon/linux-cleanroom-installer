@@ -812,6 +812,8 @@ static void g15_drain_one(struct g15_gpu *gpu, u64 state)
  * Event channel (256 x 0x38): u32 type at +0; type 1 carries a u64 stage
  * flag mask at +4 (TA bit0, FS bit1, compute bit2). Types 0 and 4 report
  * firmware errors. Notifications only: retirement has its own receipts.
+ * Type 7 is a PB-growth request (PB growth contract 2.1): its whole record
+ * is queued for the backend, which must answer it (DEVCTL 7).
  */
 static void g15_drain_events(struct g15_gpu *gpu)
 {
@@ -848,6 +850,20 @@ static void g15_drain_events(struct g15_gpu *gpu)
 				type, g15_r32(gpu, rec + 4), g15_r32(gpu, rec + 8),
 				g15_r32(gpu, rec + 12), g15_r32(gpu, rec + 16),
 				g15_r32(gpu, rec + 20), g15_r32(gpu, rec + 24));
+		} else if (type == 7) {
+			if (gpu->grow_head - gpu->grow_tail < G15_GROW_QUEUE) {
+				u32 *q = gpu->grow_req[gpu->grow_head % G15_GROW_QUEUE];
+
+				for (u32 j = 0; j < 14; j++)
+					q[j] = g15_r32(gpu, rec + 4 * j);
+				gpu->grow_head++;
+			} else {
+				gpu->grow_lost++;
+			}
+			dev_dbg(gpu->dev, "firmware event 7 (PB growth): ctx %u slot %u counter %u position %u epoch %#llx\n",
+				 g15_r32(gpu, rec + 4), g15_r32(gpu, rec + 8),
+				 g15_r32(gpu, rec + 12), g15_r32(gpu, rec + 16),
+				 g15_r32(gpu, rec + 20) | (u64)g15_r32(gpu, rec + 24) << 32);
 		} else if (type == 8) {
 			/* Channel error (DMKill): needs a DEVCTL 8 acknowledgement. */
 			dev_warn(gpu->dev, "firmware event 8: %08x %08x %08x %08x %08x\n",
