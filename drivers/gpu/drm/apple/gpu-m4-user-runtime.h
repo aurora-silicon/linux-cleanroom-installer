@@ -1266,6 +1266,13 @@ static int m4_user_compute_packet_publish_locked(struct m4_user_job *j, u32 inde
 	put_unaligned_le64(entry, packet->bytes.work + 0xe00);
 	memcpy(native->private[GPU_M4_COMPUTE_PRIVATE_WORK]->map.vaddr,
 		packet->bytes.work, sizeof(packet->bytes.work));
+	/* A merged command's owned CDM stream, in the same page and with the
+	 * same visibility as its work image (checked by prepare).
+	 */
+	if (packet->input.work.cdm_owned)
+		memcpy(native->private[GPU_M4_COMPUTE_PRIVATE_WORK]->map.vaddr +
+			GPU_M4_DRM_MERGE_OFFSET, packet->input.command->merge_stream,
+			packet->input.command->merge_size);
 	/* The strict wait record is owned, covered NC firmware memory of THIS
 	 * command, complete before any producer can name it. The host never
 	 * rewrites it until this unit's real CORE retirement and same-slot

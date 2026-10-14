@@ -525,7 +525,21 @@ struct gpu_m4_exec_compute_input {
 	u8 binding_generation;
 	const struct gpu_m4_exec_attachment *attachments;
 	unsigned int attachment_count;
+	/* The CDM stream is a kernel-owned copy inside this work's own client
+	 * work page, [work_gpu + 0x2000, work_gpu + 0x4000), not a user range.
+	 */
+	bool cdm_owned;
 };
+
+/* An owned CDM stream lies wholly in the upper half of its work page. */
+static inline bool gpu_m4_exec_cdm_owned_valid(const struct gpu_m4_exec_compute_input *in)
+{
+	const struct gpu_m4_exec_compute_resources *r = &in->registers;
+
+	return in->work_gpu <= ~0ULL - 0x4000 && r->cdm_base >= in->work_gpu + 0x2000 &&
+		r->cdm_end > r->cdm_base && r->cdm_end <= in->work_gpu + 0x4000 &&
+		!(r->cdm_base & 3) && !(r->cdm_end & 3);
+}
 
 struct gpu_m4_exec_interval {
 	u64 va;
@@ -589,13 +603,19 @@ static inline int gpu_m4_exec_first_compute(void *output,
 	gpu[0] = (struct gpu_m4_exec_interval){ in->work_gpu, 0x4000 };
 	gpu[1] = (struct gpu_m4_exec_interval){ in->registers.preemption,
 						   in->registers.preemption_size };
-	gpu[2] = (struct gpu_m4_exec_interval){ in->registers.cdm_base,
-						   in->registers.cdm_end - in->registers.cdm_base };
+	gpu[2] = (struct gpu_m4_exec_interval){ in->page_list_gpu, 0x4000 };
 	gpu[3] = (struct gpu_m4_exec_interval){ in->auxiliary_gpu, 0x4000 };
 	gpu[4] = (struct gpu_m4_exec_interval){ in->context_store_gpu, 0x40000 };
 	gpu[5] = (struct gpu_m4_exec_interval){ in->pool_state_gpu, 0x20000 };
-	gpu[6] = (struct gpu_m4_exec_interval){ in->page_list_gpu, 0x4000 };
-	if (!gpu_m4_exec_disjoint(firmware, 6) || !gpu_m4_exec_disjoint(gpu, 7))
+	/* A user stream is disjoint from every private range; an owned copy
+	 * lies inside the work page by construction.
+	 */
+	gpu[6] = (struct gpu_m4_exec_interval){ in->registers.cdm_base,
+						   in->registers.cdm_end - in->registers.cdm_base };
+	if (in->cdm_owned && !gpu_m4_exec_cdm_owned_valid(in))
+		return -EINVAL;
+	if (!gpu_m4_exec_disjoint(firmware, 6) ||
+	    !gpu_m4_exec_disjoint(gpu, in->cdm_owned ? 6 : 7))
 		return -EINVAL;
 	ret = gpu_m4_exec_vm_range(in->vm, in->work_gpu, GPU_M4_EXEC_COMPUTE_SIZE, true);
 	if (ret)

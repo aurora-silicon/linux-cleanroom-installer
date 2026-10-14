@@ -1598,6 +1598,49 @@ int gpu_m4_vm_tree_page(struct gpu_m4_vm_tree *tree, u64 va, u32 access,
 }
 EXPORT_SYMBOL_GPL(gpu_m4_vm_tree_page);
 
+struct gpu_m4_vm_tree_read_state {
+	u64 va;
+	u32 size;
+	u8 *dst;
+};
+
+static int gpu_m4_vm_tree_read_leaf(void *cookie, u64 page, const struct gpu_m4_drm_vm_leaf *leaf)
+{
+	struct gpu_m4_vm_tree_read_state *s = cookie;
+	u64 start = max(page, s->va), end = min(page + GPU_M4_DRM_PAGE_SIZE, s->va + s->size);
+	unsigned long pfn = PHYS_PFN(leaf->pa);
+	const u8 *cpu;
+
+	if (start >= end)
+		return 0;
+	if (!leaf->pa || (leaf->pa & (GPU_M4_DRM_PAGE_SIZE - 1)) || !pfn_valid(pfn) ||
+	    PageHighMem(pfn_to_page(pfn)))
+		return -EOPNOTSUPP;
+	cpu = (const u8 *)page_address(pfn_to_page(pfn)) + (start - page);
+	/* An NC page's linear alias holds no dirty line (cleaned at its first
+	 * pin); drop speculatively filled clean lines so memory is read.
+	 */
+	if (leaf->cpu_policy != GPU_M4_DRM_CPU_WRITEBACK)
+		dcache_inval_poc((unsigned long)cpu, (unsigned long)cpu + (end - start));
+	memcpy(s->dst + (start - s->va), cpu, end - start);
+	return 0;
+}
+
+int gpu_m4_vm_tree_read(struct gpu_m4_vm_tree *tree, u64 va, u32 size, u32 access, void *dst)
+{
+	struct gpu_m4_vm_tree_read_state s = { .va = va, .size = size, .dst = dst };
+	int ret;
+
+	if (IS_ERR_OR_NULL(tree) || !dst || !size || size > GPU_M4_DRM_PAGE_SIZE ||
+	    va > U64_MAX - size)
+		return -EINVAL;
+	mutex_lock(&tree->lock);
+	ret = gpu_m4_vm_tree_visit(tree, va, size, access, true, gpu_m4_vm_tree_read_leaf, &s);
+	mutex_unlock(&tree->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(gpu_m4_vm_tree_read);
+
 u64 gpu_m4_vm_tree_revision(struct gpu_m4_vm_tree *tree)
 {
 	return tree ? READ_ONCE(tree->revision) : 0;

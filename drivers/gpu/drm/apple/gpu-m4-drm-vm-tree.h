@@ -213,6 +213,12 @@ int gpu_m4_vm_tree_covers(struct gpu_m4_vm_tree *tree, u64 va, u64 size, u32 acc
  */
 int gpu_m4_vm_tree_page(struct gpu_m4_vm_tree *tree, u64 va, u32 access,
 			struct gpu_m4_drm_vm_leaf *leaf);
+/* Copy [va, va + size) (size <= one page) of live USER extents with access
+ * into dst, under tree->lock so no leaf can be unmapped or its backing freed
+ * mid-copy. Non-cacheable backing is read after a cache invalidate of the
+ * linear alias. Errors as covers(); -EOPNOTSUPP for a non-RAM leaf.
+ */
+int gpu_m4_vm_tree_read(struct gpu_m4_vm_tree *tree, u64 va, u32 size, u32 access, void *dst);
 /* Every page of [va, va + size) (bytes) like page(); fn sees each leaf. */
 typedef int (*gpu_m4_vm_tree_leaf_fn)(void *cookie, u64 page, const struct gpu_m4_drm_vm_leaf *leaf);
 u64 gpu_m4_vm_tree_revision(struct gpu_m4_vm_tree *tree);

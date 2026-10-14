@@ -97,6 +97,10 @@ struct gpu_m4_drm_provider_job {
 	struct gpu_m4_drm_cache_access *cache_rows, *timestamp_rows;
 	u32 cache_row_count, timestamp_row_count;
 	void *bytes, *runtime_job, *stage_owner;
+	/* Owned merged compute streams of the public capture (children borrow
+	 * them with bytes); see gpu_m4_provider_merge_compute().
+	 */
+	u8 *merge_streams;
 	u32 size;
 	/* The public scheduler owns only the cheap parent. Each real child has
 	 * independent cache/snapshot/resv/version/native/retirement state and holds
@@ -1793,8 +1797,10 @@ static void gpu_m4_provider_job_free(struct gpu_m4_drm_provider_job *job)
 	if (job->retirement)
 		dma_fence_put(&job->retirement->base);
 	kvfree(job->commands); /* mixed_put clears batch, not this allocation owner */
-	if (!parent)
+	if (!parent) {
 		kfree(job->bytes);
+		kfree(job->merge_streams);
+	}
 	kfree(job->stage_extra_objects);
 	kfree(job->ts_memo);
 	kfree(job->cache_rows);
@@ -2473,6 +2479,210 @@ static int gpu_m4_provider_private_stream(struct gpu_m4_drm_provider_queue *queu
 	return computes == 1 ? 0 : -EINVAL;
 }
 
+
+/*
+ * Kernel compute merge. Userspace ends a compute command at every memory
+ * barrier, so N dependent dispatches arrive as N commands, each its own
+ * firmware work (StartCompute, register load, UMA install, Finalize,
+ * completion callback, notifier): ~20 us of firmware time per dispatch, plus
+ * the periodic service passes, against ~1.4 us in one native CDM stream.
+ *
+ * Consecutive compute commands of one submission whose CDM streams are the
+ * straight-line form [40-byte direct launch, 0x60000160]+, 0x600215fe,
+ * 0x40000000 (every launch followed by its ordinary barrier, the stream
+ * closed by the wide-visibility barrier that publishes all its writes, then
+ * the terminate) become one command executing their concatenated records:
+ * each member minus its final terminate, in order, then one terminate. Both
+ * of every member's barriers are kept, so each member's launches still
+ * complete and publish before the next member's start, as at the firmware
+ * work boundary (dirtyroom compute stream merge contract, 2026-10-14).
+ *
+ * Only plain members merge: no flags, attachments or timestamps (sampler
+ * heaps and helper programs are already refused at decode). The bytes are
+ * copied here, at submission, from the live VM under its tree lock, and the
+ * runtime executes the copy from the command's own private work page; the
+ * user streams are never patched. Anything else (indirect or linked
+ * streams, other records, timestamps) keeps its own firmware work.
+ */
+static bool compute_merge = true;
+module_param(compute_merge, bool, 0644);
+MODULE_PARM_DESC(compute_merge, "Merge consecutive straight-line compute commands of a submission into one firmware work (default 1)");
+
+/* REMOVE-DEBUG: [0] merged commands, [1] their members, [2] candidates
+ * refused for metadata, [3] refused by stream profile, [4] read failures.
+ */
+static unsigned long compute_merge_stats[5];
+static int compute_merge_stats_count = ARRAY_SIZE(compute_merge_stats);
+module_param_array(compute_merge_stats, ulong, &compute_merge_stats_count, 0444);
+MODULE_PARM_DESC(compute_merge_stats, "merged, members, refused metadata, refused profile, read errors");
+
+#define GPU_M4_MERGE_LAUNCH 40U
+#define GPU_M4_MERGE_UNIT (GPU_M4_MERGE_LAUNCH + 4U)
+#define GPU_M4_MERGE_STREAM_MAX 1024U /* bytes read per candidate stream */
+
+/* Records of a straight-line stream: n launches, each with its ordinary
+ * barrier, then the wide barrier and the terminate. Returns the bytes to copy
+ * (everything but the terminate) or 0.
+ */
+static u32 gpu_m4_merge_profile(const u8 *b, u32 size)
+{
+	u32 launches;
+
+	if (size < GPU_M4_MERGE_UNIT + 8 || (size - 8) % GPU_M4_MERGE_UNIT)
+		return 0;
+	launches = (size - 8) / GPU_M4_MERGE_UNIT;
+	for (u32 i = 0; i < launches; i++) {
+		const u8 *l = b + i * GPU_M4_MERGE_UNIT;
+		u32 w0 = get_unaligned_le32(l);
+
+		/* Type 0 launch, direct mode (word0 bits 28:27 zero), non-empty
+		 * global and local sizes, then the ordinary flags-0 barrier.
+		 */
+		if ((w0 >> 27) || get_unaligned_le32(l + GPU_M4_MERGE_LAUNCH) != 0x60000160U)
+			return 0;
+		for (u32 k = 0; k < 6; k++)
+			if (!get_unaligned_le32(l + 0x10 + 4 * k))
+				return 0;
+	}
+	if (get_unaligned_le32(b + size - 8) != 0x600215feU ||
+	    get_unaligned_le32(b + size - 4) != 0x40000000U)
+		return 0;
+	return size - 4;
+}
+
+static bool gpu_m4_merge_plain(const struct gpu_m4_drm_job_command *c)
+{
+	if (c->type != DRM_ASAHI_CMD_COMPUTE || c->compute.flags ||
+	    c->compute.attachment_count || c->compute.merge_count)
+		return false;
+	for (u32 t = 0; t < GPU_M4_DRM_JOB_TIMESTAMPS; t++)
+		if (c->compute.timestamps[t].lease)
+			return false;
+	return true;
+}
+
+static int gpu_m4_provider_merge_compute(struct gpu_m4_drm_provider_job *job)
+{
+	struct gpu_m4_drm_job_command *cmd = job->batch.commands;
+	u32 count = job->batch.count, *body = NULL, *at = NULL, read = 0, total = 0, out = 0;
+	u8 *bytes = NULL, *streams, *cursor;
+	int ret = 0;
+
+	if (!READ_ONCE(compute_merge) || !job->tree || count < 2 || job->queue->private_candidate)
+		return 0;
+	/* Cheap metadata pass first: most submissions have no adjacent pair. */
+	for (u32 i = 0; i + 1 < count; i++)
+		if (gpu_m4_merge_plain(&cmd[i]) && gpu_m4_merge_plain(&cmd[i + 1]))
+			goto candidates;
+	return 0;
+candidates:
+	body = kcalloc(count, sizeof(*body), GFP_KERNEL);
+	at = kcalloc(count, sizeof(*at), GFP_KERNEL);
+	if (!body || !at) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	/* Candidates: plain commands with a plain neighbour and a bounded,
+	 * word-sized stream; their bytes go back to back in one buffer.
+	 */
+	for (u32 i = 0; i < count; i++) {
+		const struct gpu_m4_drm_job_compute *c = &cmd[i].compute;
+		u64 size = c->cdm_end - c->cdm_base;
+
+		at[i] = U32_MAX;
+		if (!gpu_m4_merge_plain(&cmd[i]) ||
+		    !((i && gpu_m4_merge_plain(&cmd[i - 1])) ||
+		      (i + 1 < count && gpu_m4_merge_plain(&cmd[i + 1])))) {
+			compute_merge_stats[2] += cmd[i].type == DRM_ASAHI_CMD_COMPUTE;
+			continue;
+		}
+		if (size > GPU_M4_MERGE_STREAM_MAX || (size & 3)) {
+			compute_merge_stats[3]++;
+			continue;
+		}
+		at[i] = read;
+		read += size;
+	}
+	bytes = kmalloc(read ?: 1, GFP_KERNEL);
+	if (!bytes) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (u32 i = 0; i < count; i++) {
+		const struct gpu_m4_drm_job_compute *c = &cmd[i].compute;
+		u32 size = c->cdm_end - c->cdm_base;
+
+		if (at[i] == U32_MAX)
+			continue;
+		if (gpu_m4_drm_provider_vm_read(job->queue->vm, c->cdm_base, size,
+				DRM_ASAHI_BIND_READ, bytes + at[i])) {
+			compute_merge_stats[4]++;
+			continue;
+		}
+		body[i] = gpu_m4_merge_profile(bytes + at[i], size);
+		if (!body[i])
+			compute_merge_stats[3]++;
+	}
+	/* Size the owned streams of every run of >= 2 eligible neighbours. */
+	for (u32 i = 0; i < count; ) {
+		u32 run = 0, size = 4;
+
+		while (i + run < count && body[i + run] &&
+		       size + body[i + run] <= GPU_M4_DRM_MERGE_MAX_SIZE)
+			size += body[i + run++];
+		if (run >= 2)
+			total += size;
+		i += run ? run : 1;
+	}
+	if (!total)
+		goto out;
+	streams = kmalloc(total, GFP_KERNEL);
+	if (!streams) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	cursor = streams;
+	for (u32 i = 0; i < count; ) {
+		u32 run = 0, size = 4;
+
+		while (i + run < count && body[i + run] &&
+		       size + body[i + run] <= GPU_M4_DRM_MERGE_MAX_SIZE)
+			size += body[i + run++];
+		if (run < 2) {
+			/* Keep this command; a refused one never moves past a member. */
+			if (out != i)
+				cmd[out] = cmd[i];
+			out++;
+			i++;
+			continue;
+		}
+		if (out != i)
+			cmd[out] = cmd[i];
+		cmd[out].compute.merge_stream = cursor;
+		cmd[out].compute.merge_size = size;
+		cmd[out].compute.merge_count = run;
+		for (u32 k = 0; k < run; k++) {
+			memcpy(cursor, bytes + at[i + k], body[i + k]);
+			cursor += body[i + k];
+		}
+		put_unaligned_le32(0x40000000U, cursor);
+		cursor += 4;
+		compute_merge_stats[0]++;
+		compute_merge_stats[1] += run;
+		out++;
+		i += run;
+	}
+	/* Absorbed members hold no leases (plain): only clear their slots. */
+	memset(cmd + out, 0, (count - out) * sizeof(*cmd));
+	job->batch.count = out;
+	job->merge_streams = streams;
+out:
+	kfree(bytes);
+	kfree(at);
+	kfree(body);
+	return ret;
+}
+
 static void *gpu_m4_provider_prepare_inner(void *cookie, const struct gpu_m4_drm_submit *submit);
 
 static void *gpu_m4_provider_prepare(void *cookie, const struct gpu_m4_drm_submit *submit)
@@ -2547,6 +2757,10 @@ static void *gpu_m4_provider_prepare_inner(void *cookie, const struct gpu_m4_drm
 	ret = gpu_m4_drm_mixed_decode(&job->batch, commands, scratch, capacity,
 				    &job->decode, &copied);
 	job->decode_owner = NULL; /* Never authorize a later snapshot/span lookup. */
+	if (ret)
+		goto fail;
+	phase = "compute-merge";
+	ret = gpu_m4_provider_merge_compute(job);
 	if (ret)
 		goto fail;
 	gpu_m4_provider_phase_mark(GPU_M4_PROVIDER_PHASE_DECODE, &clock);

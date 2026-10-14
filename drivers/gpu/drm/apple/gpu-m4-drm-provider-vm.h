@@ -373,6 +373,11 @@ void gpu_m4_drm_provider_vm_guard_put(struct gpu_m4_drm_provider_vm *vm);
 /* Named-range validation by PTE walk (gpu_m4_vm_tree_covers()). */
 int gpu_m4_drm_provider_vm_covers(struct gpu_m4_drm_provider_vm *vm, u64 va, u64 size,
 	u32 access, struct gpu_m4_vm_tree_span *span);
+/* Bytes [va, va + size) (size <= one page) of live user extents, read under
+ * the tree lock (gpu_m4_vm_tree_read()). Authority VMs only.
+ */
+int gpu_m4_drm_provider_vm_read(struct gpu_m4_drm_provider_vm *vm, u64 va, u32 size,
+	u32 access, void *dst);
 /* The VM's ASID is fixed at its first queue: removals invalidate it. */
 void gpu_m4_drm_provider_vm_set_asid_locked(struct gpu_m4_drm_provider_vm *vm, u32 asid);
 /* Native unit client-VA maps as DRIVER extents of the authority tree: the
