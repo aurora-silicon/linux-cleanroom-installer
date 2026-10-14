@@ -223,7 +223,10 @@ MODULE_PARM_DESC(repoll_us, "Retry a prefix ready behind the running ones, held 
  * span, so every byte is in a maintained line), barriers (0x30 of the
  * one-line 0x3e record) and InitBM (0x20). Queue-info, the scheduling
  * contexts and the queues' job lists are firmware-private after the host
- * initializes them, before the firmware first sees their addresses.
+ * initializes them, before the firmware first sees their addresses; so is
+ * each queue's scratch (queue-info +0x18), the firmware's own per-queue
+ * working storage, which the common backend allocates firmware-private
+ * cached: it becomes firmware-only (GPU inaccessible) as well.
  * Host-polled or host-updated cells (stamps, queue state, thresholds,
  * counters, notifiers, timestamp cells) and GPU-written storage keep
  * AttrIndex 2. All of these objects are retained until reboot, so no cached
@@ -231,7 +234,7 @@ MODULE_PARM_DESC(repoll_us, "Retry a prefix ready behind the running ones, held 
  */
 static bool fw_cached = true;
 module_param(fw_cached, bool, 0444);
-MODULE_PARM_DESC(fw_cached, "Map microsequences, work images, barriers/InitBM, queue-info, scheduling contexts and job lists ASC-cached (firmware AttrIndex 0); 0: AttrIndex 2 (inner non-cacheable)");
+MODULE_PARM_DESC(fw_cached, "Map microsequences, work images, barriers/InitBM, queue-info, queue scratch, scheduling contexts and job lists ASC-cached (firmware AttrIndex 0); 0: AttrIndex 2 (inner non-cacheable)");
 
 static unsigned int resnap_us = 100;
 module_param(resnap_us, uint, 0644);
@@ -615,6 +618,12 @@ static u64 g15_cmd_shared(void)
 	return fw_cached ? G15_PTE_SHARED_CACHED : G15_PTE_SHARED;
 }
 
+/* Queue scratch: firmware-private cached, or the previous shared index-2 class. */
+static u64 g15_queue_scratch(void)
+{
+	return fw_cached ? G15_PTE_FW_CACHED : G15_PTE_SHARED;
+}
+
 static int g15_graph_alloc(struct g15_backend *be)
 {
 	struct g15_graph *g = &be->g;
@@ -638,7 +647,7 @@ static int g15_graph_alloc(struct g15_backend *be)
 	ret = ret ?: g15_buf_alloc(be, &g->qinfo, 0xb4, cfw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->qstate, 0x60, fw, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->ring, G15_QUEUE_CAP * 8, fw, 0, 0, false);
-	ret = ret ?: g15_buf_alloc(be, &g->qscratch, 0x40000, sh, 0, 0, false);
+	ret = ret ?: g15_buf_alloc(be, &g->qscratch, 0x40000, g15_queue_scratch(), 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->user_stamp, 4, sh, 0, 0, false);
 	ret = ret ?: g15_buf_alloc(be, &g->fw_stamp, 4, sh, 0, 0, false);
 	/* Distinct mutable command slots; shared queue, stamps and allocator. */
@@ -757,7 +766,8 @@ static int g15_render_alloc(struct g15_backend *be)
 		ret = ret ?: g15_buf_alloc(be, &r->qinfo[e], 0xb4, cfw, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->qstate[e], 0x60, fw, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->ring[e], G15_QUEUE_CAP * 8, fw, 0, 0, false);
-		ret = ret ?: g15_buf_alloc(be, &r->qscratch[e], 0x40000, sh, 0, 0, false);
+		ret = ret ?: g15_buf_alloc(be, &r->qscratch[e], 0x40000, g15_queue_scratch(), 0, 0,
+					   false);
 		ret = ret ?: g15_buf_alloc(be, &r->user_stamp[e], 4, sh, 0, 0, false);
 		ret = ret ?: g15_buf_alloc(be, &r->fw_stamp[e], 4, sh, 0, 0, false);
 	}
