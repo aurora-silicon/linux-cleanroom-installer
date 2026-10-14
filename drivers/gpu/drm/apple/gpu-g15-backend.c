@@ -220,6 +220,10 @@ static bool cdm_merge = true;
 module_param(cdm_merge, bool, 0644);
 MODULE_PARM_DESC(cdm_merge, "Publish consecutive compute commands whose streams are one direct launch, its two barriers and a terminate as one firmware compute work running a kernel-owned copy of their launches and barriers; 0: one work per command");
 
+static unsigned int merge_max = 64;
+module_param(merge_max, uint, 0644);
+MODULE_PARM_DESC(merge_max, "Commands per merged compute work, 2..340 (cdm_merge)");
+
 static bool job_merge = true;
 module_param(job_merge, bool, 0644);
 MODULE_PARM_DESC(job_merge, "With cdm_merge: a submission whose commands are all mergeable computes joins the merged work of the same queue's preceding submission when both are ready, and completes with it");
@@ -1297,9 +1301,11 @@ struct g15_cmd {
 	/*
 	 * Compute: the stream is exactly one direct launch, its two barriers
 	 * and a terminate (merge); cdm holds the validated launch and barriers.
-	 * join: published as part of the previous command's merged work.
+	 * At publication (its dependencies satisfied) the stream is read again
+	 * (checked) and only merged if unchanged (now). join: published as part
+	 * of the previous command's merged work.
 	 */
-	bool merge, join;
+	bool merge, checked, now, join;
 	u8 cdm[G15_CDM_LAUNCH];
 	struct drm_asahi_cmd_compute c;
 	struct drm_asahi_cmd_render r;
@@ -2529,6 +2535,79 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 }
 
 /*
+ * Client reads through the VM's own translations and the linear map, with
+ * the last page translation and the last proven program page cached for one
+ * parse (a submission's commands usually share their stream pages).
+ */
+struct g15_reader {
+	struct g15_vm *vm;
+	u64 page, prog_page;	/* ~0: none */
+	unsigned long cpu;	/* linear-map address of page */
+};
+
+static void g15_reader_init(struct g15_reader *rd, struct g15_vm *vm)
+{
+	rd->vm = vm;
+	rd->page = rd->prog_page = ~0ULL;
+}
+
+/* Clean+invalidate (never plain invalidate): CPU-written lines may be dirty. */
+static int g15_reader_read(struct g15_reader *rd, u64 va, void *dst, u32 len)
+{
+	while (len) {
+		u64 page = va & ~(G15_PAGE - 1);
+		u32 n = min_t(u64, len, G15_PAGE - (va & (G15_PAGE - 1)));
+		unsigned long cpu;
+
+		if (page != rd->page) {
+			struct gpu_m4_drm_vm_leaf leaf = {};
+
+			if (gpu_m4_vm_tree_page(rd->vm->tree, page, DRM_ASAHI_BIND_READ, &leaf))
+				return -EFAULT;
+			rd->page = page;
+			rd->cpu = (unsigned long)phys_to_virt(leaf.pa);
+		}
+		cpu = rd->cpu + (va & (G15_PAGE - 1));
+		dcache_clean_poc(cpu & ~63UL, ALIGN(cpu + n, 64));
+		dcache_inval_poc(cpu & ~63UL, ALIGN(cpu + n, 64));
+		memcpy(dst, (void *)cpu, n);
+		va += n;
+		dst = (u8 *)dst + n;
+		len -= n;
+	}
+	return 0;
+}
+
+static int g15_client_read(struct g15_vm *vm, u64 va, void *dst, u32 len)
+{
+	struct g15_reader rd;
+
+	g15_reader_init(&rd, vm);
+	return g15_reader_read(&rd, va, dst, len);
+}
+
+/*
+ * A mergeable compute whose stream still holds the validated bytes, read
+ * after its submission's dependencies are satisfied (a producer named by
+ * them may have written it after the submission was accepted): once per
+ * command, before it is first considered for a merged work.
+ */
+static bool g15_merge_now(struct g15_reader *rd, struct g15_cmd *cmd)
+{
+	u8 b[G15_CDM_LAUNCH + 4];
+
+	if (!cmd->merge)
+		return false;
+	if (!cmd->checked) {
+		cmd->checked = true;
+		cmd->now = !g15_reader_read(rd, cmd->c.cdm_ctrl_stream_base, b, sizeof(b)) &&
+			!memcmp(b, cmd->cdm, G15_CDM_LAUNCH) &&
+			get_unaligned_le32(b + G15_CDM_LAUNCH) == 0x40000000;
+	}
+	return cmd->now;
+}
+
+/*
  * Publish the next prefix of submission job, from its first unpublished
  * command (be->lock held). Members: consecutive commands of one engine, or
  * with mixed_prefix of both engines in API order, each in a free compute or
@@ -2552,14 +2631,16 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	bool overlap = be->fl_count, mixed = READ_ONCE(mixed_prefix);
 	struct g15_prefix pf = { .n = be->ordinal, .draw = r->draw };
 	u32 i = job->sent, ctx = job->vm->asid, computes = 0, renders = 0, end, free_c;
-	u32 group = 0;
-	bool render0 = job->cmds[i].render, merge = READ_ONCE(cdm_merge);
+	u32 group = 0, cap = clamp(READ_ONCE(merge_max), 2U, (u32)G15_CDM_MERGE_MAX);
+	bool render0 = job->cmds[i].render, merge = READ_ONCE(cdm_merge), prev = false;
+	struct g15_reader rd;
 	u8 *ta = NULL, *fs = NULL, *tas = NULL, *fss = NULL;
 	struct g15_geom geo;
 	int ret = 0;
 
 	be->prep_from_ns = ktime_get_ns();
 	memset(f, 0, sizeof(*f));
+	g15_reader_init(&rd, job->vm);
 	free_c = g15_slots_free(be);
 	for (end = i; end < job->count; end++) {
 		struct g15_cmd *cmd = &job->cmds[end];
@@ -2570,12 +2651,13 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 			break;
 		if (!cmd->render) {
 			/*
-			 * A mergeable compute after a mergeable compute of this
-			 * prefix joins its work (and slot): consecutive in API
+			 * A mergeable compute right after a mergeable compute of
+			 * this prefix joins its work (and slot): consecutive in API
 			 * order, nothing in between.
 			 */
-			if (merge && cmd->merge && end > i && job->cmds[end - 1].merge &&
-			    !job->cmds[end - 1].render && group < G15_CDM_MERGE_MAX) {
+			bool now = merge && g15_merge_now(&rd, cmd);
+
+			if (now && prev && group < cap) {
 				cmd->join = true;
 				group++;
 				continue;
@@ -2584,8 +2666,10 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 				break;
 			computes++;
 			group = 1;
+			prev = now;
 			continue;
 		}
+		prev = false;
 		g15_geometry(&cmd->r, 0, &geo);
 		k = g15_pass_pick(r, &geo, f->pass_mask);
 		if (k < 0)
@@ -3480,58 +3564,6 @@ static int g15_cover(struct g15_vm *vm, u64 start, u64 end, u32 access);
 static bool stream_gate = true;
 module_param(stream_gate, bool, 0644);
 MODULE_PARM_DESC(stream_gate, "Reject CDM/VDM streams outside the qualified f568 HoneyKrisp encodings before publication");
-
-/*
- * Client reads through the VM's own translations and the linear map, with
- * the last page translation and the last proven program page cached for one
- * parse (a submission's commands usually share their stream pages).
- */
-struct g15_reader {
-	struct g15_vm *vm;
-	u64 page, prog_page;	/* ~0: none */
-	unsigned long cpu;	/* linear-map address of page */
-};
-
-static void g15_reader_init(struct g15_reader *rd, struct g15_vm *vm)
-{
-	rd->vm = vm;
-	rd->page = rd->prog_page = ~0ULL;
-}
-
-/* Clean+invalidate (never plain invalidate): CPU-written lines may be dirty. */
-static int g15_reader_read(struct g15_reader *rd, u64 va, void *dst, u32 len)
-{
-	while (len) {
-		u64 page = va & ~(G15_PAGE - 1);
-		u32 n = min_t(u64, len, G15_PAGE - (va & (G15_PAGE - 1)));
-		unsigned long cpu;
-
-		if (page != rd->page) {
-			struct gpu_m4_drm_vm_leaf leaf = {};
-
-			if (gpu_m4_vm_tree_page(rd->vm->tree, page, DRM_ASAHI_BIND_READ, &leaf))
-				return -EFAULT;
-			rd->page = page;
-			rd->cpu = (unsigned long)phys_to_virt(leaf.pa);
-		}
-		cpu = rd->cpu + (va & (G15_PAGE - 1));
-		dcache_clean_poc(cpu & ~63UL, ALIGN(cpu + n, 64));
-		dcache_inval_poc(cpu & ~63UL, ALIGN(cpu + n, 64));
-		memcpy(dst, (void *)cpu, n);
-		va += n;
-		dst = (u8 *)dst + n;
-		len -= n;
-	}
-	return 0;
-}
-
-static int g15_client_read(struct g15_vm *vm, u64 va, void *dst, u32 len)
-{
-	struct g15_reader rd;
-
-	g15_reader_init(&rd, vm);
-	return g15_reader_read(&rd, va, dst, len);
-}
 
 static int g15_gate_reject(struct g15_vm *vm, const char *what, u64 va, const u32 *w)
 {
