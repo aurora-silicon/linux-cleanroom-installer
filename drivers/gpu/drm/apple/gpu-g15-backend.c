@@ -232,6 +232,10 @@ static unsigned int queue_credits = 32;
 module_param(queue_credits, uint, 0444);
 MODULE_PARM_DESC(queue_credits, "Submissions of one queue handed to the engine before the oldest completes, 1..64 (deeper lets ready submissions merge)");
 
+static unsigned int repoll_us = 15;
+module_param(repoll_us, uint, 0644);
+MODULE_PARM_DESC(repoll_us, "Retry a prefix ready behind the running ones, held only by a channel's unconsumed record, after this many us, 5..100 (0: at the next completion check)");
+
 static unsigned int resnap_us = 100;
 module_param(resnap_us, uint, 0644);
 MODULE_PARM_DESC(resnap_us, "Completion re-check interval while a command is published, 25..1000 us (EP0x20 events wake earlier)");
@@ -414,6 +418,7 @@ struct g15_backend {
 	u64 st_slot_sync;			/* compute slots scrubbed at claim */
 	u64 st_merged, st_merge_works;		/* commands joined into merged works; those works */
 	u64 st_absorbed;			/* submissions absorbed by a predecessor */
+	bool chan_wait;		/* a ready prefix waits only for a record's consumption */
 	spinlock_t ct_lock;
 	struct work_struct ct_clear;
 	struct dentry *debugfs;
@@ -2679,13 +2684,19 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	}
 	if (end == i)
 		return overlap ? -EAGAIN : -E2BIG;	/* idle: every slot is free */
-	/* Participating channels: every earlier record consumed. */
+	/*
+	 * Participating channels: every earlier record consumed. Behind a
+	 * running prefix the firmware takes its record within microseconds:
+	 * retry soon rather than at that prefix's retirement.
+	 */
 	for (u32 ch = 0; ch < 3; ch++) {
 		if (ch == G15_COMPUTE_CHANNEL ? !computes : !renders)
 			continue;
 		if (g15_r32(gpu, G15_CH_STATE(ch)) != be->producer[ch] ||
-		    g15_r32(gpu, G15_CH_STATE(ch) + 0x20) != be->producer[ch])
+		    g15_r32(gpu, G15_CH_STATE(ch) + 0x20) != be->producer[ch]) {
+			be->chan_wait = overlap;
 			return overlap ? -EAGAIN : -EBUSY;
+		}
 	}
 	r->pass_busy |= f->pass_mask;
 	if (renders) {
@@ -3124,6 +3135,7 @@ static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 	struct g15_job *job;
 	int ret;
 
+	be->chan_wait = false;
 	while (!be->failed && !list_empty(&be->pending)) {
 		struct g15_flight *tail = be->fl_count ?
 			&be->fl[(be->fl_first + be->fl_count - 1) % G15_FLIGHTS] : NULL;
@@ -3335,10 +3347,16 @@ static enum hrtimer_restart g15_resnap(struct hrtimer *t)
 	return HRTIMER_NORESTART;
 }
 
-/* Re-check a published command soon: hrtimer, with a one-jiffy backup. */
+/*
+ * Re-check a published command soon: hrtimer, with a one-jiffy backup;
+ * sooner while a ready prefix waits for a channel record's consumption.
+ */
 static void g15_rearm(struct g15_backend *be)
 {
 	u32 us = clamp(READ_ONCE(resnap_us), 25U, 1000U);
+
+	if (be->chan_wait && READ_ONCE(repoll_us))
+		us = clamp(READ_ONCE(repoll_us), 5U, 100U);
 
 	hrtimer_start(&be->resnap, us * NSEC_PER_USEC, HRTIMER_MODE_REL);
 	mod_delayed_work(system_highpri_wq, &be->poll, 1);
