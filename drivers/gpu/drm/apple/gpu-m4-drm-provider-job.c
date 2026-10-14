@@ -158,6 +158,11 @@ struct gpu_m4_drm_provider_job {
 	 * child: false never prepares, publishes or waits on a dma_resv.
 	 */
 	bool implicit;
+	/* The submission named input syncs (or implicit sync applies): an
+	 * execution dependency the scheduler may have left to this provider's
+	 * queue order (own-queue producers). Windows inherit it.
+	 */
+	bool inputs;
 	bool accepted, protected, staged, aggregate, window_work_ref, window_complete;
 	bool window_enqueued, window_armed;
 	/* Parent: its final child entered the lane FIFO (a later running batch
@@ -817,6 +822,7 @@ void gpu_m4_drm_provider_job_view(struct gpu_m4_drm_provider_job *job,
 		.runtime_job = job->runtime_job, .stage_owner = job->stage_owner,
 		.window_parent = job->window_parent, .command_first = job->command_first,
 		.command_total = job->command_total ?: job->batch.count, .aggregate = job->aggregate,
+		.inputs = job->inputs,
 	};
 }
 EXPORT_SYMBOL_GPL(gpu_m4_drm_provider_job_view);
@@ -2595,6 +2601,7 @@ static void *gpu_m4_provider_prepare_inner(void *cookie, const struct gpu_m4_drm
 	job->tree = queue->tree;
 	if (job->tree)
 		job->implicit = false;
+	job->inputs = submit->input_count || job->implicit;
 	INIT_WORK(&job->window_work, gpu_m4_provider_window_work);
 	INIT_WORK(&job->window_put_work, gpu_m4_provider_window_put_work);
 	INIT_DELAYED_WORK(&job->window_retry, gpu_m4_provider_window_retry);
@@ -3243,6 +3250,7 @@ static struct gpu_m4_drm_provider_job *gpu_m4_provider_window_build(
 	gpu_m4_drm_provider_queue_get(queue);
 	child->state = GPU_M4_PROVIDER_PREPARED;
 	child->implicit = parent->implicit;
+	child->inputs = parent->inputs;
 	child->tree = parent->tree;
 	/* S3c: each child executes, so it holds its own guard until retired. */
 	if (child->tree) {

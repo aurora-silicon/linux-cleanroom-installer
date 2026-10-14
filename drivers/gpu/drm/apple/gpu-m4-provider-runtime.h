@@ -260,6 +260,10 @@ struct m4_user_inflight2_stats {
 	 */
 	u64 admitted, admitted_vm, admitted_foreign, admitted_queue;
 	u64 barrier[2];
+	/* BARRIER_NONE compute-only jobs published with no global-tail wait,
+	 * and candidates kept back behind one.
+	 */
+	u64 none, veto_none;
 	/* Time with two jobs in flight (successor admission to the first of
 	 * the pair leaving), and accepted jobs per bank.
 	 */

@@ -249,6 +249,8 @@ struct gpu_m4_drm_provider_job_view {
 	struct gpu_m4_drm_provider_job *window_parent;
 	u32 command_first, command_total;
 	bool aggregate;
+	/* Input syncs or implicit sync: see the job's inputs flag. */
+	bool inputs;
 };
 
 void gpu_m4_drm_provider_job_view(struct gpu_m4_drm_provider_job *job,

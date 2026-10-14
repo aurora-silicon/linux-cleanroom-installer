@@ -93,6 +93,11 @@ struct m4_user_cross {
 	bool same_packet;
 	/* barrier_relax: that last command has no API timestamp or end copy. */
 	bool untimed;
+	/* No global-tail wait (cross_none): a BARRIER_NONE compute-only
+	 * submission without input syncs or API timestamps, overlapping only
+	 * its queue's in-flight compute-only jobs.
+	 */
+	bool none;
 };
 
 /* A bounded internal packet uses the existing physical queues. A render

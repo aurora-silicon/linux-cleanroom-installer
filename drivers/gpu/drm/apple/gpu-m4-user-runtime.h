@@ -1669,6 +1669,74 @@ static int m4_user_admit_locked(struct m4_gpu_provider_runtime *p, struct m4_use
 	return 0;
 }
 
+/* BARRIER_NONE across submissions (q17 contract s5.3, q15 s1.2): a
+ * compute-only submission whose commands wait on nothing submitted before
+ * (first command vdm/cdm NONE, no later command with barrier 0), that names
+ * no input sync (the scheduler leaves own-queue producers to this
+ * provider's order) and no API timestamp needs no wait on the in-flight
+ * tail. It overlaps only in-flight compute-only jobs of its own queue. A job
+ * that does wait on earlier work is not admitted while such a job flies
+ * beside another one: one wait on the newest target is no prefix join of
+ * work that may finish out of order (a single in-flight job is). Retirement
+ * and fences stay in order.
+ */
+static bool cross_none = true;
+module_param(cross_none, bool, 0644);
+MODULE_PARM_DESC(cross_none, "BARRIER_NONE compute-only submissions without input syncs overlap their queue's in-flight compute-only jobs with no tail wait (default 1)");
+
+static bool m4_user_cross_none_locked(struct m4_gpu_provider_runtime *p, struct m4_user_job *j)
+{
+	struct gpu_m4_drm_provider_job_view view = { };
+
+	if (!READ_ONCE(cross_none) || j->token)
+		return false;
+	gpu_m4_drm_provider_job_view(j->core_job, &view);
+	if (view.inputs || !view.batch || !view.batch->commands || !view.batch->count ||
+	    view.command_first || view.batch->commands[0].vdm_barrier != DRM_ASAHI_BARRIER_NONE ||
+	    view.batch->commands[0].cdm_barrier != DRM_ASAHI_BARRIER_NONE)
+		return false;
+	for (u32 i = 0; i < view.batch->count; i++)
+		if (view.batch->commands[i].type != DRM_ASAHI_CMD_COMPUTE ||
+		    !view.batch->commands[i].vdm_barrier || !view.batch->commands[i].cdm_barrier)
+			return false;
+	for (u32 i = 0; i < M4_USER_INFLIGHT_MAX; i++) {
+		const struct m4_user_inflight *o = &p->user_inflight[i];
+		struct m4_user_job *a;
+
+		if (!o->item || !o->job || o->job == j->core_job)
+			continue;
+		a = m4_user_lane_job_locked(p, o->job);
+		if (IS_ERR(a) || a->queue != j->queue || !a->published_count)
+			return false;
+		for (u32 k = 0; k < a->command_count && k < ARRAY_SIZE(a->cmd); k++)
+			if (a->cmd[k].engine_mask != BIT(2))
+				return false;
+	}
+	return true;
+}
+
+/* An in-flight job other than j took no tail wait and another one flies
+ * beside it: j's single tail wait would then not cover everything earlier.
+ * One in-flight job alone, NONE or not, is joined by a wait on its tail
+ * (everything before it already retired).
+ */
+static bool m4_user_none_inflight_locked(const struct m4_gpu_provider_runtime *p,
+	const struct m4_user_job *j)
+{
+	u32 count = 0;
+	bool none = false;
+
+	for (u32 i = 0; i < M4_USER_INFLIGHT_MAX; i++) {
+		const struct m4_user_inflight *o = &p->user_inflight[i];
+
+		if (!o->item || !o->job || o->job == j->core_job)
+			continue;
+		count++;
+		none |= container_of(o->item, struct m4_user_job, item)->cross.none;
+	}
+	return none && count > 1;
+}
+
 /* inflight2 global-tail barrier: name the last command of the newest job
  * admitted ahead of j (the lane admits j only once every in-flight job
  * published its whole window, in admission order) and hold its notifier.
@@ -1684,10 +1752,18 @@ static int m4_user_cross_locked(struct m4_gpu_provider_runtime *p, struct m4_use
 	u32 last;
 	int ret;
 
-	if (j->cross.notifier || j->published)
+	if (j->cross.notifier || j->cross.none || j->published)
 		return -ESTALE;
 	if (!p->user_inflight2)
 		return 0;
+	if (m4_user_cross_none_locked(p, j)) {
+		j->cross.none = true;
+		p->user_inflight2_stats.none++; /* REMOVE-DEBUG */
+		return 0;
+	}
+	/* Admission keeps an ordered job out behind a NONE one. */
+	if (m4_user_none_inflight_locked(p, j))
+		return M4_USER_WHY(-EPROTO, "cross behind a NONE job");
 	for (u32 i = 0; i < M4_USER_INFLIGHT_MAX; i++) {
 		const struct m4_user_inflight *o = &p->user_inflight[i];
 
@@ -1898,6 +1974,15 @@ static int m4_user_inflight2_admit_locked(struct m4_gpu_provider_runtime *p,
 	if (compute_tail && view.batch->commands[0].type == DRM_ASAHI_CMD_RENDER &&
 	    !READ_ONCE(inflight2_mixed)) {
 		veto = M4_USER_VETO_CLASS;
+		goto vetoed;
+	}
+	/* Beside an in-flight job that took no tail wait (with another one in
+	 * flight), only another such job: a single wait on the newest target
+	 * is no prefix join.
+	 */
+	if (m4_user_none_inflight_locked(p, j) && !m4_user_cross_none_locked(p, j)) {
+		st->veto_none++;
+		veto = M4_USER_VETO_STATE;
 		goto vetoed;
 	}
 	/* Worst case of its whole window: a render's TA [barrier, InitBuffer,
@@ -2651,6 +2736,8 @@ static noinline ssize_t m4_user_inflight2_show(struct m4_gpu_power *gpu, char *b
 		" inflight2_admitted=%llu inflight2_vm=%llu inflight2_foreign=%llu inflight2_queue=%llu inflight2_barrier_render=%llu inflight2_barrier_compute=%llu inflight2_overlap_ns=%llu inflight2_overlap_max=%llu",
 		st.admitted, st.admitted_vm, st.admitted_foreign, st.admitted_queue,
 		st.barrier[0], st.barrier[1], st.overlap_ns, st.overlap_max);
+	n += sysfs_emit_at(buf, size + n, " inflight2_none=%llu inflight2_veto_none=%llu",
+		st.none, st.veto_none);
 	for (u32 i = 0; i < M4_USER_VETOES; i++)
 		n += sysfs_emit_at(buf, size + n, " inflight2_veto_%s=%llu", veto_name[i],
 			st.veto[i]);
