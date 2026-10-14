@@ -54,6 +54,29 @@ static const u32 m4_exec_queue_size[M4_EXEC_QUEUE_BUFFERS] = {
 	0x24c0, 0x60, 0x800, 0x18, 0x200, 8, 8, 8, 0x40,
 };
 
+/* queue_cached: the work ring (bit 1), queue-info (bit 2) and notifier
+ * list head (bit 4, with the scheduling context) records.
+ */
+static u32 m4_exec_queue_cached_bit(unsigned int id)
+{
+	return id == M4_EXEC_QUEUE_RING ? 2 : id == M4_EXEC_QUEUE_INFO ? 4 :
+		id == M4_EXEC_QUEUE_NOTIFIERS ? 16 : 0;
+}
+
+static enum gpu_m4_access m4_exec_queue_access(const struct m4_gpu_ready *r, unsigned int id)
+{
+	u32 bit = m4_exec_queue_cached_bit(id);
+
+	return bit ? m4_ready_queue_access(r, bit) : GPU_M4_FW_RW;
+}
+
+static u64 m4_exec_queue_attrs(const struct m4_gpu_ready *r, unsigned int id)
+{
+	u32 bit = m4_exec_queue_cached_bit(id);
+
+	return bit ? m4_ready_queue_attrs(r, bit) : 0x00c000000000044bULL;
+}
+
 static bool m4_exec_firmware_buffer(unsigned int id)
 {
 	return id == M4_EXEC_WORK || id == M4_EXEC_AUX || id == M4_EXEC_COUNTER;
@@ -286,7 +309,7 @@ static int m4_exec_memory_prepare(struct m4_gpu_hello *h)
 	ret = gpu_m4_client_map(&e->client, r->input.lower_uma, e->uma_pa, 1, true);
 	if (ret)
 		return ret;
-	ret = m4_exec_nc(h, &e->context, 0x38, true, GPU_M4_FW_RW);
+	ret = m4_exec_nc(h, &e->context, 0x38, true, m4_ready_queue_access(r, 16));
 	if (ret)
 		return ret;
 	ret = m4_exec_nc(h, &e->zero_stamp, 8, true, GPU_M4_FW_RW);
@@ -306,7 +329,8 @@ static int m4_exec_memory_prepare(struct m4_gpu_hello *h)
 		struct m4_ready_buffer *q = e->queue[engine];
 
 		for (u32 i = 0; i < M4_EXEC_QUEUE_BUFFERS; i++) {
-			ret = m4_exec_nc(h, &q[i], m4_exec_queue_size[i], true, GPU_M4_FW_RW);
+			ret = m4_exec_nc(h, &q[i], m4_exec_queue_size[i], true,
+				m4_exec_queue_access(r, i));
 			if (ret)
 				return ret;
 		}
@@ -581,14 +605,15 @@ static bool m4_exec_memory_check(struct m4_gpu_hello *h, bool full)
 	/* Live READY bootstrap edges of each retained firmware allocation. */
 	for (u32 i = 0; i < ARRAY_SIZE(common); i++)
 		if (gpu_m4_bootstrap_check(&upper, common[i]->va, common[i]->pa,
-					   common[i]->size, 0x00c000000000044bULL, true))
+					   common[i]->size, common[i] == &e->context ?
+					   m4_ready_queue_attrs(h->ready, 16) : 0x00c000000000044bULL, true))
 			return false;
 	for (u32 engine = 0; engine < 3; engine++)
 		for (u32 i = 0; i < M4_EXEC_QUEUE_BUFFERS; i++) {
 			struct m4_ready_buffer *b = &e->queue[engine][i];
 
 			if (gpu_m4_bootstrap_check(&upper, b->va, b->pa, b->size,
-						   0x00c000000000044bULL, true))
+						   m4_exec_queue_attrs(h->ready, i), true))
 				return false;
 		}
 	for (u32 i = 0; i < M4_EXEC_BUFFERS; i++) {
