@@ -526,6 +526,26 @@ static void m4_user_init(struct m4_gpu_provider_runtime *p)
 		p->user_inflight_max > 2 ? M4_USER_INFLIGHT4_BANK_SIZE : M4_USER_INFLIGHT2_BANK_SIZE;
 }
 
+/* Scheduler credits per new queue: batches the scheduler hands to the
+ * provider at once, each materializing its windows while earlier ones
+ * execute, at least the packet cap. Above it, the next batches are built
+ * and wait accepted in the lane FIFO while the cap's packets run, so a
+ * completion is refilled without a run/materialize hop. 0: the packet cap.
+ */
+static unsigned int queue_credits = 8;
+module_param(queue_credits, uint, 0644);
+MODULE_PARM_DESC(queue_credits, "Scheduler credits per new queue, packet cap..16 (default 8; 0: the packet cap)");
+
+static u32 m4_user_queue_credits(const struct m4_gpu_provider_runtime *p)
+{
+	u32 credits = READ_ONCE(queue_credits);
+
+	if (!p->user_inflight2)
+		return 0;
+	return credits ? clamp_t(u32, credits, p->user_inflight_max,
+				 GPU_M4_DRM_SCHED_PROVIDER_MAX_CREDITS) : p->user_inflight_max;
+}
+
 static void *m4_user_vm_create(void *owner, struct gpu_m4_drm_vm *frontend,
 			       u64 kernel_start, u64 kernel_end)
 {
@@ -728,7 +748,7 @@ static void *m4_user_queue_create(void *owner, void *backend, u32 priority, u64 
 		/* Packets in flight: the next batches of this queue may run
 		 * (and materialize) while earlier ones execute.
 		 */
-		.credit_limit = p->user_inflight2 ? p->user_inflight_max : 0,
+		.credit_limit = m4_user_queue_credits(p),
 		.runtime_queue = q, .runtime = p->user_runtime,
 	};
 	q->provider_queue = gpu_m4_drm_provider_queue_create(&config);

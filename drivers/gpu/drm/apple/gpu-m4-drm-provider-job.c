@@ -19,6 +19,10 @@
 
 /* Child windows a batch may hold built and enqueued behind its active one. */
 #define GPU_M4_PROVIDER_PREFETCH_MAX 3U
+/* Running batches a queue may hold: one per scheduler credit, at most what
+ * the scheduler lets a provider configure.
+ */
+#define GPU_M4_PROVIDER_AGGREGATES ((u32)GPU_M4_DRM_SCHED_PROVIDER_MAX_CREDITS)
 
 struct gpu_m4_drm_provider_queue {
 	struct kref ref;
@@ -35,7 +39,7 @@ struct gpu_m4_drm_provider_queue {
 	 * woken on close. Registered while its materializer ref is held;
 	 * removed at terminalization.
 	 */
-	struct gpu_m4_drm_provider_job *aggregate[GPU_M4_DRM_SCHED_MAX_CREDITS];
+	struct gpu_m4_drm_provider_job *aggregate[GPU_M4_PROVIDER_AGGREGATES];
 	/* The next job materializing its first window before run, woken on
 	 * close. Registered while its early materializer ref is held.
 	 */
@@ -169,6 +173,10 @@ struct gpu_m4_drm_provider_job {
 	 * of the queue may now materialize its first child).
 	 */
 	bool window_final;
+	/* Parent: its materializer found an earlier running batch of the queue
+	 * still materializing and waits for that batch's final child.
+	 */
+	bool window_turn_wait;
 	bool waiting_counted; /* REMOVE-DEBUG: counted in queue->waiting */
 	/* REMOVE-DEBUG pacing: its submit entry; parent: final child's retirement. */
 	u64 submit_ns, final_ns;
@@ -2788,7 +2796,7 @@ static struct dma_fence *gpu_m4_provider_next_dependency(void *cookie, void *own
 static void gpu_m4_provider_aggregate_add_locked(struct gpu_m4_drm_provider_queue *queue,
 	struct gpu_m4_drm_provider_job *job)
 {
-	for (u32 i = 0; i < (u32)GPU_M4_DRM_SCHED_MAX_CREDITS; i++) {
+	for (u32 i = 0; i < (u32)GPU_M4_PROVIDER_AGGREGATES; i++) {
 		if (!queue->aggregate[i]) {
 			queue->aggregate[i] = job;
 			return;
@@ -2797,17 +2805,32 @@ static void gpu_m4_provider_aggregate_add_locked(struct gpu_m4_drm_provider_queu
 	WARN_ON(1); /* more running batches than scheduler credits */
 }
 
-/* Wake the running batches after parent (or every one with parent NULL). */
+/* aggregate_wake_all=1: every running batch after parent is woken (each
+ * takes the provider mutex only to find its child still executing or its
+ * turn not come). 0: only the first one waiting for its turn, the only batch
+ * a final enqueue or a batch end can unblock; it wakes the next in turn.
+ */
+static bool aggregate_wake_all;
+module_param(aggregate_wake_all, bool, 0644);
+MODULE_PARM_DESC(aggregate_wake_all, "Wake every later running batch at a final enqueue or batch end (default 0: the first one waiting for its turn)");
+
+/* Wake the running batch after parent (or after none with parent NULL) that
+ * waits for its turn.
+ */
 static void gpu_m4_provider_aggregate_wake_locked(struct gpu_m4_drm_provider_queue *queue,
 	struct gpu_m4_drm_provider_job *parent)
 {
-	bool after = !parent;
+	bool after = !parent, all = READ_ONCE(aggregate_wake_all);
 
-	for (u32 i = 0; i < (u32)GPU_M4_DRM_SCHED_MAX_CREDITS && queue->aggregate[i]; i++) {
+	for (u32 i = 0; i < (u32)GPU_M4_PROVIDER_AGGREGATES && queue->aggregate[i]; i++) {
 		struct gpu_m4_drm_provider_job *job = queue->aggregate[i];
 
-		if (after && job->window_work_ref)
+		if (after && job->window_work_ref && (all || job->window_turn_wait)) {
+			job->window_turn_wait = false;
 			queue_work(system_unbound_wq, &job->window_work);
+			if (!all)
+				return;
+		}
 		after |= job == parent;
 	}
 }
@@ -2817,10 +2840,10 @@ static void gpu_m4_provider_aggregate_unlink_locked(struct gpu_m4_drm_provider_q
 {
 	u32 n = 0;
 
-	for (u32 i = 0; i < (u32)GPU_M4_DRM_SCHED_MAX_CREDITS; i++)
+	for (u32 i = 0; i < (u32)GPU_M4_PROVIDER_AGGREGATES; i++)
 		if (queue->aggregate[i] && queue->aggregate[i] != parent)
 			queue->aggregate[n++] = queue->aggregate[i];
-	for (u32 i = n; i < (u32)GPU_M4_DRM_SCHED_MAX_CREDITS; i++)
+	for (u32 i = n; i < (u32)GPU_M4_PROVIDER_AGGREGATES; i++)
 		queue->aggregate[i] = NULL;
 }
 
@@ -2841,7 +2864,7 @@ static bool gpu_m4_provider_aggregate_turn_locked(struct gpu_m4_drm_provider_job
 {
 	struct gpu_m4_drm_provider_queue *queue = parent->queue;
 
-	for (u32 i = 0; i < (u32)GPU_M4_DRM_SCHED_MAX_CREDITS && queue->aggregate[i]; i++) {
+	for (u32 i = 0; i < (u32)GPU_M4_PROVIDER_AGGREGATES && queue->aggregate[i]; i++) {
 		if (queue->aggregate[i] == parent)
 			return true;
 		if (!queue->aggregate[i]->window_final)
@@ -2863,7 +2886,7 @@ int gpu_m4_drm_provider_job_queue_next_locked(struct gpu_m4_drm_provider_job *ch
 	parent = child->window_parent;
 	if (parent && child->command_first + child->batch.count < parent->batch.count)
 		return GPU_M4_DRM_QUEUE_NEXT_OWN;
-	for (u32 i = 0; i < (u32)GPU_M4_DRM_SCHED_MAX_CREDITS && queue->aggregate[i]; i++) {
+	for (u32 i = 0; i < (u32)GPU_M4_PROVIDER_AGGREGATES && queue->aggregate[i]; i++) {
 		struct gpu_m4_drm_provider_job *job = queue->aggregate[i];
 
 		if (job == parent)
@@ -3824,6 +3847,7 @@ again:
 		/* An earlier running batch of this queue still materializes: its
 		 * final child's enqueue (or its end) wakes this one.
 		 */
+		parent->window_turn_wait = true;
 		mutex_unlock(lock);
 		if (drop)
 			WARN_ON(gpu_m4_drm_provider_job_put(drop));
@@ -4188,7 +4212,7 @@ static struct gpu_m4_drm_provider_queue *gpu_m4_provider_queue_create(
 	/* Two credits only with bounded windows: the aggregate machinery keeps
 	 * same-queue batches in order.
 	 */
-	if (config->credit_limit > (u32)GPU_M4_DRM_SCHED_MAX_CREDITS ||
+	if (config->credit_limit > (u32)GPU_M4_PROVIDER_AGGREGATES ||
 	    (config->credit_limit > 1 && !config->execution_window))
 		return ERR_PTR(-EINVAL);
 	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
@@ -4279,7 +4303,7 @@ static void gpu_m4_provider_close_runtime(struct gpu_m4_drm_provider_queue *queu
 		/* A child parked on a private dependency is a PRIVATE lane entry the
 		 * lane never revisits: wake its materializer to cancel the remainder.
 		 */
-		for (u32 i = 0; i < (u32)GPU_M4_DRM_SCHED_MAX_CREDITS; i++)
+		for (u32 i = 0; i < (u32)GPU_M4_PROVIDER_AGGREGATES; i++)
 			if (queue->aggregate[i] && queue->aggregate[i]->window_work_ref)
 				queue_work(system_unbound_wq, &queue->aggregate[i]->window_work);
 		/* Likewise a never-run early first window: drop its child now. */
