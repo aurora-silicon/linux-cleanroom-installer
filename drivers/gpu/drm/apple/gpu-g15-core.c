@@ -1208,21 +1208,34 @@ out:
 	return ret;
 }
 
-/* One device-control record, then its producer/completion receipt. */
 /*
- * Post one 0x38-byte device-control record (EP0x21 0x0083000000000011) and
- * wait for its consumption and completion. Callers serialize (gpu->lock once
- * the backend runs).
+ * Post one 0x38-byte device-control record (EP0x21 0x0083000000000011) behind
+ * the earlier ones (one posted without waiting may still be pending: wait for
+ * its consumption first) and, with wait, wait for its consumption and
+ * completion. A firmware halted for recovery consumes nothing until the
+ * host's resume: -EBUSY then, so the caller can answer the halt instead of
+ * timing out. Callers serialize (gpu->lock once the backend runs).
  */
-int g15_devctl_record(struct g15_gpu *gpu, const u8 *record)
+static int g15_devctl_submit(struct g15_gpu *gpu, const u8 *record, bool wait)
 {
 	u32 producer = gpu->devctl_producer, next = (producer + 1) % 256;
 	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
 	u32 opcode = get_unaligned_le32(record);
 	int ret;
 
-	if (g15_r32(gpu, G15_DEVCTL_STATE) != producer)
-		return -EPROTO;
+	while (g15_r32(gpu, G15_DEVCTL_STATE) != producer) {
+		g15_drain_rings(gpu);
+		if (gpu->error)
+			return gpu->error;
+		if (g15_r32(gpu, G15_CONTROL + G15_CONTROL_HALTED) == 1)
+			return -EBUSY;
+		if (time_after(jiffies, deadline)) {
+			dev_err(gpu->dev, "control %#x: earlier record not consumed (read=%u producer=%u)\n",
+				opcode, g15_r32(gpu, G15_DEVCTL_STATE), producer);
+			return -ETIMEDOUT;
+		}
+		usleep_range(1000, 2000);
+	}
 	ret = g15_write(gpu, G15_DEVCTL_RING + producer * 0x38, record, 0x38);
 	if (ret)
 		return ret;
@@ -1231,7 +1244,7 @@ int g15_devctl_record(struct g15_gpu *gpu, const u8 *record)
 	wmb();
 	gpu->devctl_producer = next;
 	ret = apple_rtkit_send_message(gpu->rtkit, 0x21, 0x0083000000000011ULL, NULL, false);
-	if (ret)
+	if (ret || !wait)
 		return ret;
 	for (;;) {
 		g15_drain_rings(gpu);
@@ -1240,6 +1253,8 @@ int g15_devctl_record(struct g15_gpu *gpu, const u8 *record)
 		if (g15_r32(gpu, G15_DEVCTL_STATE) == next &&
 		    g15_r32(gpu, G15_DEVCTL_STATE + 0x10) == next)
 			return 0;
+		if (g15_r32(gpu, G15_CONTROL + G15_CONTROL_HALTED) == 1)
+			return -EBUSY;
 		if (time_after(jiffies, deadline)) {
 			dev_err(gpu->dev, "control %#x: read=%u completion=%u producer=%u\n", opcode,
 				g15_r32(gpu, G15_DEVCTL_STATE),
@@ -1248,6 +1263,12 @@ int g15_devctl_record(struct g15_gpu *gpu, const u8 *record)
 		}
 		usleep_range(1000, 2000);
 	}
+}
+
+/* Post one device-control record and wait for its completion receipt. */
+int g15_devctl_record(struct g15_gpu *gpu, const u8 *record)
+{
+	return g15_devctl_submit(gpu, record, true);
 }
 
 static int g15_devctl(struct g15_gpu *gpu, u32 opcode)

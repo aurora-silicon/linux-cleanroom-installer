@@ -3813,6 +3813,7 @@ static int g15_recover(struct g15_backend *be, bool *recovered)
 {
 	struct g15_gpu *gpu = be->gpu;
 	const u64 c = G15_CONTROL;
+	u32 halts = 0;
 	int err, t;
 	u64 busy, fault;
 
@@ -3851,11 +3852,33 @@ static int g15_recover(struct g15_backend *be, bool *recovered)
 		dev_err(gpu->dev, "recovery: resume not consumed (%d ms)\n", t);
 		return err;
 	}
-	/* Firmware clears resume before finishing: wait for the queue to drain. */
+	/*
+	 * Firmware clears resume before finishing: wait for the queues to drain.
+	 * Work of the failed prefixes that runs after the resume can fail in
+	 * turn (a compute that waited on the aborted FS hitting a firmware
+	 * compute timeout): its own halt is answered the same way, a bounded
+	 * number of times, and the drain continues.
+	 */
 	for (t = 0; t < 1000 && !g15_prefix_drained(be); t++) {
 		mutex_lock(&gpu->lock);
 		g15_drain_rings(gpu);
 		mutex_unlock(&gpu->lock);
+		if (g15_r32(gpu, c + G15_CTL_HALTED) == 1 && !READ_ONCE(gpu->error) && halts < 4) {
+			halts++;
+			g15_recover_snapshot(be, "halted again");
+			g15_w32(gpu, c + G15_CTL_HALTED, 0);
+			wmb();
+			g15_w32(gpu, c + G15_CTL_RESUME, 1);
+			wmb();
+			for (u32 w = 0; w < 500 && g15_r32(gpu, c + G15_CTL_RESUME); w++)
+				usleep_range(1000, 1500);
+			if (g15_r32(gpu, c + G15_CTL_RESUME)) {
+				dev_err(gpu->dev, "recovery: resume after a further halt not consumed\n");
+				return err;
+			}
+			t = 0;
+			continue;
+		}
 		usleep_range(1000, 1500);
 	}
 	g15_recover_snapshot(be, "resumed");
@@ -3967,14 +3990,22 @@ static void g15_poll_work(struct work_struct *work)
 	int ret = 0;
 
 	mutex_lock(&be->lock);
-	if (!be->fl_count || be->failed)
+	if (be->failed)
+		goto out;
+	/*
+	 * With nothing published only a firmware error event needs this pass:
+	 * one that arrived after its prefix's receipts is answered here (the
+	 * firmware halted and waits for the resume) instead of being taken
+	 * for a failure of the next prefix.
+	 */
+	if (!be->fl_count && atomic_read(&gpu->event_errors) == be->errors_seen)
 		goto out;
 	/* After an event, a few short trailing polls catch the final receipts. */
 	for (u32 tail = atomic_xchg(&be->evented, 0) ? 4 : 0; ; tail--) {
 		mutex_lock(&gpu->lock);
 		g15_drain_rings(gpu);
 		mutex_unlock(&gpu->lock);
-		ret = g15_retired(be);
+		ret = be->fl_count ? g15_retired(be) : 0;
 		while (ret > 0) {
 			f = g15_oldest(be);
 			if (be->ordinal <= 2 && be->r.draw <= 2) {
@@ -4007,17 +4038,17 @@ static void g15_poll_work(struct work_struct *work)
 		udelay(5);
 	}
 	g15_pb_grow(be);
-	if (!be->fl_count)
-		goto next;
 	f = g15_oldest(be);
-	if (!be->preempt_global)
+	if (!f && atomic_read(&gpu->event_errors) == be->errors_seen)
+		goto next;
+	if (f && !be->preempt_global)
 		g15_progress(be, f);
 	/*
 	 * A started, stuck class-0 compute cannot be preempted: fail-stop at its
 	 * shorter budget rather than arming the ineffective compute-store
 	 * request and waiting the full deadline.
 	 */
-	if (!ret && !READ_ONCE(gpu->error) && !be->preempt_global &&
+	if (f && !ret && !READ_ONCE(gpu->error) && !be->preempt_global &&
 	    atomic_read(&gpu->event_errors) == be->errors_seen &&
 	    time_after(jiffies, be->compute_deadline) && g15_compute_hang(be, f)) {
 		dev_warn(gpu->dev, "class-0 compute hang of ctx %u (not preemptible): failing\n",
@@ -4025,7 +4056,7 @@ static void g15_poll_work(struct work_struct *work)
 		g15_report(be, "compute hang");
 		be->deadline = jiffies;		/* take the fail-stop branch below */
 	}
-	if (!ret && !READ_ONCE(gpu->error) &&
+	if (f && !ret && !READ_ONCE(gpu->error) &&
 	    atomic_read(&gpu->event_errors) == be->errors_seen &&
 	    time_after(jiffies, be->deadline) && !be->preempt_global &&
 	    !g15_compute_hang(be, f) &&
@@ -4043,11 +4074,12 @@ static void g15_poll_work(struct work_struct *work)
 		again = true;
 	} else if (ret < 0 || READ_ONCE(gpu->error) ||
 		   atomic_read(&gpu->event_errors) != be->errors_seen ||
-		   time_after(jiffies, be->deadline)) {
+		   (f && time_after(jiffies, be->deadline))) {
 		bool recovered = false, render = false;
+		u32 ctx = f ? f->job->vm->asid : 0;
 		int err;
 
-		g15_report(be, "prefix FAILED");
+		g15_report(be, f ? "prefix FAILED" : "firmware error with no prefix published");
 		mutex_lock(&gpu->lock);
 		g15_dump_events(gpu, 4);
 		mutex_unlock(&gpu->lock);
@@ -4072,8 +4104,8 @@ static void g15_poll_work(struct work_struct *work)
 					be->fs_resync = true;
 					be->r.reinit = true;
 				}
-				dev_warn(gpu->dev, "recovered: ctx %u submission failed with %d\n",
-					 f->job->vm->asid, err);
+				dev_warn(gpu->dev, "recovered: ctx %u submission failed with %d\n", ctx,
+					 err);
 				/* The failing client's VM is lost; other clients continue. */
 				while (be->fl_count)
 					g15_flight_done(be, g15_oldest(be), err, &done);

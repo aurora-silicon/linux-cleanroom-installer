@@ -49,6 +49,7 @@ enum g15_region { G15_TTBS, G15_TABLES, G15_HANDOFF, G15_SHARED_L2, G15_TEXT, G1
 #define G15_GLOBALS		0xfffffc20407cc204ULL
 #define G15_POWER		0xfffffc204081370cULL
 #define G15_CONTROL		0xfffffc20003bbc30ULL
+#define G15_CONTROL_HALTED	0x4590	/* u32: firmware halted for recovery (it sets 1, the host clears) */
 #define G15_FLAGS		0xfffffc2040857fc0ULL
 #define G15_CH_STATE(i)		(0xfffffc2040003fd0ULL + (i) * 0x44000ULL)
 #define G15_CH_RING(i)		(0xfffffc2000002800ULL + (i) * 0x44000ULL)
