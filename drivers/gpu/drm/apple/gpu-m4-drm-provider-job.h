@@ -491,6 +491,11 @@ int gpu_m4_drm_provider_job_put(struct gpu_m4_drm_provider_job *job);
 int gpu_m4_drm_provider_job_start_locked(struct gpu_m4_drm_provider_job *job);
 int gpu_m4_drm_provider_job_retire_locked(struct gpu_m4_drm_provider_job *job);
 int gpu_m4_drm_provider_job_cancel_locked(struct gpu_m4_drm_provider_job *job);
+/* A firmware recovery aborted a work of this PUBLISHED child: its eventual
+ * retire_locked (every published work proven passed by the runtime) retires
+ * its owners as usual but completes it, and latches its VM, with error.
+ */
+int gpu_m4_drm_provider_job_abort_locked(struct gpu_m4_drm_provider_job *job, int error);
 void gpu_m4_drm_provider_job_fault_locked(struct gpu_m4_drm_provider_job *job, int error);
 /* Hold a job ref and drop provider/resv locks first. Success/error signals only
  * a completion already committed above; there is no public "signal success"

@@ -163,11 +163,14 @@ static inline int gpu_m4_compute_reuse_retired_prefixes(
 			return -EINVAL;
 		consumer[i + 1] = r->queue_consumer[i];
 	}
-	if (!r->firmware_stamp || !r->user_stamp ||
+	if (!r->firmware_stamp ||
 	    !gpu_m4_exec_stamp_reached(r->firmware_stamp, r->expected_stamp) ||
+	    !r->uma_submitted || (!r->aborted && r->uma_submitted != r->uma_completed))
+		return -EAGAIN;
+	/* A recovered abort never completed: no user stamp or timestamps. */
+	if (!r->aborted && (!r->user_stamp ||
 	    !gpu_m4_exec_stamp_reached(r->user_stamp, r->expected_stamp) ||
-	    !r->uma_submitted || r->uma_submitted != r->uma_completed ||
-	    !r->timestamp_start || r->timestamp_end <= r->timestamp_start)
+	    !r->timestamp_start || r->timestamp_end <= r->timestamp_start))
 		return -EAGAIN;
 	produced = (r->queue_write - r->next) & 255;
 	if (produced >= 128 || (!produced && r->queue_busy && !r->ignore_busy))
@@ -275,26 +278,30 @@ static inline int gpu_m4_compute_horizon_retired(const struct gpu_m4_exec_retire
 		r->expected_stamp, r->stage_horizon) : 0;
 	if (stage == -EINVAL)
 		return stage;
+	/* A recovered abort (r->aborted) never completed: its stage frontier
+	 * and positions prove the firmware passed it; no user stamp, timestamps
+	 * or completed UMA count need exist (its unit never runs again).
+	 */
 	if (!notifier) {
 		if ((!r->stage_horizon && r->firmware_stamp != r->expected_stamp) ||
-		    stage == -EAGAIN || r->user_stamp != r->expected_stamp)
+		    stage == -EAGAIN || (!r->aborted && r->user_stamp != r->expected_stamp))
 			return -EAGAIN;
 	} else {
 		if ((!r->stage_horizon &&
 		     (!r->firmware_stamp ||
 		      !gpu_m4_exec_stamp_reached(r->firmware_stamp, r->expected_stamp))) ||
-		    stage == -EAGAIN || !r->user_stamp ||
-		    !gpu_m4_exec_stamp_reached(r->user_stamp, r->expected_stamp))
+		    stage == -EAGAIN || (!r->aborted && (!r->user_stamp ||
+		    !gpu_m4_exec_stamp_reached(r->user_stamp, r->expected_stamp))))
 			return -EAGAIN;
 		if ((!r->stage_horizon &&
 		     !gpu_m4_exec_stamp_reached(target_horizon, r->firmware_stamp)) ||
-		    !gpu_m4_exec_stamp_reached(target_horizon, r->user_stamp))
+		    (!r->aborted && !gpu_m4_exec_stamp_reached(target_horizon, r->user_stamp)))
 			return -EPROTO; /* Beyond the known submitted tail. */
 	}
 	if (stage)
 		return stage; /* -EPROTO: beyond the event's published tail. */
-	if (!r->uma_submitted || r->uma_submitted != r->uma_completed ||
-	    !r->timestamp_start || r->timestamp_end <= r->timestamp_start)
+	if (!r->uma_submitted || (!r->aborted && (r->uma_submitted != r->uma_completed ||
+	    !r->timestamp_start || r->timestamp_end <= r->timestamp_start)))
 		return -EAGAIN;
 	return 0;
 }

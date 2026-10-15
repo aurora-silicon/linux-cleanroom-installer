@@ -275,6 +275,11 @@ struct gpu_m4_exec_retirement {
 	 * receipt.
 	 */
 	u32 stage_horizon;
+	/* A firmware recovery aborted the work: the firmware passed it (stage,
+	 * queue, pipe) but it never completed, so no user stamp, timestamps or
+	 * completed UMA count are required of this observation.
+	 */
+	bool aborted;
 };
 
 /* Stage (Finalize) cell of a work. The firmware stores the targets of one
@@ -316,13 +321,13 @@ static inline int gpu_m4_exec_retired(const struct gpu_m4_exec_retirement *r)
 	stage = gpu_m4_exec_stage_check(r->firmware_stamp, r->expected_stamp, r->stage_horizon);
 	if (stage == -EINVAL)
 		return stage;
-	if (stage == -EAGAIN || r->user_stamp != r->expected_stamp ||
+	if (stage == -EAGAIN || (!r->aborted && r->user_stamp != r->expected_stamp) ||
 	    r->queue_read != r->next || r->queue_write != r->next ||
 	    (r->queue_busy && !r->ignore_busy) ||
 	    r->pipe_read != r->pipe_next || r->pipe_cfi != r->pipe_next ||
 	    r->pipe_write != r->pipe_next || !r->uma_submitted ||
-	    r->uma_submitted != r->uma_completed ||
-	    !r->timestamp_start || r->timestamp_end <= r->timestamp_start)
+	    (!r->aborted && (r->uma_submitted != r->uma_completed ||
+	     !r->timestamp_start || r->timestamp_end <= r->timestamp_start)))
 		return -EAGAIN;
 	for (i = 0; i < 3; i++)
 		if (r->queue_consumer[i] != r->next)

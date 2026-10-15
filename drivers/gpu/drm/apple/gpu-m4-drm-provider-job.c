@@ -192,6 +192,11 @@ struct gpu_m4_drm_provider_job {
 	 * fence signals). A published job that never retired keeps it.
 	 */
 	bool tree, guarded;
+	/* Nonzero: a firmware recovery aborted one of this child's works. The
+	 * runtime proved the firmware passed every published work, so it
+	 * retires its owners normally, but completes with this error.
+	 */
+	int aborted;
 };
 
 struct gpu_m4_drm_provider_timestamp {
@@ -1180,12 +1185,17 @@ int gpu_m4_drm_provider_job_timestamp_check_locked(struct gpu_m4_drm_provider_jo
 		return ret;
 	/* Closing an accepted queue/VM is not cancellation of its published work.
 	 * These owned software states, not current frontend openness, are authority.
+	 * A child retired after a recovered firmware abort completed with its
+	 * abort error, yet every work of it passed and its owners retired as
+	 * usual: for the native history of its units it is a retired job.
 	 */
 	if (!job->accepted || !job->protected || IS_ERR_OR_NULL(job->runtime_job) ||
 	    IS_ERR_OR_NULL(job->cache) || IS_ERR(job->resv) ||
 	    IS_ERR_OR_NULL(job->finished) || IS_ERR_OR_NULL(job->retirement) ||
 	    job->state != (retired ? GPU_M4_PROVIDER_RETIRED : GPU_M4_PROVIDER_PUBLISHED) ||
-	    job->retirement->error || job->retirement->ready != retired)
+	    (job->retirement->error &&
+	     !(retired && job->aborted && job->retirement->error == job->aborted)) ||
+	    job->retirement->ready != retired)
 		return -EINVAL;
 	for (u32 i = 0; i < job->batch.count; i++) {
 		const struct gpu_m4_drm_job_timestamp *slots;
@@ -1325,12 +1335,17 @@ int gpu_m4_drm_provider_job_check_access_locked(struct gpu_m4_drm_provider_job *
 	/* These are core-owned phases. In particular, runtime.publish enters after
 	 * protection and before GPU producers; a retained error fence, !uncertain
 	 * or cache visibility by itself cannot manufacture successful retirement.
+	 * A child retired after a recovered firmware abort (job->aborted) is a
+	 * retired job for its units' native history: every work of it passed
+	 * and its owners retired as usual; only its fence carries the error.
 	 */
 	if (!job->accepted || !job->protected || IS_ERR_OR_NULL(job->runtime_job) ||
 	    IS_ERR_OR_NULL(job->cache) || IS_ERR(job->resv) ||
 	    IS_ERR_OR_NULL(job->finished) || IS_ERR_OR_NULL(job->retirement) ||
 	    job->state != (retired ? GPU_M4_PROVIDER_RETIRED : GPU_M4_PROVIDER_PUBLISHED) ||
-	    job->retirement->error || job->retirement->ready != retired)
+	    (job->retirement->error &&
+	     !(retired && job->aborted && job->retirement->error == job->aborted)) ||
+	    job->retirement->ready != retired)
 		return -EINVAL;
 	/* Membership must precede dereferencing a supplied opaque object. This
 	 * also admits a held file-global BO absent from the lower user ledger.
@@ -3072,10 +3087,12 @@ int gpu_m4_drm_provider_job_start_locked(struct gpu_m4_drm_provider_job *job)
 	 * cache preparation or protection: it completes definitely unpublished
 	 * with that error below, never through the provider fault hook. Its
 	 * already published predecessors keep their exact owners and retire
-	 * through the actual hardware/cache predicate.
+	 * through the actual hardware/cache predicate. The frontend VM error
+	 * counts too: a VM whose work a recovery aborted is lost, its later
+	 * READY jobs never publish.
 	 */
 	if (!ret)
-		ret = gpu_m4_drm_provider_vm_error_locked(queue->vm);
+		ret = gpu_m4_drm_provider_vm_status_locked(queue->vm);
 	if (!ret)
 		ret = gpu_m4_drm_provider_version_roots_locked(job->version, &low, &high);
 #ifdef CONFIG_DEBUG_FS
@@ -3168,6 +3185,14 @@ int gpu_m4_drm_provider_job_retire_locked(struct gpu_m4_drm_provider_job *job)
 	 * deferred GEM/VM-close removal may follow (provider worker).
 	 */
 	gpu_m4_provider_guard_retired(job);
+	if (job->aborted) {
+		/* Retired (no work of it remains on the firmware), not a provider
+		 * fault: only its own VM latches the error, before the signal.
+		 */
+		gpu_m4_drm_vm_error(gpu_m4_drm_vm_owner_vm(job->batch.vm_snapshot), job->aborted);
+		gpu_m4_provider_complete_locked(job, job->aborted);
+		return 0;
+	}
 	gpu_m4_provider_complete_locked(job, 0);
 	return 0;
 fault:
@@ -3175,6 +3200,19 @@ fault:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(gpu_m4_drm_provider_job_retire_locked);
+
+int gpu_m4_drm_provider_job_abort_locked(struct gpu_m4_drm_provider_job *job, int error)
+{
+	if (!job || job->aggregate)
+		return -EINVAL;
+	lockdep_assert_held(gpu_m4_provider_job_lock(job));
+	if (job->state != GPU_M4_PROVIDER_PUBLISHED)
+		return -EINVAL;
+	if (!job->aborted)
+		job->aborted = error < 0 ? error : -EIO;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(gpu_m4_drm_provider_job_abort_locked);
 
 int gpu_m4_drm_provider_job_cancel_locked(struct gpu_m4_drm_provider_job *job)
 {
@@ -4016,6 +4054,12 @@ int gpu_m4_drm_provider_job_window_complete_locked(struct gpu_m4_drm_provider_jo
 	lockdep_assert_held(gpu_m4_provider_job_lock(child));
 	parent = child->window_parent;
 	if (!parent)
+		return 0;
+	/* A child published beside a sibling whose recovered abort already
+	 * failed the batch: that finalization dropped it; nothing to advance.
+	 */
+	if (parent->state == GPU_M4_PROVIDER_AGGREGATE_FAILED &&
+	    parent->active_window != child && !gpu_m4_provider_window_prefetched(parent, child))
 		return 0;
 	if ((parent->active_window != child && !gpu_m4_provider_window_prefetched(parent, child)) ||
 	    !child->window_enqueued || child->window_complete ||
