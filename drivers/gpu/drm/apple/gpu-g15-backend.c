@@ -518,6 +518,7 @@ struct g15_flight {
 	/* Whole compute-only jobs published behind job in this prefix (in order). */
 	struct g15_job *group[G15_HORIZON_JOBS - 1];
 	u32 group_count;
+	bool rebuild;		/* re-initializes the render allocators after an abort */
 	u64 pub_ns;
 	unsigned long published_at;
 };
@@ -600,6 +601,7 @@ struct g15_backend {
 	int errors_seen;	/* gpu->event_errors already handled by recovery */
 	u32 preempt_global;	/* Globals offset of the armed preemption divisor, or 0 */
 	bool fs_resync;		/* next render waits on the reached FS stamp */
+	bool rebuild_live;	/* the rebuild prefix is published and not yet retired */
 	u64 st_recoveries, st_hang_kills;
 	struct delayed_work poll;
 	struct hrtimer resnap;		/* high-resolution poll fallback */
@@ -2848,7 +2850,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	struct g15_prefix pf = { .n = be->ordinal, .draw = r->draw };
 	u32 i = job->sent, ctx = job->vm->asid, computes = 0, renders = 0, end, free_c;
 	u32 last_render = U32_MAX;	/* index of the prefix's last render member */
-	bool render0 = job->cmds[i].render;
+	bool render0 = job->cmds[i].render, rebuild = false;
 	u8 *ta = NULL, *fs = NULL, *tas = NULL, *fss = NULL;
 	struct g15_geom geo;
 	int ret = 0;
@@ -2856,6 +2858,15 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	be->prep_from_ns = ktime_get_ns();
 	memset(f, 0, sizeof(*f));
 	free_c = g15_slots_free(be);
+	/*
+	 * After an abort the prefix that rebuilds the render allocators holds
+	 * renders only (see g15_engine_next): a compute published with it, or
+	 * behind it before it retired, crashed the 2419 firmware in its
+	 * progress path (F+0x35568, FAR 0x58) after a recovered hang whose
+	 * prefix had a compute waiting on the hung FS.
+	 */
+	if (be->r.reinit || be->fs_resync)
+		mixed = false;
 	for (end = i; end < job->count; end++) {
 		const struct g15_cmd *cmd = &job->cmds[end];
 		int k;
@@ -2910,6 +2921,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 		if (ret)
 			goto out;
 		/* After a recovered render abort the allocator state is not trusted. */
+		rebuild = r->reinit;
 		if (r->reinit) {
 			if (r->spare_ready)
 				g15_render_take_spare(be);
@@ -3042,6 +3054,10 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 		g15_deadline(be);
 	job->sent = end;
 	be->fl_count++;
+	if (rebuild) {
+		f->rebuild = true;
+		be->rebuild_live = true;
+	}
 	/* Compute on channel 2, then FS on channel 1, then TA on channel 0 (R8). */
 	if (computes) {
 		ret = g15_channel_post(be, G15_COMPUTE_CHANNEL, g->qinfo.va, 2, pf.c_head,
@@ -3344,7 +3360,9 @@ static void g15_fail_flights(struct g15_backend *be, int error)
 /*
  * Publish further prefixes (be->lock held): with nothing published any ready
  * job; behind published prefixes only the next job of the same VM, up to
- * max_inflight, and not while recovery state is pending. Jobs whose first
+ * max_inflight, and not while recovery state is pending: neither the prefix
+ * that rebuilds the render allocators after an abort is published behind
+ * another one, nor anything behind it until it has retired. Jobs whose first
  * publication failed before any visible record complete with an error; done
  * collects jobs whose engine reference the caller drops after unlocking.
  */
@@ -3361,7 +3379,7 @@ static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 		job = g15_pick(be);
 		if (tail && (be->fl_count >= clamp(READ_ONCE(max_inflight), 1U, (u32)G15_FLIGHTS) ||
 			     job->vm != tail->job->vm || be->r.reinit || be->fs_resync ||
-			     be->preempt_global))
+			     be->rebuild_live || be->preempt_global))
 			break;
 		if (tail && tail->job != job && !list_empty(&tail->job->link))
 			be->st_yields++;	/* another queue's turn at a prefix boundary */
@@ -3679,6 +3697,10 @@ static void g15_flight_done(struct g15_backend *be, struct g15_flight *f, int er
 	if (!error)
 		g15_stat_retire(be, f);
 	g15_flight_release(be, f);	/* after the stats read its timestamp cells */
+	if (f->rebuild) {
+		f->rebuild = false;
+		be->rebuild_live = false;
+	}
 	be->fl_first = (be->fl_first + 1) % G15_FLIGHTS;
 	be->fl_count--;
 	if (!be->fl_count)
@@ -3813,7 +3835,9 @@ static void g15_poll_work(struct work_struct *work)
 		 * A firmware error event, or a receipt fault (the fault banks can
 		 * be seen before the firmware's event is drained), with a live
 		 * transport: recovery waits for the firmware's own halt. Every
-		 * published prefix fails with it.
+		 * published prefix fails with it. A hang in the render-only
+		 * allocator rebuild prefix recovers like any render hang and
+		 * re-primes; only its first member stays strict.
 		 */
 		if (READ_ONCE(gpu_recovery) && !READ_ONCE(gpu->error) &&
 		    (atomic_read(&gpu->event_errors) != be->errors_seen || ret == -EIO)) {
