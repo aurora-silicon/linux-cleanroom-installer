@@ -137,6 +137,31 @@ struct m4_command_arena;
 
 enum m4_ready_table { M4_UPPER_LEAF, M4_LOWER_MIDDLE, M4_LOWER_LEAF, M4_READY_TABLES };
 
+/* One firmware-initiated recovery: the firmware stopped itself at
+ * FirmwareData +0x4fb0 = 1 after a type-0x16 recovery statistics record and a
+ * type-4 event (+0xc: the held event of the work it aborts). The host answers
+ * 1 -> 2, the firmware aborts that work and stops at 3, the host answers
+ * 3 -> 0 and the firmware resumes everything else. Under the GPU mutex.
+ */
+struct m4_ready_recovery {
+	/* state: 0 none, 1 recovery records drained, phases not yet answered. */
+	u32 state, epoch, count;
+	u64 start_ns, answer_ns, resumed_ns;
+	/* Type-4 event +0xc and the runtime-wide stage cells (TA, FS, compute)
+	 * at the first record: the in-order frontier the aborted work missed.
+	 */
+	u32 event_slot, stage[3];
+	/* FirmwareData +0x4fa0 at the answered pre-recovery stop. */
+	u64 generation;
+	/* Selected fault bank (SGX +0xd8c0/+0xd8c8) sampled at phase 1. */
+	u64 bank_info, bank_address;
+	bool bank_valid, have_event, have_statistics, marked, answered, running;
+	/* Storm guard: recoveries begun in the current 10 s window. */
+	u64 window_ns;
+	u32 window_count;
+	u8 statistics[0x48], event[0x48];
+};
+
 struct m4_gpu_ready {
 	struct m4_gpu_hello *hello;
 	struct m4_gpu_exec_memory *execution;
@@ -181,6 +206,8 @@ struct m4_gpu_ready {
 	/* REMOVE-DEBUG: last observed FirmwareData recovery phase/generation. */
 	u32 recovery_phase;
 	u64 recovery_generation;
+	/* Same-boot firmware-initiated recovery (gpu-m4-ready.h). */
+	struct m4_ready_recovery recovery;
 	int error;
 	/* queue_cached, sampled once before the bootstrap tables are built. */
 	u32 queue_cached;

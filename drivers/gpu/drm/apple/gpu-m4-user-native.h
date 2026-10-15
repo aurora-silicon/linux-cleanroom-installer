@@ -56,6 +56,10 @@ struct m4_user_native_receipt {
 	struct gpu_m4_render_retirement_dependency render_dependency[3];
 	struct gpu_m4_render_retirement_copy render_copies[GPU_M4_DRM_RENDER_TIMESTAMPS];
 	u32 render_dependency_count, render_copy_count;
+	/* The firmware aborted this use in a recovery: its counts are the
+	 * observed ones (no completion), and its unit never runs again.
+	 */
+	bool aborted;
 };
 
 /* The UMA ID / PB ID slot the receipt's works named to firmware. */
@@ -407,6 +411,10 @@ struct m4_user_native_unit {
 	 * after the VM closed.
 	 */
 	bool tree;
+	/* Its latest use was aborted by a firmware recovery: its private
+	 * completion state is unknown, so it is never selected again.
+	 */
+	bool aborted;
 };
 
 /* REMOVE-DEBUG experiment: PB heap multiplier for NEW render units (1 = the
@@ -2883,6 +2891,7 @@ static void m4_user_native_receipt_complete_locked(struct m4_user_native_stage *
 		refcount_inc(&h->refs);
 		m4_user_native_history_put_locked(u->history);
 		m4_user_native_history_put_locked(u->displacement);
+		u->aborted |= h->command[i].aborted;
 		u->history = h; u->history_index = i;
 		u->displacement = NULL; u->displacer = NULL;
 		u->accepted = NULL; u->idle = false;
@@ -3138,6 +3147,12 @@ static int m4_user_native_history_check_locked(struct m4_user_native_stage *s)
 	for (u32 i = 0; !ret && i < h->count; i++) {
 		const struct m4_user_native_receipt *r = &h->command[i];
 
+		/* A recovered abort's use proves nothing and its unit never runs
+		 * again; the other uses of the history keep their full proofs.
+		 */
+		if (r->aborted && r->type == s->command[i].type &&
+		    r->type == view.batch->commands[i].type && s->unit[i] && s->unit[i]->aborted)
+			continue;
 		if (r->type != s->command[i].type || r->type != view.batch->commands[i].type ||
 		    !r->submitted || (r->shared ? r->completed < r->submitted :
 			r->submitted != r->completed))
@@ -3856,6 +3871,20 @@ static int m4_user_native_slot_owner_locked(struct m4_gpu_provider_runtime *p,
 	return 0;
 }
 
+/* The current owner of u's own slot is a recovered abort's unit: no warm
+ * reuse proof exists for that slot until a fresh unit displaces it.
+ */
+static bool m4_user_native_slot_aborted_locked(struct m4_gpu_provider_runtime *p,
+	const struct m4_user_native_unit *u)
+{
+	struct m4_user_native_unit *c;
+
+	if (!u->history || u->history_index >= u->history->count)
+		return false;
+	return !m4_user_native_slot_owner_locked(p, u->command.type,
+		u->history->command[u->history_index].uma_slot, &c) && c->aborted;
+}
+
 /* Some unit's latest completed use in s is still the current owner of its
  * slot: s keeps firmware-last owner state and is never a cold component.
  */
@@ -3912,8 +3941,9 @@ static u32 m4_user_native_retarget_slot_locked(struct m4_user_native_stage *s, u
 
 		for (u32 i = 0; i < index && i < s->count && !used; i++)
 			used = s->command[i].type == type && m4_user_native_reused_slot(s, i) == slot;
+		/* A recovered abort's unit is no reuse proof of its slot. */
 		if (used || m4_user_native_slot_owner_locked(p, type, slot, &c) || !c->history ||
-		    !c->history->complete || c->accepted || c->cold)
+		    !c->history->complete || c->accepted || c->cold || c->aborted)
 			continue;
 		/* An exited client's last owner first: its displacement frees
 		 * that client's retained windows.
@@ -3992,7 +4022,11 @@ static int m4_user_native_unit_take(struct m4_user_native_stage *s, u32 index,
 		/* A cold tombstone owns no history: reject it before following
 		 * any old command/history/displacer pointer.
 		 */
-		if (u->cold) {
+		/* An aborted unit never runs again, and one displaced by an
+		 * aborted use waits for a later healthy owner of its slot.
+		 */
+		if (u->cold || u->aborted || (u->displacer && u->displacer->aborted) ||
+		    m4_user_native_slot_aborted_locked(p, u)) {
 			m4_user_native_unit_stats.reject[M4_USER_NATIVE_REJECT_COLD] += last; why[M4_USER_NATIVE_REJECT_COLD] += last;
 			continue;
 		}

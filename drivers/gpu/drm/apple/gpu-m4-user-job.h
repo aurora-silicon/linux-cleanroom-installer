@@ -136,6 +136,17 @@ struct m4_user_command {
 	 */
 	u32 final_target;
 	bool published, receipt;
+	/* Nonzero: published and unfinished when that recovery epoch began, so
+	 * the firmware may have aborted it. It retires with its ordinary full
+	 * receipt, or, once the firmware moved past it but that receipt still
+	 * failed for a grace period since abort_ns, as aborted.
+	 */
+	u32 abort;
+	u64 abort_ns, abort_wait_ns;
+	/* Set only while its aborted receipt is taken (the compute predicate
+	 * then observes it as aborted).
+	 */
+	bool abort_proven;
 	/* REMOVE-DEBUG timing: raw CNTPCT (CNTFRQ units, 1 GHz on M4) of this
 	 * command's packet publication and its observed FS end (internal 24 MHz
 	 * ticks) at receipt.
@@ -195,6 +206,12 @@ struct m4_user_job {
 	 */
 	bool mixed;
 	bool prepared, published, retired;
+	/* A command of this job was aborted by a firmware recovery: the job
+	 * retires (every published command passed) and fails with this error.
+	 */
+	int abort_error;
+	/* p->user_recoveries when this job was activated. */
+	u32 recoveries;
 };
 
 /* REMOVE-DEBUG: attribution trail of the latest ordinary publish/retire call.

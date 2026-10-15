@@ -15,6 +15,10 @@ MODULE_PARM_DESC(firmware_logging, "Retain late firmware messages in the guarded
 
 enum m4_hello_region { M4_TTBS, M4_TABLES, M4_HANDOFF, M4_SHARED, M4_TEXT, M4_DATA };
 
+struct m4_ready_recovery;
+
+enum { M4_RECOVERY_BEGIN, M4_RECOVERY_MARK, M4_RECOVERY_RESUMED };
+
 struct m4_gpu_hello {
 	struct m4_gpu_power *gpu;
 	struct resource region[6];
@@ -42,6 +46,13 @@ struct m4_gpu_hello {
 	 */
 	void (*fault_report)(void *owner);
 	void *fault_report_owner;
+	/* Same-boot recovery steps of the ordinary runtime (owner mutex held):
+	 * M4_RECOVERY_BEGIN at the first recovery record, M4_RECOVERY_MARK just
+	 * before the host answers the firmware's pre-recovery stop, and
+	 * M4_RECOVERY_RESUMED after the post-recovery answer. Nonzero refuses
+	 * the recovery (fail-stop). Set once with the lane.
+	 */
+	int (*recovery)(void *owner, u32 step, struct m4_ready_recovery *rec);
 };
 
 #include "gpu-m4-ready-memory.h"

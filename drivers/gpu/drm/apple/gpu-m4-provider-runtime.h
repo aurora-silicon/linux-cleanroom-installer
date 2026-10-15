@@ -474,6 +474,12 @@ struct m4_gpu_provider_runtime {
 	 */
 	u32 user_stage_exposed[3];
 	bool user_render_stage_waits; /* render_stage_waits, likewise */
+	/* Same-boot recoveries completed, and whether the lane still runs one
+	 * job at a time until a job activated after the latest one retired
+	 * successfully (the post-recovery canary).
+	 */
+	u32 user_recoveries;
+	bool user_recovery_exclusive;
 	bool ordinary, prerun_staging;
 	int error, handoff_get, handoff_put, tlbi;
 	bool attempted, prepared, complete, selected, v0_extra, writing;

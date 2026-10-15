@@ -41,6 +41,7 @@ MODULE_PARM_DESC(lane_timeout_ms, "DEBUG: ordinary active-work deadline in ms (1
 static struct m4_user_job *m4_user_lane_job_locked(struct m4_gpu_provider_runtime *p,
 	struct gpu_m4_drm_provider_job *job);
 static void m4_user_fault_report(void *owner);
+static int m4_user_recovery(void *owner, u32 step, struct m4_ready_recovery *rec);
 
 static int m4_user_inflight2_admit_locked(struct m4_gpu_provider_runtime *p,
 	struct gpu_m4_drm_provider_lane_item *candidate);
@@ -153,6 +154,7 @@ static int m4_user_lane_init(struct m4_gpu_provider_runtime *p)
 	/* Never destroyed while the pinned READY/session owner can receive. */
 	p->hello->fault_report_owner = p;
 	p->hello->fault_report = m4_user_fault_report;
+	p->hello->recovery = m4_user_recovery;
 	smp_store_release(&p->hello->notify_lane, lane);
 	return 0;
 }

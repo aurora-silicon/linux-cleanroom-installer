@@ -1368,6 +1368,7 @@ static int m4_user_compute_packet_retired_locked(struct m4_user_job *j, u32 inde
 		.timestamp_start = m4_store_read64(n->counter->map.vaddr + GPU_M4_EXEC_COMPUTE_STAMPS),
 		.timestamp_end = m4_store_read64(n->counter->map.vaddr + GPU_M4_EXEC_COMPUTE_STAMPS + 8),
 		.ignore_busy = m4_user_wire_overlapped(j),
+		.aborted = j->cmd[index].abort_proven,
 	};
 	for (u32 i = 0; i < 3; i++)
 		observed.queue_consumer[i] = m4_user_qi_consumer(p, queue, i);
@@ -1843,8 +1844,10 @@ static int m4_user_prepare_locked(void *owner, struct gpu_m4_drm_provider_job *j
 	if (!ret)
 		ret = m4_user_cross_locked(p, j);
 	m4_user_start_account(M4_USER_START_IDLE, start);
-	if (!ret)
+	if (!ret) {
 		j->prepared = true;
+		j->recoveries = p->user_recoveries;
+	}
 	return ret;
 }
 
@@ -1880,6 +1883,10 @@ static int m4_user_inflight2_admit_locked(struct m4_gpu_provider_runtime *p,
 	lockdep_assert_held(&p->hello->gpu->lock);
 	if (IS_ERR(j) || &j->item != candidate || !j->bank_held || j->prepared || j->published)
 		goto vetoed;
+	if (p->user_recovery_exclusive) {
+		veto = M4_USER_VETO_DEPTH;
+		goto vetoed;
+	}
 	gpu_m4_drm_provider_job_view(j->core_job, &view);
 	if (!view.batch || view.batch->count != j->command_count)
 		goto vetoed;
@@ -2298,6 +2305,332 @@ static bool m4_user_command_pending_locked(struct m4_user_job *j,
 	return target && (s32)(stamp - target) < 0;
 }
 
+/* Same-boot recovery (q19/q20 recovery contracts). At the firmware's
+ * pre-recovery stop the snapshot at FirmwareData +0x40b8 lists the affected
+ * works (bit 0 valid, bit 1 guilty, bit 3 pending TA cleanup, stamp ID bits
+ * 10:4, exact stamp at +4): each resolves by (held event, target) to a
+ * published command of an in-flight job, which then fails its job (-EIO,
+ * guilty or collateral). The selected fault bank's context (bits 22:17)
+ * names the faulting VM when it is a dedicated one: its in-flight jobs fail
+ * too. Every other work unfinished at the first recovery record (target
+ * beyond its event's in-order stage frontier then) is a suspect: the
+ * firmware resumes it and it retires with its ordinary full receipt, or, if
+ * the firmware passed it without completing it (no user stamp/timestamps),
+ * with an aborted receipt after a grace period, failing its job (-EIO).
+ * Aborted units are never reused. Everything else continues unaffected.
+ */
+#define M4_USER_ABORT_GRACE_NS (20 * NSEC_PER_MSEC)
+
+static u32 m4_user_command_target(const struct m4_user_job *j, u32 index)
+{
+	if (j->cmd[index].engine_mask & BIT(2))
+		return j->compute_reservation ?
+			j->compute_reservation[index].chronology.target_stamp : 0;
+	return j->render_reservation ? j->render_reservation[index].chronology.target_stamp : 0;
+}
+
+static int m4_user_recovery_engine(u32 event_slot)
+{
+	return event_slot == 15 ? 2 : event_slot == 0x70 ? 0 : event_slot == 0x71 ? 1 : -1;
+}
+
+/* A published unreceipted command of an in-flight job by event engine and
+ * exact stamp target (a recovery snapshot entry's identity).
+ */
+static struct m4_user_job *m4_user_recovery_find_locked(struct m4_gpu_provider_runtime *p,
+	int engine, u32 value, u32 *index)
+{
+	for (u32 i = 0; engine >= 0 && i < M4_USER_INFLIGHT_MAX; i++) {
+		struct m4_user_job *j;
+
+		if (!p->user_inflight[i].job)
+			continue;
+		j = m4_user_lane_job_locked(p, p->user_inflight[i].job);
+		if (IS_ERR_OR_NULL(j))
+			continue;
+		for (u32 c = j->completed_count; c < j->published_count && c < ARRAY_SIZE(j->cmd); c++)
+			if (j->cmd[c].published && !j->cmd[c].receipt &&
+			    (j->cmd[c].engine_mask & BIT(engine)) &&
+			    m4_user_command_target(j, c) == value) {
+				*index = c;
+				return j;
+			}
+	}
+	return NULL;
+}
+
+/* Native pre-acknowledgement TA cleanup: an affected entry with pending TA
+ * cleanup (flags & 9 == 9) whose TA has not completed gets its published TPC
+ * span (TA work +0x768 bytes of the unit's TPC resource) zeroed through the
+ * retained NC mapping before the host answers 2.
+ */
+static int m4_user_recovery_tpc_locked(struct m4_gpu_provider_runtime *p,
+	const struct m4_ready_recovery *rec, struct m4_user_job *j, u32 index)
+{
+	const struct m4_user_render_native *n = m4_user_native_render(j->native_stage, index);
+	u32 target = m4_user_command_target(j, index);
+	u64 length;
+
+	if (!n || !n->tpc || !n->tpc->map.vaddr || !n->work[0] || !n->work[0]->map.vaddr)
+		return -ESTALE;
+	/* The TA frontier before the recovery: forced progress is no receipt. */
+	if (gpu_m4_exec_stamp_reached(rec->stage[0], target))
+		return 0; /* Its TA completed: nothing to clean. */
+	length = get_unaligned_le64(n->work[0]->map.vaddr + 0x768);
+	if (!length || length > n->tpc->size)
+		return -ERANGE;
+	memset(n->tpc->map.vaddr, 0, length);
+	dma_wmb();
+	dev_warn(p->hello->gpu->dev, "GPU recovery: TA of asid %u command %u target %#x incomplete: TPC %#llx bytes cleared\n",
+		j->asid, index, target, length);
+	return 0;
+}
+
+static int m4_user_recovery_mark_locked(struct m4_gpu_provider_runtime *p,
+	struct m4_ready_recovery *rec)
+{
+	struct device *dev = p->hello->gpu->dev;
+	void *fw = p->ready->input.object[GPU_M4_FIRMWARE_DATA];
+	int engine = m4_user_recovery_engine(rec->event_slot);
+	u32 asid = rec->bank_valid ? (rec->bank_info >> 17) & 0x3f : 0;
+	u32 entries = 0, resolved = 0, unmatched = 0, guilty = 0, cleaned = 0;
+	u32 suspects = 0, oldest_target = 0;
+	struct m4_user_job *oldest = NULL;
+	int ret = 0;
+
+	/* 1. The firmware's affected-work snapshot (valid prefix of 448). */
+	for (u32 i = 0; i < 448; i++) {
+		u32 flags = m4_ready_read32(fw + 0x40b8 + 8 * i);
+		u32 value = m4_ready_read32(fw + 0x40bc + 8 * i);
+		u32 id = (flags >> 4) & 0x7f, index = 0;
+		struct m4_user_job *j;
+
+		if (!(flags & 1))
+			break;
+		entries++;
+		j = m4_user_recovery_find_locked(p, m4_user_recovery_engine(id), value, &index);
+		if (i < 16 || !j)
+			dev_warn(dev, "GPU recovery %u: entry %u flags %#x event %#x stamp %#x -> %s asid %u command %u\n",
+				rec->epoch, i, flags, id, value, j ? "work" : "UNMATCHED",
+				j ? j->asid : 0, index);
+		if (!j) {
+			unmatched++;
+			continue;
+		}
+		resolved++;
+		j->cmd[index].abort = rec->epoch;
+		j->cmd[index].abort_ns = j->cmd[index].abort_wait_ns = 0;
+		/* Guilty (bit 1) and collateral entries both fail their job. */
+		if (!j->abort_error)
+			j->abort_error = -EIO;
+		guilty += !!(flags & 2);
+		if ((flags & 9) == 9 && (j->cmd[index].engine_mask & BIT(0))) {
+			ret = m4_user_recovery_tpc_locked(p, rec, j, index);
+			if (ret) {
+				dev_err(dev, "GPU recovery %u: TPC cleanup of entry %u failed (%d)\n",
+					rec->epoch, i, ret);
+				return ret;
+			}
+			cleaned++;
+		}
+	}
+	/* 2. Every other work still unfinished at the first record is a suspect
+	 * (aborted receipt after the grace period); the faulting dedicated
+	 * context's jobs fail.
+	 */
+	for (u32 i = 0; i < M4_USER_INFLIGHT_MAX; i++) {
+		struct m4_user_job *j;
+		u32 marked = 0;
+
+		if (!p->user_inflight[i].job)
+			continue;
+		j = m4_user_lane_job_locked(p, p->user_inflight[i].job);
+		if (IS_ERR_OR_NULL(j))
+			continue;
+		for (u32 c = j->completed_count; c < j->published_count && c < ARRAY_SIZE(j->cmd); c++) {
+			struct m4_user_command *cmd = &j->cmd[c];
+			u32 target = m4_user_command_target(j, c);
+			bool unfinished = false;
+
+			if (!cmd->published || cmd->receipt || !target)
+				continue;
+			if (cmd->abort == rec->epoch) {
+				marked++;
+				continue;
+			}
+			for (u32 e = 0; e < 3; e++)
+				if (cmd->engine_mask & BIT(e))
+					unfinished |= !gpu_m4_exec_stamp_reached(rec->stage[e], target);
+			if (!unfinished)
+				continue;
+			cmd->abort = rec->epoch;
+			cmd->abort_ns = cmd->abort_wait_ns = 0;
+			marked++;
+			suspects++;
+			if (engine >= 0 && (cmd->engine_mask & BIT(engine)) &&
+			    (!oldest || !gpu_m4_exec_stamp_reached(target, oldest_target + 0x100))) {
+				oldest = j;
+				oldest_target = target;
+			}
+		}
+		if (marked && asid >= 2 && j->asid == asid && !j->abort_error) {
+			j->abort_error = -EIO;
+			guilty++;
+		}
+	}
+	if (!resolved && !guilty && oldest) {
+		/* No snapshot entry and no dedicated faulting context. */
+		if (!oldest->abort_error)
+			oldest->abort_error = -EIO;
+		guilty++;
+	}
+	dev_warn(dev, "GPU recovery %u: reason %u forced %u matches %u queue %#x context %u event %#x stages %#x/%#x/%#x: %u entries (%u resolved, %u unmatched, %u TPC cleared), %u more suspects, %u guilty (bank %#llx va %#llx)\n",
+		rec->epoch, m4_ready_read32(fw + 0x4ecc), m4_ready_read32(fw + 0x4fc0),
+		m4_ready_read32(fw + 0x4ec0), m4_ready_read32(fw + 0x4ec8), asid, rec->event_slot,
+		rec->stage[0], rec->stage[1], rec->stage[2], entries, resolved, unmatched, cleaned,
+		suspects, guilty, (unsigned long long)rec->bank_info,
+		(unsigned long long)(rec->bank_address << 6));
+	/* An affected work that resolves to no retained published owner: its
+	 * error cannot be reported, so the recovery is refused (fail-stop).
+	 */
+	return unmatched ? -ENOENT : 0;
+}
+
+static int m4_user_recovery(void *owner, u32 step, struct m4_ready_recovery *rec)
+{
+	struct m4_gpu_provider_runtime *p = owner;
+
+	lockdep_assert_held(&p->hello->gpu->lock);
+	/* The attribution needs the runtime-wide stage cells' frontiers. */
+	if (!p->ordinary || !p->execution || !p->user_lane || !p->user_stage_cells || p->error)
+		return -ENODEV;
+	switch (step) {
+	case M4_RECOVERY_BEGIN:
+		for (u32 e = 0; e < 3; e++)
+			rec->stage[e] = m4_user_stage_read(p, e);
+		return 0;
+	case M4_RECOVERY_MARK:
+		return m4_user_recovery_mark_locked(p, rec);
+	case M4_RECOVERY_RESUMED:
+		dev_warn(p->hello->gpu->dev, "GPU recovery %u complete (%u total): answered after %llu us, resumed after %llu us\n",
+			rec->epoch, rec->count, (rec->answer_ns - rec->start_ns) / 1000,
+			(rec->resumed_ns - rec->start_ns) / 1000);
+		/* Fresh work runs alone until one job of it retires (canary). */
+		p->user_recoveries++;
+		p->user_recovery_exclusive = true;
+		gpu_m4_drm_provider_lane_notify(p->user_lane);
+		return 0;
+	}
+	return -EINVAL;
+}
+
+/* cursor passed this command's own entries [before, next) within producer. */
+static bool m4_user_ring_passed(u32 cursor, u32 producer, u32 before, u32 next)
+{
+	u32 done = (cursor - before) & 255;
+
+	return done >= ((next - before) & 255) && done <= ((producer - before) & 255);
+}
+
+/* A suspect whose ordinary full receipt failed (full: that result): the
+ * aborted receipt, once the firmware moved past it on every engine it used
+ * (each stage frontier reached its target within the published tail, each
+ * queue and pipe consumed its entries) and the full receipt stayed
+ * incomplete for the grace period. Its own completion state (UMA completed
+ * count, timestamps) is not required: the work never completed; its unit
+ * never runs again.
+ */
+static int m4_user_command_aborted_locked(struct m4_user_job *j, u32 index, int full)
+{
+	struct m4_gpu_provider_runtime *p = j->runtime;
+	struct m4_user_command *cmd = &j->cmd[index];
+	struct m4_user_native_history *history = j->native_stage ? j->native_stage->pending : NULL;
+	u32 target = m4_user_command_target(j, index);
+	u64 submitted = 0, completed = 0, now;
+	int ret;
+
+	if (!target || !history || history->job != j->core_job || history->complete ||
+	    index >= history->count || index != j->completed_count || !cmd->published ||
+	    cmd->receipt)
+		return M4_USER_WHY(-ESTALE, "abort %u target=%#x pending=%d", index, target, !!history);
+	/* REMOVE-DEBUG: a suspect still unproven one second in: say why, once. */
+	now = ktime_get_ns();
+	if (!cmd->abort_wait_ns)
+		cmd->abort_wait_ns = now;
+	if (cmd->abort_wait_ns != 1 && now - cmd->abort_wait_ns > NSEC_PER_SEC) {
+		cmd->abort_wait_ns = 1;
+		for (u32 e = 0; e < 3; e++) {
+			const struct m4_user_engine *w = &cmd->wire[e];
+			struct m4_ready_buffer *q = p->execution->queue[e];
+			void *pipe = p->ready->buffer[GPU_M4_OBJECT_COUNT + e * 2].cpu;
+
+			if (cmd->engine_mask & BIT(e))
+				dev_warn(p->hello->gpu->dev, "GPU recovery %u: suspect asid %u command %u/%u engine %u full %d: stage %#x target %#x tail %#x queue %u/%u own %u-%u pipe %u/%u/%u own %u-%u\n",
+					cmd->abort, j->asid, index, j->command_count, e, full,
+					m4_user_stage_read(p, e), target, m4_user_stage_tail(p, e),
+					m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x30),
+					m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x40),
+					w->queue_before, w->queue_next, m4_ready_read32(pipe),
+					m4_ready_read32(pipe + 0x10), m4_ready_read32(pipe + 0x20),
+					w->pipe_before, w->pipe_next);
+		}
+	}
+	for (u32 e = 0; e < 3; e++) {
+		const struct m4_user_engine *w = &cmd->wire[e];
+		struct m4_ready_buffer *q = p->execution->queue[e];
+		void *pipe = p->ready->buffer[GPU_M4_OBJECT_COUNT + e * 2].cpu;
+		u32 pipe_write;
+
+		if (!(cmd->engine_mask & BIT(e)))
+			continue;
+		ret = gpu_m4_exec_stage_check(m4_user_stage_read(p, e), target,
+			m4_user_stage_tail(p, e));
+		if (ret)
+			return ret == -EAGAIN ? ret : M4_USER_WHY(ret, "abort %u engine %u stage %#x target %#x tail %#x",
+				index, e, m4_user_stage_read(p, e), target, m4_user_stage_tail(p, e));
+		pipe_write = m4_ready_read32(pipe + 0x20);
+		if (!m4_user_ring_passed(m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x30),
+				m4_ready_read32(q[M4_EXEC_QUEUE_STATE].cpu + 0x40),
+				w->queue_before, w->queue_next) ||
+		    !m4_user_ring_passed(m4_ready_read32(pipe), pipe_write, w->pipe_before, w->pipe_next) ||
+		    !m4_user_ring_passed(m4_ready_read32(pipe + 0x10), pipe_write, w->pipe_before,
+				w->pipe_next))
+			return -EAGAIN;
+	}
+	if (!cmd->abort_ns)
+		cmd->abort_ns = now;
+	if (now - cmd->abort_ns < M4_USER_ABORT_GRACE_NS)
+		return -EAGAIN;
+	if (cmd->engine_mask & BIT(2)) {
+		/* The ordinary compute receipt, observed as aborted: it also waits
+		 * for the firmware to drain the UMA counts, and records a real
+		 * observation that later reuse proofs of its slot can check.
+		 */
+		cmd->abort_proven = true;
+		ret = m4_user_compute_packet_retired_locked(j, index);
+		cmd->abort_proven = false;
+		if (ret)
+			return ret;
+		submitted = history->command[index].submitted;
+		completed = history->command[index].completed;
+	} else {
+		history->command[index].uma_slot = cmd->uma_slot;
+		history->command[index].parameter_id =
+			m4_user_native_slot_parameter(DRM_ASAHI_CMD_RENDER, cmd->uma_slot);
+	}
+	history->command[index].aborted = true;
+	if (!j->abort_error) {
+		/* Aborted outside the faulting VM: an innocent victim. */
+		j->abort_error = -EIO;
+		dev_err(p->hello->gpu->dev, "GPU recovery %u: work of asid %u aborted collaterally\n",
+			cmd->abort, j->asid);
+	}
+	dev_warn(p->hello->gpu->dev, "GPU recovery %u: aborted command %u/%u (asid %u engines %#x target %#x full %d) passed; uma %llu/%llu\n",
+		cmd->abort, index, j->command_count, j->asid, cmd->engine_mask, target, full,
+		(unsigned long long)submitted, (unsigned long long)completed);
+	return 0;
+}
+
 /* Drain the completed prefix of the published window. Each full per-command
  * hardware receipt advances the head and may append the next command into
  * its own lease; only the whole child's receipt returns success to the real
@@ -2338,7 +2671,8 @@ static int m4_user_retired_locked(void *owner, struct gpu_m4_drm_provider_job *j
 			return M4_USER_WHY(-ESTALE, "retire head %u/%u published=%u", head,
 				j->command_count, j->published_count);
 		/* A recent snapshot covers a poll that observes no progress. */
-		if (service && m4_user_command_pending_locked(j, &view) && m4_user_poll_fresh(p)) {
+		if (service && !j->cmd[head].abort && m4_user_command_pending_locked(j, &view) &&
+		    m4_user_poll_fresh(p)) {
 			ret = m4_user_latched_locked(p);
 			if (ret)
 				return M4_USER_WHY(ret, "retire %u latched", head);
@@ -2348,7 +2682,7 @@ static int m4_user_retired_locked(void *owner, struct gpu_m4_drm_provider_job *j
 		ret = service ? m4_user_service_locked(p) : m4_user_live_health_locked(p);
 		if (ret)
 			return M4_USER_WHY(ret, "retire %u live health", head);
-		if (m4_user_command_pending_locked(j, &view))
+		if (!j->cmd[head].abort && m4_user_command_pending_locked(j, &view))
 			return 0;
 		/* Possible completion outside the worker's service: full graph
 		 * health and token authority first (one live pass per lane-worker
@@ -2365,6 +2699,9 @@ static int m4_user_retired_locked(void *owner, struct gpu_m4_drm_provider_job *j
 		ret = view.batch->commands[head].type == DRM_ASAHI_CMD_COMPUTE ?
 			m4_user_compute_packet_retired_locked(j, head) :
 			m4_user_render_packet_retired_locked(j, head);
+		/* A recovery suspect without its full receipt: maybe aborted. */
+		if (ret && j->cmd[head].abort)
+			ret = m4_user_command_aborted_locked(j, head, ret);
 		if (ret == -EAGAIN)
 			return 0;
 		if (ret)
@@ -2376,8 +2713,14 @@ static int m4_user_retired_locked(void *owner, struct gpu_m4_drm_provider_job *j
 		j->cmd[head].receipt = true;
 		j->completed_count++;
 		m4_user_service_void(p); /* Progress: the next service resnapshots. */
-		if (j->completed_count == j->command_count)
+		if (j->completed_count == j->command_count) {
+			/* Recovered abort: every published work passed, the job
+			 * retires and fails with that error.
+			 */
+			if (j->abort_error)
+				gpu_m4_drm_provider_job_abort_locked(job, j->abort_error);
 			return 1; /* Core performs cache/version retirement, then lane notification. */
+		}
 		j->command_index = j->completed_count;
 		ret = m4_user_publish_window_locked(j);
 		if (ret)
@@ -2389,6 +2732,8 @@ static int m4_user_retired_locked(void *owner, struct gpu_m4_drm_provider_job *j
 static void m4_user_job_retired_locked(struct m4_gpu_provider_runtime *p, struct m4_user_job *j)
 {
 	lockdep_assert_held(&p->hello->gpu->lock);
+	if (!j->abort_error && j->recoveries == p->user_recoveries)
+		p->user_recovery_exclusive = false;
 	if (j->token) {
 		gpu_m4_drm_timestamp_alias_token_complete_locked(j->token);
 		j->token = NULL;
@@ -2442,9 +2787,11 @@ static void m4_user_job_retired_locked(struct m4_gpu_provider_runtime *p, struct
 	schedule_work(&p->user_reap);
 	/* Receipt/last-owner/cache bookkeeping above is complete. An execution
 	 * window child now lets its aggregate materialize the next window, outside
-	 * every lock; ordinary jobs are a no-op.
+	 * every lock; ordinary jobs are a no-op. A recovered abort completed
+	 * with its error, which already woke the aggregate to fail.
 	 */
-	WARN_ON(gpu_m4_drm_provider_job_window_complete_locked(j->core_job));
+	if (!j->abort_error)
+		WARN_ON(gpu_m4_drm_provider_job_window_complete_locked(j->core_job));
 }
 
 /* REMOVE-DEBUG fault attribution (READY hook, owner mutex held): every

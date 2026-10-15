@@ -529,6 +529,172 @@ static void m4_store_capture_event(struct m4_gpu_hello *h, u32 index,
 	gpu_m4_evidence_append(v, 0x800 + index, data, sizeof(data), 0, 0, 0);
 }
 
+/* Same-boot recovery from a firmware-initiated recovery (a GPU fault the
+ * firmware itself stops for, e.g. a translation fault outside the user VA
+ * window). The firmware publishes a type-0x16 recovery statistics record and
+ * a type-4 event, then stops at FirmwareData +0x4fb0 = 1. The host answers
+ * 2; the firmware aborts the faulting work, passes its stage target and stops
+ * at 3; the host answers 0 and the firmware resumes every other work. The
+ * ordinary runtime marks the aborted work (its job fails with an error,
+ * everything else continues). 0: the old fail-stop.
+ */
+static bool gpu_recovery = true;
+module_param(gpu_recovery, bool, 0644);
+MODULE_PARM_DESC(gpu_recovery, "Answer firmware-initiated GPU recoveries and fail only the aborted work (default 1; 0 = fail-stop)");
+
+/* Bounds: a recovery whose phases do not complete in time, or more than
+ * this many recoveries in ten seconds, fail-stop as before.
+ */
+#define M4_RECOVERY_TIMEOUT_MS 1000U
+#define M4_RECOVERY_STORM 32U
+
+static int m4_ready_drain_once(struct m4_gpu_hello *h);
+
+static void m4_ready_recovery_bank(struct m4_gpu_hello *h, struct m4_ready_recovery *rec)
+{
+	u8 sample[0x20];
+
+	if (rec->bank_valid || !m4_store_sample_fault(h, sample) ||
+	    get_unaligned_le32(sample) != 1 || get_unaligned_le32(sample + 4) != 1 ||
+	    !(get_unaligned_le64(sample + 8) & 1))
+		return;
+	rec->bank_info = get_unaligned_le64(sample + 8);
+	rec->bank_address = get_unaligned_le64(sample + 0x10);
+	rec->bank_valid = true;
+}
+
+/* A drained recovery record. False: no recovery (disabled, no ordinary
+ * runtime, a failed owner, a recovery storm or a refused begin); the caller
+ * latches its error as before.
+ */
+static bool m4_ready_recovery_note(struct m4_gpu_hello *h, const u8 *record, bool event)
+{
+	struct m4_gpu_ready *r = h->ready;
+	struct m4_ready_recovery *rec = &r->recovery;
+
+	if (!READ_ONCE(gpu_recovery) || !h->recovery || r->error ||
+	    atomic_read(&h->callback_error))
+		return false;
+	if (!rec->state) {
+		u64 now = ktime_get_ns();
+
+		if (now - rec->window_ns > 10 * NSEC_PER_SEC) {
+			rec->window_ns = now;
+			rec->window_count = 0;
+		}
+		if (++rec->window_count > M4_RECOVERY_STORM) {
+			dev_err(h->gpu->dev, "GPU recovery storm: %u recoveries in 10 s; fail-stop\n",
+				rec->window_count - 1);
+			return false;
+		}
+		rec->state = 1;
+		rec->epoch++;
+		rec->start_ns = now;
+		rec->answer_ns = 0;
+		rec->event_slot = ~0U;
+		rec->bank_valid = rec->have_event = rec->have_statistics = false;
+		rec->marked = rec->answered = false;
+		memset(rec->stage, 0, sizeof(rec->stage));
+		m4_ready_recovery_bank(h, rec);
+		if (h->recovery(h->fault_report_owner, M4_RECOVERY_BEGIN, rec)) {
+			rec->state = 0;
+			return false;
+		}
+	}
+	if (event) {
+		memcpy(rec->event, record, sizeof(rec->event));
+		rec->event_slot = get_unaligned_le32(record + 0xc);
+		rec->have_event = true;
+	} else {
+		memcpy(rec->statistics, record, sizeof(rec->statistics));
+		rec->have_statistics = true;
+	}
+	return true;
+}
+
+/* Drive the noted recovery to completion under the owner mutex: answer the
+ * pre-recovery stop once the type-4 event is drained (the runtime marks the
+ * aborted work first), then the post-recovery stop. Further records are
+ * drained meanwhile. Nothing else publishes while the mutex is held, so no
+ * other path observes a nonzero phase. Bounded; a stuck firmware fails.
+ */
+static int m4_ready_recovery_run(struct m4_gpu_hello *h)
+{
+	struct m4_gpu_ready *r = h->ready;
+	struct m4_ready_recovery *rec = &r->recovery;
+	void *word = r->input.object[GPU_M4_FIRMWARE_DATA] + 0x4fb0;
+	u64 deadline = rec->start_ns + (u64)M4_RECOVERY_TIMEOUT_MS * NSEC_PER_MSEC;
+	int ret = 0;
+
+	rec->running = true;
+	for (;;) {
+		u32 phase = m4_ready_read32(word);
+		u64 now = ktime_get_ns();
+
+		if (phase == 1 && !rec->answered &&
+		    (rec->have_event || now - rec->start_ns > 50 * NSEC_PER_MSEC)) {
+			rec->generation = (u64)m4_ready_read32(r->input.object[GPU_M4_FIRMWARE_DATA] + 0x4fa0) |
+				(u64)m4_ready_read32(r->input.object[GPU_M4_FIRMWARE_DATA] + 0x4fa4) << 32;
+			/* The event names the previous generation: one per recovery. */
+			if (rec->have_event &&
+			    get_unaligned_le64(rec->event + 4) + 1 != rec->generation)
+				dev_warn(h->gpu->dev, "GPU recovery %u: event generation %llu, firmware %llu\n",
+					rec->epoch, get_unaligned_le64(rec->event + 4), rec->generation);
+			m4_ready_recovery_bank(h, rec);
+			if (!rec->marked) {
+				rec->marked = true;
+				ret = h->recovery(h->fault_report_owner, M4_RECOVERY_MARK, rec);
+				if (ret)
+					break;
+			}
+			/* Ordered against every snapshot read and repair above. */
+			mb();
+			m4_ready_write32(word, 2);
+			mb();
+			rec->answered = true;
+			rec->answer_ns = now;
+		} else if (phase == 3 && rec->answered) {
+			u64 generation = (u64)m4_ready_read32(r->input.object[GPU_M4_FIRMWARE_DATA] + 0x4fa0) |
+				(u64)m4_ready_read32(r->input.object[GPU_M4_FIRMWARE_DATA] + 0x4fa4) << 32;
+
+			/* A nested recovery during this one is not recoverable here. */
+			if (generation != rec->generation) {
+				dev_err(h->gpu->dev, "GPU recovery %u: generation %llu -> %llu during recovery; fail-stop\n",
+					rec->epoch, rec->generation, generation);
+				ret = -EPROTO;
+				break;
+			}
+			mb();
+			m4_ready_write32(word, 0);
+			mb();
+			rec->state = 0;
+			rec->count++;
+			rec->resumed_ns = now;
+			r->recovery_phase = 0;
+			ret = h->recovery(h->fault_report_owner, M4_RECOVERY_RESUMED, rec);
+			break;
+		} else if (phase > 3 || (phase == 0 && rec->answered)) {
+			dev_err(h->gpu->dev, "GPU recovery %u: unexpected phase %u (answered=%u)\n",
+				rec->epoch, phase, rec->answered);
+			ret = -EPROTO;
+			break;
+		}
+		if (now > deadline) {
+			dev_err(h->gpu->dev, "GPU recovery %u: phase %u after %u ms (event=%u statistics=%u answered=%u); fail-stop\n",
+				rec->epoch, phase, M4_RECOVERY_TIMEOUT_MS, rec->have_event,
+				rec->have_statistics, rec->answered);
+			ret = -EIO;
+			break;
+		}
+		ret = m4_ready_drain_once(h);
+		if (ret)
+			break;
+		usleep_range(20, 50);
+	}
+	rec->running = false;
+	return ret;
+}
+
 static int m4_ready_drain_once(struct m4_gpu_hello *h)
 {
 	struct m4_gpu_ready *r = h->ready;
@@ -614,7 +780,8 @@ static int m4_ready_drain_once(struct m4_gpu_hello *h)
 					/* %*ph caps each chunk at 64 bytes: retain all 72. */
 					dev_err(h->gpu->dev, "GPU recovery statistics: %*ph %*ph %*ph\n",
 						32, record, 32, record + 32, 8, record + 64);
-					error = -EIO;
+					if (!m4_ready_recovery_note(h, record, false))
+						error = -EIO;
 				}
 			} else {
 				r->event_records++;
@@ -629,7 +796,8 @@ static int m4_ready_drain_once(struct m4_gpu_hello *h)
 							32, record, 32, record + 32, 8, record + 64);
 						unexpected_event_logged = true;
 					}
-					if (!error)
+					if (!(type == 4 && m4_ready_recovery_note(h, record, true)) &&
+					    !error)
 						error = -EPROTO;
 				}
 			}
@@ -639,8 +807,10 @@ static int m4_ready_drain_once(struct m4_gpu_hello *h)
 	}
 	m4_store_seal_evidence(h);
 	if (error)
-		M4_READY_WHY(h, error, "drain %s record (logged above)",
+		return M4_READY_WHY(h, error, "drain %s record (logged above)",
 			     error == -EIO ? "recovery statistics" : "unexpected event");
+	if (r->recovery.state && !r->recovery.running)
+		error = m4_ready_recovery_run(h);
 	return error;
 }
 
