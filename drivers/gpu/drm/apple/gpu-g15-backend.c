@@ -258,9 +258,16 @@ MODULE_PARM_DESC(compute_horizon, "Ready compute-only jobs of one queue publishe
  * horizon X and thresholds are published before the running prefix's last
  * FS completes: no PB catch-up, notification and full drain at every prefix
  * boundary. The first TA of every prefix keeps its strict (type 1) wait on
- * the previous prefix's last FS. Compute-only prefixes still wait for the
- * consumption of the previous record, which lets further ready jobs join
- * their horizon.
+ * the previous prefix's last FS.
+ *
+ * A compute-only horizon waits for the consumption of the previous record,
+ * which the firmware reports only after that prefix's last work (round-10
+ * contract A1), so that further ready jobs join it: posted at once, every
+ * horizon would hold one job and pay the per-horizon boundary. It is posted
+ * behind the unconsumed record as soon as its queue owns (published and
+ * not retired, or ready) as many jobs as at any of its last 32 arrivals:
+ * no further job of a client keeping that many outstanding can arrive
+ * before a retirement, so waiting longer only idles the GPU.
  */
 static unsigned int prefix_renders = G15_RENDER_SLOTS / 2;
 module_param(prefix_renders, uint, 0644);
@@ -594,6 +601,16 @@ struct g15_backend {
 	u64 st_pass_sync;			/* pass slots reset at claim */
 	u64 st_slot_sync;			/* compute slots scrubbed at claim */
 	u64 st_grouped;				/* jobs published behind another in a compute horizon */
+	/*
+	 * Compute horizon formation: compute-only prefixes by jobs (1..16), why
+	 * grouping stopped (no further ready job, the horizon cap, compute
+	 * slots, a job of the queue that does not qualify), those published
+	 * behind a running prefix and of them behind its unconsumed record,
+	 * and why ready jobs stayed unpublished (both flights published, a
+	 * channel record unconsumed, no free slot).
+	 */
+	u64 st_hz[G15_HORIZON_JOBS], st_hz_stop[4], st_hz_behind, st_hz_ahead;
+	u64 st_hold[3];
 	bool chan_wait;		/* a ready prefix waits only for a record's consumption */
 	spinlock_t ct_lock;
 	struct work_struct ct_clear;
@@ -1577,6 +1594,9 @@ struct g15_queue {
 	u32 priority;
 	u64 turn;			/* be->turn of its last publication (be->lock) */
 	u64 fence_context, seqno;	/* seqno under be->lock */
+	/* Jobs it owned (published and not retired, or ready) at its last arrivals. */
+	u8 owned[32];
+	u32 owned_i;
 };
 
 /* Compute: ts 0/1 start/end. Render: 0/1 vertex start/end, 2/3 fragment. */
@@ -2908,6 +2928,48 @@ static void g15_deadline(struct g15_backend *be)
  * horizons (new_queue 0). Returns -EAGAIN when it cannot be appended yet
  * (no free slot, or a channel record still unconsumed).
  */
+/*
+ * Jobs the compute horizon of job could take now, besides job itself: the
+ * grouping rules of g15_publish, at most max - 1.
+ */
+static u32 g15_horizon_ready(struct g15_backend *be, struct g15_job *job, u32 computes,
+			     u32 free_c, u32 max)
+{
+	struct g15_job *j2;
+	u32 n = 0;
+
+	list_for_each_entry(j2, &be->pending, link) {
+		bool compute_only = true;
+
+		if (1 + n >= max)
+			break;
+		if (j2 == job || j2->q != job->q)
+			continue;
+		for (u32 k = 0; k < j2->count; k++)
+			compute_only &= !j2->cmds[k].render;
+		if (!compute_only || j2->vm != job->vm || j2->sent || !j2->count ||
+		    computes + j2->count > free_c)
+			break;
+		computes += j2->count;
+		n++;
+	}
+	return n;
+}
+
+/* Jobs of queue q in published prefixes (be->lock held). */
+static u32 g15_queue_published(struct g15_backend *be, const struct g15_queue *q)
+{
+	u32 n = 0;
+
+	for (u32 k = 0; k < be->fl_count; k++) {
+		const struct g15_flight *f = &be->fl[(be->fl_first + k) % G15_FLIGHTS];
+
+		if (f->job->q == q)
+			n += 1 + f->group_count;
+	}
+	return n;
+}
+
 static int g15_publish(struct g15_backend *be, struct g15_job *job)
 {
 	struct g15_gpu *gpu = be->gpu;
@@ -2920,6 +2982,7 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	u32 last_render = U32_MAX;	/* index of the prefix's last render member */
 	bool render0 = job->cmds[i].render, rebuild = false;
 	u8 *ta = NULL, *fs = NULL, *tas = NULL, *fss = NULL;
+	int hz_stop = -1;	/* compute-only horizon: why grouping stopped */
 	struct g15_geom geo;
 	int ret = 0;
 
@@ -2966,6 +3029,14 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 	 * retirement.
 	 */
 	ahead = overlap && renders && READ_ONCE(submit_ahead);
+	if (overlap && !renders && end == job->count && READ_ONCE(submit_ahead)) {
+		u32 max = clamp(READ_ONCE(compute_horizon), 1U, (u32)G15_HORIZON_JOBS);
+		u32 ready = 1 + g15_horizon_ready(be, job, computes, free_c, max), depth = 0;
+
+		for (u32 k = 0; k < ARRAY_SIZE(job->q->owned); k++)
+			depth = max_t(u32, depth, job->q->owned[k]);
+		ahead = ready >= max || ready + g15_queue_published(be, job->q) >= depth;
+	}
 	for (u32 ch = 0; ch < 3; ch++) {
 		u32 consumer = g15_r32(gpu, G15_CH_STATE(ch));
 
@@ -3034,18 +3105,26 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 		u32 max = clamp(READ_ONCE(compute_horizon), 1U, (u32)G15_HORIZON_JOBS);
 		struct g15_job *j2, *tmp;
 
+		hz_stop = 0;
 		list_for_each_entry_safe(j2, tmp, &be->pending, link) {
 			bool compute_only = true;
 
-			if (1 + f->group_count >= max)
+			if (1 + f->group_count >= max) {
+				hz_stop = 1;
 				break;
+			}
 			if (j2 == job || j2->q != job->q)
 				continue;
 			for (u32 k = 0; k < j2->count; k++)
 				compute_only &= !j2->cmds[k].render;
-			if (!compute_only || j2->vm != job->vm || j2->sent || !j2->count ||
-			    computes + j2->count > free_c)
+			if (!compute_only || j2->vm != job->vm || j2->sent || !j2->count) {
+				hz_stop = 3;
 				break;
+			}
+			if (computes + j2->count > free_c) {
+				hz_stop = 2;
+				break;
+			}
 			for (u32 k = 0; k < j2->count && !ret; k++)
 				ret = g15_prefix_compute(be, j2, &j2->cmds[k], &pf, f, false);
 			if (ret)
@@ -3122,6 +3201,12 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 		g15_deadline(be);
 	job->sent = end;
 	be->fl_count++;
+	if (hz_stop >= 0) {
+		be->st_hz[f->group_count]++;
+		be->st_hz_stop[hz_stop]++;
+		be->st_hz_behind += overlap;
+		be->st_hz_ahead += ahead;
+	}
 	if (rebuild) {
 		f->rebuild = true;
 		be->rebuild_live = true;
@@ -3447,8 +3532,11 @@ static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 		job = g15_pick(be);
 		if (tail && (be->fl_count >= clamp(READ_ONCE(max_inflight), 1U, (u32)G15_FLIGHTS) ||
 			     job->vm != tail->job->vm || be->r.reinit || be->fs_resync ||
-			     be->rebuild_live || be->preempt_global))
+			     be->rebuild_live || be->preempt_global)) {
+			be->st_hold[0] += be->fl_count >= clamp(READ_ONCE(max_inflight), 1U,
+							       (u32)G15_FLIGHTS);
 			break;
+		}
 		if (tail && tail->job != job && !list_empty(&tail->job->link))
 			be->st_yields++;	/* another queue's turn at a prefix boundary */
 		job->q->turn = ++be->turn;
@@ -3458,8 +3546,10 @@ static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 				list_del_init(&job->link);	/* fully published */
 			continue;
 		}
-		if (ret == -EAGAIN)
+		if (ret == -EAGAIN) {
+			be->st_hold[be->chan_wait ? 1 : 2]++;
 			break;		/* storage or channel still held: on a later retirement */
+		}
 		list_del_init(&job->link);
 		if (ret == -EIO || job->sent) {
 			/* Uncertain, or earlier commands ran: retain, stop the engine. */
@@ -3973,6 +4063,13 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 		   be->st_ct_sync, be->st_slot_sync, div_u64(be->st_starved_ns, 1000),
 		   div_u64(be->st_prep_ns, 1000), be->st_grouped, be->st_pass_sync);
 	seq_printf(m, "type0: fs2c %llu c2ta %llu\n", be->st_fs2c0, be->st_c2ta0);
+	seq_puts(m, "horizon:");
+	for (u32 k = 0; k < G15_HORIZON_JOBS; k++)
+		seq_printf(m, " %llu", be->st_hz[k]);
+	seq_printf(m, " stop %llu/%llu/%llu/%llu behind %llu hold %llu/%llu/%llu ahead %llu\n",
+		   be->st_hz_stop[0], be->st_hz_stop[1], be->st_hz_stop[2], be->st_hz_stop[3],
+		   be->st_hz_behind, be->st_hold[0], be->st_hold[1], be->st_hold[2],
+		   be->st_hz_ahead);
 	seq_printf(m, "pb: blocks %u/%u/%u requests %llu grown %llu refused %llu bad %llu\n",
 		   be->r.pb_init_blocks, be->r.pb_posted, be->r.pb_max, be->st_pb_req,
 		   be->st_pb_grown, be->st_pb_refused, be->st_pb_bad);
@@ -4459,6 +4556,13 @@ static struct dma_fence *g15_run(void *owner, void *cookie)
 	job->fence = dma_fence_get(fence);
 	kref_get(&job->ref);	/* engine */
 	list_add_tail(&job->link, &be->pending);
+	{
+		u32 owned = g15_queue_published(be, q);
+
+		list_for_each_entry(j, &be->pending, link)
+			owned += j->q == q;
+		q->owned[q->owned_i++ % ARRAY_SIZE(q->owned)] = min(owned, 255U);
+	}
 	g15_engine_next(be, &done);
 	if (be->fl_count)
 		g15_rearm(be);
