@@ -66,6 +66,17 @@ module_param(hwdata_cached, bool, 0444);
 MODULE_PARM_DESC(hwdata_cached, "Map the HardwareData pages holding HardwareDataB and the engine activity records ASC-cached (firmware AttrIndex 0); 0: AttrIndex 2");
 static unsigned int idle_standby_us = 2500;
 static unsigned int idle_min_conf = 500;	/* permille */
+/*
+ * Idle decision branch (round-10 contract D2): Globals +0x2c enables the
+ * firmware's idle decision and a nonzero +0x30 selects its predictive
+ * branch, which may power the GPU down immediately after any work. Under
+ * sustained low-duty submission (tens of us between works) its learned
+ * history turns that into a ~300-us power-up before 2-3% of the works,
+ * whatever the minimum confidence. 0 keeps the ordinary finite delay:
+ * the GPU powers down once it has been idle for the +0x9a0 delay (2,
+ * about 2 ms measured).
+ */
+static unsigned int idle_predictive;
 
 static u32 g15_permille_f32(u32 p)
 {
@@ -92,13 +103,14 @@ static int g15_idle_set(const char *val, const struct kernel_param *kp)
 	put_unaligned_le32(0x13, rec);
 	mutex_lock(&gpu->lock);
 	ret = g15_w32(gpu, G15_GLOBALS + 0x7a8, clamp(idle_standby_us, 100U, 100000U)) ?:
-	      g15_w32(gpu, G15_GLOBALS + 0x7c4, g15_permille_f32(idle_min_conf));
+	      g15_w32(gpu, G15_GLOBALS + 0x7c4, g15_permille_f32(idle_min_conf)) ?:
+	      g15_w32(gpu, G15_GLOBALS + 0x30, !!idle_predictive);
 	wmb();
 	if (!ret)
 		ret = g15_devctl_record(gpu, rec);
 	mutex_unlock(&gpu->lock);
-	dev_info(gpu->dev, "idle policy: standby %u us, min confidence %u/1000 re-imported: %d\n",
-		 idle_standby_us, idle_min_conf, ret);
+	dev_info(gpu->dev, "idle policy: %s, standby %u us, min confidence %u/1000 re-imported: %d\n",
+		 idle_predictive ? "predictive" : "finite delay", idle_standby_us, idle_min_conf, ret);
 	return ret;
 }
 
@@ -110,6 +122,8 @@ module_param_cb(idle_standby_us, &g15_idle_ops, &idle_standby_us, 0644);
 MODULE_PARM_DESC(idle_standby_us, "Firmware predictive-idle standby time, 100..100000 us (Globals +0x7a8; board profile 700, native ADT 1500): the GPU stays up about this long after its last work");
 module_param_cb(idle_min_conf, &g15_idle_ops, &idle_min_conf, 0644);
 MODULE_PARM_DESC(idle_min_conf, "Firmware predictive-idle minimum confidence, permille (Globals +0x7c4; board profile 700)");
+module_param_cb(idle_predictive, &g15_idle_ops, &idle_predictive, 0644);
+MODULE_PARM_DESC(idle_predictive, "Firmware idle decision (Globals +0x30): 1 predictive (board profile; may power down right after any work), 0 (default) power down after the ordinary finite delay");
 
 /*
  * GPU firmware builds whose ABI this driver implements. The canonical object
@@ -1099,6 +1113,7 @@ static int g15_build(struct g15_gpu *gpu)
 	put_unaligned_le32(100, glob + 0x980);
 	put_unaligned_le32(clamp(idle_standby_us, 100U, 100000U), glob + 0x7a8);
 	put_unaligned_le32(g15_permille_f32(idle_min_conf), glob + 0x7c4);
+	put_unaligned_le32(!!idle_predictive, glob + 0x30);
 	/* HardwareDataA at +0x4580: maintained S8 request. */
 	put_unaligned_le32(8, hw + 0x4580 + 0x2c);
 	put_unaligned_le32(8, hw + 0x4580 + 0x30);
