@@ -90,6 +90,10 @@ struct gpu_m4_initdata_input {
 	u64 loader_va[GPU_M4_LOADER_COUNT];
 	u64 scratch, lower_uma, lower_parameter;
 	u32 ktrace_mask; /* Control+0: firmware Ktrace class mask */
+	/* Main +0xea4 (native 1): the firmware's unchanged-hardware-progress
+	 * monitor may start a recovery of a stalled work.
+	 */
+	u32 progress_recovery;
 };
 
 static inline bool gpu_m4_bootstrap_alias(u64 va)
@@ -184,6 +188,7 @@ static inline int gpu_m4_encode_initdata(const struct gpu_m4_initdata_input *in,
 	put_unaligned_le64(in->va[GPU_M4_RETENTION], m + 0xe88);
 	for (unsigned int i = 0; i < sizeof(main) / sizeof(main[0]); i++)
 		put_unaligned_le32(main[i].value, m + main[i].offset);
+	put_unaligned_le32(in->progress_recovery, m + 0xea4);
 	put_unaligned_le64(0x0000000607002004ULL, m + 0xf24);
 	put_unaligned_le32(ceiling, m + 0xfc4);
 	for (unsigned int i = 0; i <= ceiling; i++) {

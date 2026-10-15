@@ -98,6 +98,10 @@ static unsigned int ktrace_mask;
 module_param(ktrace_mask, uint, 0400);
 MODULE_PARM_DESC(ktrace_mask, "Firmware Ktrace class mask published at initdata (default 0 as native; 0x33 diagnostic)");
 
+static bool progress_recovery = true;
+module_param(progress_recovery, bool, 0400);
+MODULE_PARM_DESC(progress_recovery, "Let the firmware recover a work whose hardware progress stalls (Main +0xea4, native 1; default 1)");
+
 /* Retained session queue records mapped ASC-cached (AttrIndex 0, FW RW,
  * PA | 0x00c0000000000443), as native maps its submit-pipe record arrays,
  * work-ring storage and queue-info; index 2 makes the firmware CPU read them
@@ -490,6 +494,7 @@ static int m4_ready_prepare(struct m4_gpu_hello *h)
 	r->pstate.user = GPU_M4_PSTATE_MAX;
 	gpu_m4_thermal_init(&r->pstate.thermal);
 	in->ktrace_mask = ktrace_mask & 0x3ff;
+	in->progress_recovery = progress_recovery;
 	ret = gpu_m4_encode_initdata(in, r->pstate.configured);
 	if (ret)
 		return ret;
