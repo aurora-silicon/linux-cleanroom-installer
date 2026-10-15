@@ -460,6 +460,12 @@ struct g15_pass {
 	struct g15_buf aux, pre[3], tpc, tilemap, heap, scene_user, fs_scratch;
 	struct g15_buf ta_work, fs_work, ta_seq, fs_seq, ta_scratch, scene;
 	struct g15_buf its, uts, own_barrier, prev_barrier, fs_dep;
+	/*
+	 * G15_CT_* reset state of its mutable storage (be->ct_lock), and the
+	 * TPC/tilemap spans its last use may have written.
+	 */
+	u32 state;
+	u64 tpc_dirty, tilemap_dirty;
 };
 
 struct g15_render {
@@ -585,6 +591,7 @@ struct g15_backend {
 	u64 st_pb_req, st_pb_grown, st_pb_refused, st_pb_bad;	/* PB growth requests/blocks */
 	u64 st_clustered;			/* clustered render members */
 	u64 st_ct_sync;				/* clustering buffers zeroed at claim */
+	u64 st_pass_sync;			/* pass slots reset at claim */
 	u64 st_slot_sync;			/* compute slots scrubbed at claim */
 	u64 st_grouped;				/* jobs published behind another in a compute horizon */
 	bool chan_wait;		/* a ready prefix waits only for a record's consumption */
@@ -2358,12 +2365,62 @@ static void g15_encode_fs(struct g15_backend *be, struct g15_pass *p, const stru
  * Reset retired storage outside be->lock: compute slots' runtime storage and
  * clustering buffers (their written span).
  */
+/*
+ * Per-use reset of a pass slot's storage (per-use reset contract b): work
+ * images, microsequences, scratch, stage stamps, the TPC/tilemap spans its
+ * last use wrote, auxiliary, heap metadata and scene-user (pass_full_reset)
+ * and the preemption save areas. The slot is neither published nor claimed.
+ */
+static void g15_pass_scrub(struct g15_backend *be, struct g15_pass *p)
+{
+	struct g15_render *r = &be->r;
+
+	g15_buf_fill(&p->ta_work, 0, 0, G15_TA_WORK_SIZE);
+	g15_buf_fill(&p->fs_work, 0, 0, G15_FS_WORK_SIZE);
+	g15_buf_fill(&p->ta_seq, 0, 0, 0x1000);
+	g15_buf_fill(&p->fs_seq, 0, 0, 0x1000);
+	g15_buf_fill(&p->ta_scratch, 0, 0, 0x10000);
+	g15_buf_fill(&p->fs_scratch, 0, 0, 0x10000);
+	g15_buf_fill(&p->its, 0, 0, 32);
+	g15_buf_fill(&p->tpc, 0, 0, p->tpc_dirty);
+	g15_buf_fill(&p->tilemap, 0, 0, p->tilemap_dirty);
+	if (READ_ONCE(pass_full_reset)) {
+		g15_buf_fill(&p->aux, 0, 0, 0x20000);
+		g15_buf_fill(&p->heap, 0, 0, 0x1000);
+		g15_buf_fill(&p->scene_user, 0, 0, 0x10000);
+	}
+	/* Preemption save areas start zeroed on every use (clustering contract 5). */
+	g15_buf_fill(&p->pre[0], 0, 0, r->pre_records * 0x540);
+	g15_buf_fill(&p->pre[1], 0, 0, r->pre_records * 0x280);
+	g15_buf_fill(&p->pre[2], 0, 0, r->pre_records * 0x40);
+	p->tpc_dirty = 0;
+	p->tilemap_dirty = 0;
+}
+
 static void g15_ct_clear_work(struct work_struct *work)
 {
 	struct g15_backend *be = container_of(work, struct g15_backend, ct_clear);
 	struct g15_graph *g = &be->g;
 	struct g15_render *r = &be->r;
 
+	for (;;) {
+		struct g15_pass *p = NULL;
+
+		spin_lock(&be->ct_lock);
+		for (u32 k = 0; !p && k < r->slots; k++)
+			if (r->pass[k].state == G15_CT_DIRTY)
+				p = &r->pass[k];
+		if (p)
+			p->state = G15_CT_CLEARING;
+		spin_unlock(&be->ct_lock);
+		if (!p)
+			break;
+		g15_pass_scrub(be, p);
+		wmb();	/* reset before the slot can be claimed */
+		spin_lock(&be->ct_lock);
+		p->state = G15_CT_CLEAN;
+		spin_unlock(&be->ct_lock);
+	}
 	for (;;) {
 		struct g15_slot *s = NULL;
 
@@ -2525,6 +2582,29 @@ static u32 g15_slots_free(struct g15_backend *be)
 }
 
 /*
+ * Claim pass slot p for a render of the prefix being prepared (be->lock
+ * held): reset now unless the background reset already did.
+ */
+static void g15_pass_claim(struct g15_backend *be, struct g15_pass *p)
+{
+	bool sync;
+
+	spin_lock(&be->ct_lock);
+	while (p->state == G15_CT_CLEARING) {
+		spin_unlock(&be->ct_lock);
+		flush_work(&be->ct_clear);
+		spin_lock(&be->ct_lock);
+	}
+	sync = p->state != G15_CT_CLEAN;
+	p->state = G15_CT_USED;
+	spin_unlock(&be->ct_lock);
+	if (sync) {
+		g15_pass_scrub(be, p);
+		be->st_pass_sync++;
+	}
+}
+
+/*
  * A pass slot for a render of the given geometry, not held and not already
  * picked: the next small slot after the previous prefix's, else slot 0
  * (which holds any admitted geometry); -1 if none is free.
@@ -2554,12 +2634,16 @@ static int g15_pass_pick(struct g15_render *r, const struct g15_geom *geo, u32 p
 static void g15_flight_release(struct g15_backend *be, struct g15_flight *f)
 {
 	struct g15_graph *g = &be->g;
+	u32 mask = f->pass_mask;
 
 	be->r.pass_busy &= ~f->pass_mask;
 	f->pass_mask = 0;
-	if (!f->ct_count && !f->slot_count)
+	if (!f->ct_count && !f->slot_count && !mask)
 		return;
 	spin_lock(&be->ct_lock);
+	for (u32 k = 0; mask; k++, mask >>= 1)
+		if (mask & 1)
+			be->r.pass[k].state = G15_CT_DIRTY;
 	for (u32 k = 0; k < f->ct_count; k++)
 		f->ct[k]->state = G15_CT_DIRTY;
 	/* Without rotation the next claim of a slot scrubs it (STALE). */
@@ -2696,30 +2780,14 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 	g15_encode_ta(be, p, cmd, ctx, usc, Tta, &geo, cluster ? &cl : NULL, ta, tas);
 	g15_encode_fs(be, p, cmd, ctx, usc, n, Tfs, &geo, fs, fss);
 
-	/* The slot is unpublished: its previous prefix fully retired. */
-	g15_buf_fill(&p->ta_work, 0, 0, G15_TA_WORK_SIZE);
-	g15_buf_fill(&p->fs_work, 0, 0, G15_FS_WORK_SIZE);
-	g15_buf_fill(&p->ta_seq, 0, 0, 0x1000);
-	g15_buf_fill(&p->fs_seq, 0, 0, 0x1000);
-	g15_buf_fill(&p->ta_scratch, 0, 0, 0x10000);
-	g15_buf_fill(&p->fs_scratch, 0, 0, 0x10000);
-	g15_buf_fill(&p->its, 0, 0, 32);
-	g15_buf_fill(&p->tpc, 0, 0, geo.tpc_bytes);
-	g15_buf_fill(&p->tilemap, 0, 0, geo.tilemap_bytes);
 	/*
-	 * The rest of the slot's firmware/GPU-written storage, as the per-use
-	 * reset contract (b) requires: auxiliary, heap metadata (logical span)
-	 * and scene-user, all zeroed.
+	 * The slot is unpublished: its previous prefix fully retired. Its
+	 * storage was reset in the background since then (g15_flight_release),
+	 * or is reset here.
 	 */
-	if (READ_ONCE(pass_full_reset)) {
-		g15_buf_fill(&p->aux, 0, 0, 0x20000);
-		g15_buf_fill(&p->heap, 0, 0, 0x1000);
-		g15_buf_fill(&p->scene_user, 0, 0, 0x10000);
-	}
-	/* Preemption save areas start zeroed on every use (clustering contract 5). */
-	g15_buf_fill(&p->pre[0], 0, 0, r->pre_records * 0x540);
-	g15_buf_fill(&p->pre[1], 0, 0, r->pre_records * 0x280);
-	g15_buf_fill(&p->pre[2], 0, 0, r->pre_records * 0x40);
+	g15_pass_claim(be, p);
+	p->tpc_dirty = geo.tpc_bytes;
+	p->tilemap_dirty = geo.tilemap_bytes;
 	if (cluster)
 		be->st_clustered++;	/* its buffer is zero: cleared since its last use */
 	g15_buf_write(&p->ta_work, 0, ta, G15_TA_WORK_SIZE);
@@ -3901,9 +3969,9 @@ static int g15_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "jobs %llu job_cmds %llu job_max %llu early %llu recoveries %llu hang_kills %llu clustered %llu\n",
 		   be->st_jobs, be->st_job_cmds, be->st_job_max, be->st_early, be->st_recoveries,
 		   be->st_hang_kills, be->st_clustered);
-	seq_printf(m, "ct_sync %llu slot_sync %llu starved_us %llu prep_us %llu grouped %llu\n",
+	seq_printf(m, "ct_sync %llu slot_sync %llu starved_us %llu prep_us %llu grouped %llu pass_sync %llu\n",
 		   be->st_ct_sync, be->st_slot_sync, div_u64(be->st_starved_ns, 1000),
-		   div_u64(be->st_prep_ns, 1000), be->st_grouped);
+		   div_u64(be->st_prep_ns, 1000), be->st_grouped, be->st_pass_sync);
 	seq_printf(m, "type0: fs2c %llu c2ta %llu\n", be->st_fs2c0, be->st_c2ta0);
 	seq_printf(m, "pb: blocks %u/%u/%u requests %llu grown %llu refused %llu bad %llu\n",
 		   be->r.pb_init_blocks, be->r.pb_posted, be->r.pb_max, be->st_pb_req,
