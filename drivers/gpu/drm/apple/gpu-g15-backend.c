@@ -3062,6 +3062,21 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 		}
 		if (renders >= clamp(READ_ONCE(prefix_renders), 1U, (u32)G15_RENDER_SLOTS))
 			break;
+		/*
+		 * The prefix that primes freshly initialized render allocators
+		 * (the first after boot, or after an abort's re-init) holds one
+		 * render: their submitted cell is 1 and their completed count 0,
+		 * so the first completed TA (FS) catches its allocator up and
+		 * clears its registration. A second render of the prefix then
+		 * holds a position of that allocator with no registered manager
+		 * until it completes, and the firmware's progress/preemption
+		 * path, which consults bound positions (F+0x3daa4 through the
+		 * position dependency expansion F+0x354e0, round-10 contract
+		 * C1), dereferences the missing manager: RTKit crash at
+		 * F+0x35568, FAR 0x58.
+		 */
+		if (renders && (r->reinit || !r->draw))
+			break;
 		g15_geometry(&cmd->r, 0, &geo);
 		k = g15_pass_pick(r, &geo, f->pass_mask);
 		if (k < 0)
@@ -3109,8 +3124,12 @@ static int g15_publish(struct g15_backend *be, struct g15_job *job)
 		ret = ta && fs && tas && fss ? 0 : -ENOMEM;
 		if (ret)
 			goto out;
-		/* After a recovered render abort the allocator state is not trusted. */
-		rebuild = r->reinit;
+		/*
+		 * After a recovered render abort the allocator state is not
+		 * trusted. The priming prefix (also the first after boot) retires
+		 * before anything is published behind it.
+		 */
+		rebuild = r->reinit || !r->draw;
 		if (r->reinit) {
 			if (r->spare_ready)
 				g15_render_take_spare(be);
