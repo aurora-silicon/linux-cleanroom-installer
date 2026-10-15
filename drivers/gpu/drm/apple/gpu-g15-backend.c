@@ -281,6 +281,21 @@ static unsigned int deadline_ms = 5000;
 module_param(deadline_ms, uint, 0644);
 MODULE_PARM_DESC(deadline_ms, "Host deadline for a published prefix; firmware progress timeouts may need longer");
 
+/*
+ * A class-0 compute that spins forever cannot be preempted on 2419 (its
+ * queue-info +0x30 is 0, so the firmware's long-running-compute monitor
+ * never runs, and the periodic +0x1c store request does not interrupt a
+ * shader that never yields; round-10 class-0 compute-hang contract). When
+ * the oldest prefix's only unfinished engine is a compute that has already
+ * started, and no firmware event has arrived, there is nothing to wait for:
+ * fail-stop after this shorter no-progress budget instead of the full
+ * deadline plus the ineffective preemption retry. Other engines and longer
+ * legitimate compute keep the full deadline_ms.
+ */
+static unsigned int compute_deadline_ms = 2000;
+module_param(compute_deadline_ms, uint, 0644);
+MODULE_PARM_DESC(compute_deadline_ms, "No-progress budget before fail-stop when the oldest prefix's only unfinished started engine is a class-0 compute (not firmware-preemptible)");
+
 static bool gpu_recovery = true;
 module_param(gpu_recovery, bool, 0644);
 MODULE_PARM_DESC(gpu_recovery, "After a firmware fault/timeout event, acknowledge the firmware halt, fail the affected submission and continue; 0 latches the GPU failed until reboot");
@@ -571,7 +586,8 @@ struct g15_backend {
 	u32 target, head, events;
 	u32 ta_target, fs_target, ta_head, fs_head, stage_seen;
 	u32 producer[3];	/* host channels 0 TA, 1 FS, 2 compute */
-	unsigned long deadline;	/* of the oldest published prefix */
+	unsigned long deadline;		/* of the oldest published prefix */
+	unsigned long compute_deadline;	/* shorter budget for a started, stuck class-0 compute */
 	u64 progress_flight;	/* oldest prefix (publication ns) and its stamps at the last poll */
 	u32 progress[3];
 	u64 st_overlaps;	/* prefixes published while another ran */
@@ -2908,9 +2924,43 @@ static struct g15_flight *g15_oldest(struct g15_backend *be)
  * or last made progress (g15_progress), so a compute horizon of several jobs
  * has a budget per job without hiding a stall behind an unrelated retirement.
  */
+static bool g15_stamp_reached(u32 obs, u32 own, u32 tail);
+static bool g15_ring_passed(u32 c, u32 b, u32 h, u32 t, u32 m);
+
 static void g15_deadline(struct g15_backend *be)
 {
 	be->deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(deadline_ms), 100U));
+	be->compute_deadline = jiffies + msecs_to_jiffies(max(READ_ONCE(compute_deadline_ms), 100U));
+}
+
+/*
+ * The oldest prefix's only unfinished engine is a class-0 compute that has
+ * already started (a nonzero internal start timestamp in one of its slots),
+ * with no firmware event: it cannot be preempted, so waiting longer or
+ * arming the compute-store request is futile (round-10 contract).
+ */
+static bool g15_compute_hang(struct g15_backend *be, const struct g15_flight *f)
+{
+	struct g15_render *r = &be->r;
+
+	if (!f->computes ||
+	    g15_stamp_reached(g15_buf_r32(&be->g.fw_stamp, 0), f->target, be->target))
+		return false;	/* no compute, or the compute is done */
+	if (f->renders &&
+	    (!g15_stamp_reached(g15_buf_r32(&r->fw_stamp[0], 0), f->ta_target, be->ta_target) ||
+	     !g15_stamp_reached(g15_buf_r32(&r->fw_stamp[1], 0), f->fs_target, be->fs_target)))
+		return false;	/* a render of the prefix is still unfinished */
+	/*
+	 * The firmware has consumed the prefix's compute record (its work is
+	 * admitted, not waiting on an external dependency; drm_sched resolved
+	 * those before publication) and its work-ring READ has reached the
+	 * work, so the compute started but has not finished. The private start
+	 * timestamp is only written at completion, so it cannot be used here.
+	 */
+	if (g15_r32(be->gpu, G15_CH_STATE(G15_COMPUTE_CHANNEL)) != f->rec[2])
+		return false;	/* its record not consumed yet */
+	return g15_ring_passed(g15_buf_r32(&be->g.qstate, 0x30), f->c_start, f->head, be->head,
+			       G15_QUEUE_CAP);
 }
 
 /*
@@ -3962,9 +4012,23 @@ static void g15_poll_work(struct work_struct *work)
 	f = g15_oldest(be);
 	if (!be->preempt_global)
 		g15_progress(be, f);
+	/*
+	 * A started, stuck class-0 compute cannot be preempted: fail-stop at its
+	 * shorter budget rather than arming the ineffective compute-store
+	 * request and waiting the full deadline.
+	 */
+	if (!ret && !READ_ONCE(gpu->error) && !be->preempt_global &&
+	    atomic_read(&gpu->event_errors) == be->errors_seen &&
+	    time_after(jiffies, be->compute_deadline) && g15_compute_hang(be, f)) {
+		dev_warn(gpu->dev, "class-0 compute hang of ctx %u (not preemptible): failing\n",
+			 f->job->vm->asid);
+		g15_report(be, "compute hang");
+		be->deadline = jiffies;		/* take the fail-stop branch below */
+	}
 	if (!ret && !READ_ONCE(gpu->error) &&
 	    atomic_read(&gpu->event_errors) == be->errors_seen &&
 	    time_after(jiffies, be->deadline) && !be->preempt_global &&
+	    !g15_compute_hang(be, f) &&
 	    READ_ONCE(hang_preempt) && READ_ONCE(gpu_recovery)) {
 		/* Host deadline, no firmware event: let the firmware kill it. */
 		g15_report(be, "hung, requesting preemption");
