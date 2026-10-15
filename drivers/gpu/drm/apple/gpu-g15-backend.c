@@ -229,7 +229,7 @@ MODULE_PARM_DESC(pb_max_blocks, "Maximum PB blocks with pb_grow, pb_blocks..2048
  */
 static unsigned int cross_engine_hold = 1;
 module_param(cross_engine_hold, uint, 0644);
-MODULE_PARM_DESC(cross_engine_hold, "Keep the type-1 predecessor hold on internal cross-engine waits: bit 0 FS->compute, bit 1 compute->TA (default 1: compute->TA type 0 inside a prefix; never clear both)");
+MODULE_PARM_DESC(cross_engine_hold, "Keep the type-1 predecessor hold on internal cross-engine waits: bit 0 FS->compute, bit 1 compute->TA (default 1: compute->TA type 0 inside a prefix, with compute_queue_class 0 only; never clear both)");
 
 static bool early_tiling = true;
 module_param(early_tiling, bool, 0444);
@@ -282,19 +282,42 @@ module_param(deadline_ms, uint, 0644);
 MODULE_PARM_DESC(deadline_ms, "Host deadline for a published prefix; firmware progress timeouts may need longer");
 
 /*
- * A class-0 compute that spins forever cannot be preempted on 2419 (its
- * queue-info +0x30 is 0, so the firmware's long-running-compute monitor
- * never runs, and the periodic +0x1c store request does not interrupt a
- * shader that never yields; round-10 class-0 compute-hang contract). When
- * the oldest prefix's only unfinished engine is a compute that has already
- * started, and no firmware event has arrived, there is nothing to wait for:
- * fail-stop after this shorter no-progress budget instead of the full
- * deadline plus the ineffective preemption retry. Other engines and longer
- * legitimate compute keep the full deadline_ms.
+ * Compute queue scheduling class (queue-info +0x30..+0x48, the firmware's
+ * recognized rows). A compute of the donor's class 0 cannot be ended by any
+ * host request on 2419 (class-0 compute-hang contract): its queue-info +0x30
+ * is 0, and the firmware's compute request does not touch it, so a shader
+ * that never finishes can only be contained by a global fail-stop. On class
+ * 2 the firmware's compute request (Globals +0x1c, imported by DEVCTL 0x13)
+ * ends the running compute: it retires through its normal receipts, or the
+ * firmware raises an error event and halts, and the ordinary recovery
+ * handshake follows. Repeated requests store and resume the running work,
+ * then end it (a finite compute ends early with its outputs unwritten), so
+ * the request is armed only for a compute that made no progress for
+ * compute_deadline_ms, and restored before anything else is published.
+ *
+ * Class 2 admits up to eight computes of the queue at once: every compute
+ * that follows a compute waits on its predecessor's FW stamp, keeping the
+ * ring order the kernel and Mesa rely on (as class 0 executes it). Every
+ * wait on a compute's stamp (compute -> compute, compute -> TA) keeps the
+ * type-1 predecessor hold: a work admitted behind the running compute with
+ * only the type-0 stamp wait makes the firmware decline the request. The
+ * unchanged-work compute monitor stays disabled (Globals +0x9b0 = 0, the
+ * round-7 row-2 profile), so finite work never meets an unrequested context
+ * store.
  */
-static unsigned int compute_deadline_ms = 2000;
+static unsigned int compute_queue_class = 2;
+module_param(compute_queue_class, uint, 0444);
+MODULE_PARM_DESC(compute_queue_class, "Compute queue-info scheduling row: 2 (default; a hung compute is ended in place, its client's VM lost) or 0 (donor row; a compute hang fail-stops the GPU until reboot)");
+
+/*
+ * No-progress budget of the oldest prefix whose first unfinished compute has
+ * started (its predecessors done, its record consumed): class 2 then asks
+ * the firmware to end it, class 0 fail-stops. Finite computes longer than
+ * this without a completed compute in between are ended as hangs.
+ */
+static unsigned int compute_deadline_ms = 5000;
 module_param(compute_deadline_ms, uint, 0644);
-MODULE_PARM_DESC(compute_deadline_ms, "No-progress budget before fail-stop when the oldest prefix's only unfinished started engine is a class-0 compute (not firmware-preemptible)");
+MODULE_PARM_DESC(compute_deadline_ms, "No-progress budget of a started compute before it is ended as a hang (class 2) or the GPU fail-stops (class 0); legitimate single computes must finish within it");
 
 static bool gpu_recovery = true;
 module_param(gpu_recovery, bool, 0644);
@@ -381,9 +404,8 @@ MODULE_PARM_DESC(manager_cached, "Map the UMA managers, PB manager, block contro
  * admission and service passes between every stage. Class 2, the common
  * backend's default render row, requests service after eight ready nodes:
  * the prefix's works are inserted back to back and the TA/FS cycle runs
- * without the intermediate passes. The compute queue keeps class 0, whose
- * policy the common backend also uses for compute to keep compute
- * preemption off.
+ * without the intermediate passes. The compute queue has its own row
+ * (compute_queue_class).
  */
 static unsigned int render_queue_class = 2;
 module_param(render_queue_class, uint, 0444);
@@ -539,6 +561,11 @@ struct g15_flight {
 	u32 ta_target, fs_target, ta_head, fs_head, ta_start, fs_start;
 	u32 rec[3];
 	u32 slot[G15_COMPUTE_SLOTS], slot_count;	/* compute slot of compute member j */
+	/*
+	 * Compute member j's FW stamp target, and the FS target it waits on
+	 * directly (0: none): its predecessors in the prefix (compute_hang).
+	 */
+	u32 cstamp[G15_COMPUTE_SLOTS], cwait[G15_COMPUTE_SLOTS];
 	u32 pass[G15_RENDER_SLOTS], pass_mask;		/* pass slot of render member j */
 	struct g15_ct *ct[G15_RENDER_SLOTS];
 	u32 ct_count;
@@ -547,6 +574,7 @@ struct g15_flight {
 	struct g15_job *group[G15_HORIZON_JOBS - 1];
 	u32 group_count;
 	bool rebuild;		/* re-initializes the render allocators after an abort */
+	bool doomed;		/* published behind an ended one: fails at retirement */
 	u64 pub_ns;
 	unsigned long published_at;
 };
@@ -587,7 +615,7 @@ struct g15_backend {
 	u32 ta_target, fs_target, ta_head, fs_head, stage_seen;
 	u32 producer[3];	/* host channels 0 TA, 1 FS, 2 compute */
 	unsigned long deadline;		/* of the oldest published prefix */
-	unsigned long compute_deadline;	/* shorter budget for a started, stuck class-0 compute */
+	unsigned long compute_deadline;	/* no-progress budget of a started compute */
 	u64 progress_flight;	/* oldest prefix (publication ns) and its stamps at the last poll */
 	u32 progress[3];
 	u64 st_overlaps;	/* prefixes published while another ran */
@@ -639,7 +667,13 @@ struct g15_backend {
 	bool queue_registered;
 	int failed;
 	int errors_seen;	/* gpu->event_errors already handled by recovery */
-	u32 preempt_global;	/* Globals offset of the armed preemption divisor, or 0 */
+	/*
+	 * Hang request (g15_kill_arm): the Globals offset of the armed divisor
+	 * (0x1c compute, 0x24 fragment) or 0; publication is frozen while it is
+	 * armed. kill_ended: the prefix it was armed for retired (ended).
+	 */
+	u32 preempt_global;
+	bool kill_ended;
 	bool fs_resync;		/* next render waits on the reached FS stamp */
 	bool rebuild_live;	/* the rebuild prefix is published and not yet retired */
 	u64 st_recoveries, st_hang_kills;
@@ -952,6 +986,15 @@ static void g15_graph_init(struct g15_backend *be)
 	g15_buf_w64(&g->qinfo, 0x38, 0xffffffffffff0000ULL);
 	g15_buf_w32(&g->qinfo, 0x40, 1);
 	g15_buf_w32(&g->qinfo, 0x48, 1);
+	if (compute_queue_class == 2) {
+		/* Row 2 (round-5 contract table): 2, 2, ffff000000000000, 0, 0, 2. */
+		g15_buf_w32(&g->qinfo, 0x30, 2);
+		g15_buf_w32(&g->qinfo, 0x34, 2);
+		g15_buf_w64(&g->qinfo, 0x38, 0xffff000000000000ULL);
+		g15_buf_w32(&g->qinfo, 0x40, 0);
+		g15_buf_w32(&g->qinfo, 0x44, 0);
+		g15_buf_w32(&g->qinfo, 0x48, 2);
+	}
 	g15_buf_w32(&g->qinfo, 0x4c, 0xffffffff);
 	g15_buf_w32(&g->qinfo, 0x50, G15_UUID);
 	g15_buf_w64(&g->qinfo, 0xa4, g->sched_ctx.va);
@@ -2743,7 +2786,19 @@ static int g15_prefix_compute(struct g15_backend *be, struct g15_job *job,
 		be->st_fs2c0 += type0;
 		g15_buf_w64(&g->ring, 8ULL * pf->c_head, s->barrier.va);
 		pf->c_head = (pf->c_head + 1) % G15_QUEUE_CAP;
+	} else if (pf->prev == 1 && compute_queue_class) {
+		/*
+		 * Class 2 runs computes of the queue concurrently: keep the ring
+		 * order with a wait on the previous compute's FW stamp. Type 1:
+		 * a successor admitted with only the stamp wait makes the
+		 * firmware decline the compute request that ends a hang.
+		 */
+		g15_barrier(&s->barrier, g->fw_stamp.va, pf->last_ct, G15_EVENT_SLOT, T, G15_UUID, 1);
+		g15_buf_w64(&g->ring, 8ULL * pf->c_head, s->barrier.va);
+		pf->c_head = (pf->c_head + 1) % G15_QUEUE_CAP;
 	}
+	f->cstamp[pf->computes] = T;
+	f->cwait[pf->computes] = pf->prev == 2 ? pf->last_fs : 0;
 	g15_buf_w64(&g->ring, 8ULL * pf->c_head, s->work.va);
 	pf->c_head = (pf->c_head + 1) % G15_QUEUE_CAP;
 	if (n <= 4) {
@@ -2841,12 +2896,14 @@ static void g15_prefix_render(struct g15_backend *be, struct g15_job *job,
 		/*
 		 * Compute -> render: the TA waits on the previous compute; type 0
 		 * (round-9 contract B3) when that compute is of this prefix and
-		 * this render starts no InitBM.
+		 * this render starts no InitBM, on the class-0 compute queue only
+		 * (on class 2 a TA admitted with only the stamp wait makes the
+		 * firmware decline the request that ends a hung compute).
 		 */
 		bool type0 = pf->computes && !pf->initbm && !be->fs_resync &&
 			n != 1 && !(!pf->renders && r->reinit) && !pf->ct_ts &&
 			!cmd->ts_va[0] && !cmd->ts_va[1] && !cmd->ts_va[2] && !cmd->ts_va[3] &&
-			!(READ_ONCE(cross_engine_hold) & 2);
+			!(READ_ONCE(cross_engine_hold) & 2) && !compute_queue_class;
 
 		g15_barrier(&p->prev_barrier, be->g.fw_stamp.va, pf->last_ct, G15_EVENT_SLOT, Tta,
 			    0x3d420, type0 ? 0 : 1);
@@ -2934,29 +2991,28 @@ static void g15_deadline(struct g15_backend *be)
 }
 
 /*
- * The oldest prefix's only unfinished engine is a class-0 compute that has
- * already started (a nonzero internal start timestamp in one of its slots),
- * with no firmware event: it cannot be preempted, so waiting longer or
- * arming the compute-store request is futile (round-10 contract).
+ * The oldest prefix's first unfinished compute has started and makes no
+ * progress, with no firmware event: its predecessors in the prefix are done
+ * (the previous compute members by the reached FW stamp, a render it waits on
+ * directly by the FS stamp), the firmware consumed the prefix's compute
+ * record and its work-ring READ passed the prefix's entries (the private
+ * start timestamp is only written at completion, so it cannot be used).
+ * Later members, renders waiting on it included, may be unfinished.
  */
 static bool g15_compute_hang(struct g15_backend *be, const struct g15_flight *f)
 {
 	struct g15_render *r = &be->r;
+	u32 fw = g15_buf_r32(&be->g.fw_stamp, 0), j;
 
-	if (!f->computes ||
-	    g15_stamp_reached(g15_buf_r32(&be->g.fw_stamp, 0), f->target, be->target))
-		return false;	/* no compute, or the compute is done */
-	if (f->renders &&
-	    (!g15_stamp_reached(g15_buf_r32(&r->fw_stamp[0], 0), f->ta_target, be->ta_target) ||
-	     !g15_stamp_reached(g15_buf_r32(&r->fw_stamp[1], 0), f->fs_target, be->fs_target)))
-		return false;	/* a render of the prefix is still unfinished */
-	/*
-	 * The firmware has consumed the prefix's compute record (its work is
-	 * admitted, not waiting on an external dependency; drm_sched resolved
-	 * those before publication) and its work-ring READ has reached the
-	 * work, so the compute started but has not finished. The private start
-	 * timestamp is only written at completion, so it cannot be used here.
-	 */
+	if (!f->computes || g15_stamp_reached(fw, f->target, be->target))
+		return false;	/* no compute, or its computes are done */
+	for (j = 0; j < f->computes && g15_stamp_reached(fw, f->cstamp[j], be->target); j++)
+		;
+	if (j == f->computes)
+		return false;
+	if (f->cwait[j] &&
+	    !g15_stamp_reached(g15_buf_r32(&r->fw_stamp[1], 0), f->cwait[j], be->fs_target))
+		return false;	/* still waiting on a render of the prefix */
 	if (g15_r32(be->gpu, G15_CH_STATE(G15_COMPUTE_CHANNEL)) != f->rec[2])
 		return false;	/* its record not consumed yet */
 	return g15_ring_passed(g15_buf_r32(&be->g.qstate, 0x30), f->c_start, f->head, be->head,
@@ -3594,14 +3650,15 @@ static void g15_engine_next(struct g15_backend *be, struct list_head *done)
 	int ret;
 
 	be->chan_wait = false;
-	while (!be->failed && !list_empty(&be->pending)) {
+	/* Nothing is published while a hang request is armed (g15_kill_arm). */
+	while (!be->failed && !be->preempt_global && !list_empty(&be->pending)) {
 		struct g15_flight *tail = be->fl_count ?
 			&be->fl[(be->fl_first + be->fl_count - 1) % G15_FLIGHTS] : NULL;
 
 		job = g15_pick(be);
 		if (tail && (be->fl_count >= clamp(READ_ONCE(max_inflight), 1U, (u32)G15_FLIGHTS) ||
 			     job->vm != tail->job->vm || be->r.reinit || be->fs_resync ||
-			     be->rebuild_live || be->preempt_global)) {
+			     be->rebuild_live)) {
 			be->st_hold[0] += be->fl_count >= clamp(READ_ONCE(max_inflight), 1U,
 							       (u32)G15_FLIGHTS);
 			break;
@@ -3682,10 +3739,14 @@ static void g15_recover_snapshot(struct g15_backend *be, const char *phase)
 }
 
 /*
- * Hang trigger (preemption addendum A, D): a nonzero periodic divisor at
+ * Hang request (preemption addendum A, D): a nonzero periodic divisor at
  * Globals +0x1c (compute) or +0x24 (fragment), imported by DEVCTL 0x13, makes
- * the firmware request context switches; a job that does not yield is then
- * killed through its own recovery task (halt, then our resume handshake).
+ * the firmware request context stores at every service iteration. On the
+ * class-2 compute queue the request ends the running compute; a job that does
+ * not yield is killed through the firmware's own recovery (halt, then our
+ * resume handshake). g15_preempt_set writes a divisor and waits for the
+ * import; g15_kill_arm posts the record without waiting (the firmware may
+ * halt before it consumes it) and freezes publication until the outcome.
  */
 static int g15_preempt_set(struct g15_backend *be, u32 offset, u32 divisor)
 {
@@ -3700,6 +3761,26 @@ static int g15_preempt_set(struct g15_backend *be, u32 offset, u32 divisor)
 	ret = g15_devctl_record(gpu, rec);
 	mutex_unlock(&gpu->lock);
 	dev_info(gpu->dev, "preemption divisor Globals+%#x=%u: %d\n", offset, divisor, ret);
+	return ret;
+}
+
+static int g15_kill_arm(struct g15_backend *be, u32 offset)
+{
+	struct g15_gpu *gpu = be->gpu;
+	u8 rec[0x38] = {};
+	int ret;
+
+	put_unaligned_le32(0x13, rec);
+	mutex_lock(&gpu->lock);
+	g15_w32(gpu, G15_GLOBALS + offset, 1);
+	wmb();
+	ret = g15_devctl_post(gpu, rec);
+	mutex_unlock(&gpu->lock);
+	be->preempt_global = offset;
+	be->kill_ended = false;
+	/* Outcome budget: the prefix retires, or an error event, within it. */
+	be->deadline = jiffies + msecs_to_jiffies(ret ? 0 : 2000);
+	dev_info(gpu->dev, "hang request Globals+%#x=1: %d\n", offset, ret);
 	return ret;
 }
 
@@ -3788,12 +3869,23 @@ static void g15_pb_grow(struct g15_backend *be)
 	}
 }
 
-static void g15_preempt_disarm(struct g15_backend *be)
+/*
+ * Restore the armed divisor to 0 and wait for the import before anything is
+ * published again (an earlier arming record is consumed first). Returns the
+ * control result; on failure the request stays armed (publication frozen).
+ */
+static int g15_preempt_disarm(struct g15_backend *be)
 {
+	int ret = 0;
+
 	if (be->preempt_global) {
-		g15_preempt_set(be, be->preempt_global, 0);
-		be->preempt_global = 0;
+		ret = g15_preempt_set(be, be->preempt_global, 0);
+		if (!ret) {
+			be->preempt_global = 0;
+			be->kill_ended = false;
+		}
 	}
+	return ret;
 }
 
 /* Firmware DONE/READ reached the newest published ends, pipes consumed, engines idle. */
@@ -4012,12 +4104,14 @@ static void g15_poll_work(struct work_struct *work)
 	if (be->failed)
 		goto out;
 	/*
-	 * With nothing published only a firmware error event needs this pass:
-	 * one that arrived after its prefix's receipts is answered here (the
-	 * firmware halted and waits for the resume) instead of being taken
-	 * for a failure of the next prefix.
+	 * With nothing published only an armed hang request whose prefix ended
+	 * or a firmware error event needs this pass: one that arrived after
+	 * its prefix's receipts is answered here (the firmware halted and
+	 * waits for the resume) instead of being taken for a failure of the
+	 * next prefix.
 	 */
-	if (!be->fl_count && atomic_read(&gpu->event_errors) == be->errors_seen)
+	if (!be->fl_count && !be->preempt_global &&
+	    atomic_read(&gpu->event_errors) == be->errors_seen)
 		goto out;
 	/* After an event, a few short trailing polls catch the final receipts. */
 	for (u32 tail = atomic_xchg(&be->evented, 0) ? 4 : 0; ; tail--) {
@@ -4033,22 +4127,30 @@ static void g15_poll_work(struct work_struct *work)
 				g15_dump_events(gpu, 2);
 				mutex_unlock(&gpu->lock);
 			}
-			if (be->preempt_global) {
+			if (be->preempt_global && !be->kill_ended) {
 				/*
-				 * Retired only after the hang preemption: the firmware
-				 * ended it (stamps written, work abandoned). Report the
-				 * submission failed and its client's VM lost, like a hang
-				 * reset.
+				 * Retired only after the hang request: the firmware
+				 * ended it (stamps written, work abandoned). Its
+				 * submission fails and its client's VM is lost, like a
+				 * hang reset. A compute request ends compute work
+				 * only: the prefix's renders completed with their own
+				 * receipts and the render allocators stay. Later
+				 * prefixes (same VM) may have been ended by the
+				 * request too before it is restored: they fail.
 				 */
-				g15_preempt_disarm(be);
+				u32 off = be->preempt_global;
+
+				be->kill_ended = true;
 				be->st_hang_kills++;
-				if (f->renders)
+				if (f->renders && off == 0x24)
 					be->r.reinit = true;	/* aborted scene: PB state untrusted */
-				dev_warn(gpu->dev, "hung submission of ctx %u killed by firmware preemption\n",
-					 f->job->vm->asid);
+				for (u32 k = 1; k < be->fl_count; k++)
+					be->fl[(be->fl_first + k) % G15_FLIGHTS].doomed = true;
+				dev_warn(gpu->dev, "hung submission of ctx %u ended by the firmware's %s request\n",
+					 f->job->vm->asid, off == 0x24 ? "fragment" : "compute");
 				g15_flight_done(be, f, -ETIMEDOUT, &done);
 			} else {
-				g15_flight_done(be, f, 0, &done);
+				g15_flight_done(be, f, f->doomed ? -EIO : 0, &done);
 			}
 			ret = be->fl_count ? g15_retired(be) : 0;
 		}
@@ -4057,43 +4159,57 @@ static void g15_poll_work(struct work_struct *work)
 		udelay(5);
 	}
 	g15_pb_grow(be);
+	/*
+	 * The request's prefix ended: restore the divisor (and wait for its
+	 * import) before anything is published, unless a firmware error arrived
+	 * meanwhile: the firmware may have halted, and the recovery below
+	 * answers it first, then restores the divisor.
+	 */
+	if (be->kill_ended && !ret && !READ_ONCE(gpu->error) &&
+	    atomic_read(&gpu->event_errors) == be->errors_seen && g15_preempt_disarm(be))
+		be->deadline = jiffies;		/* not restored: fail below */
 	f = g15_oldest(be);
-	if (!f && atomic_read(&gpu->event_errors) == be->errors_seen)
-		goto next;
 	if (f && !be->preempt_global)
 		g15_progress(be, f);
+	if (!f && !be->preempt_global && !ret && !READ_ONCE(gpu->error) &&
+	    atomic_read(&gpu->event_errors) == be->errors_seen)
+		goto next;
 	/*
-	 * A started, stuck class-0 compute cannot be preempted: fail-stop at its
-	 * shorter budget rather than arming the ineffective compute-store
-	 * request and waiting the full deadline.
+	 * The oldest prefix's started compute made no progress for its budget,
+	 * with no firmware event: on class 2 ask the firmware to end it; a
+	 * class-0 compute cannot be ended, fail-stop now rather than arming the
+	 * ineffective request and waiting the full deadline.
 	 */
 	if (f && !ret && !READ_ONCE(gpu->error) && !be->preempt_global &&
 	    atomic_read(&gpu->event_errors) == be->errors_seen &&
 	    time_after(jiffies, be->compute_deadline) && g15_compute_hang(be, f)) {
+		g15_report(be, "compute hang");
+		if (compute_queue_class && READ_ONCE(gpu_recovery)) {
+			dev_warn(gpu->dev, "compute of ctx %u made no progress for %u ms: asking the firmware to end it\n",
+				 f->job->vm->asid, READ_ONCE(compute_deadline_ms));
+			g15_kill_arm(be, 0x1c);
+			again = true;
+			goto next;	/* publication stays frozen */
+		}
 		dev_warn(gpu->dev, "class-0 compute hang of ctx %u (not preemptible): failing\n",
 			 f->job->vm->asid);
-		g15_report(be, "compute hang");
 		be->deadline = jiffies;		/* take the fail-stop branch below */
 	}
 	if (f && !ret && !READ_ONCE(gpu->error) &&
 	    atomic_read(&gpu->event_errors) == be->errors_seen &&
 	    time_after(jiffies, be->deadline) && !be->preempt_global &&
-	    !g15_compute_hang(be, f) &&
+	    (compute_queue_class || !g15_compute_hang(be, f)) &&
 	    READ_ONCE(hang_preempt) && READ_ONCE(gpu_recovery)) {
 		/* Host deadline, no firmware event: let the firmware kill it. */
 		g15_report(be, "hung, requesting preemption");
 		/* The compute divisor while the oldest prefix's computes are not done. */
-		be->preempt_global = f->computes &&
-			!g15_stamp_reached(g15_buf_r32(&be->g.fw_stamp, 0), f->target, be->target) ?
-			0x1c : f->renders ? 0x24 : 0x1c;
-		if (g15_preempt_set(be, be->preempt_global, 1))
-			be->deadline = jiffies;	/* fail on the next pass */
-		else
-			be->deadline = jiffies + msecs_to_jiffies(3000);
+		g15_kill_arm(be, f->computes &&
+			     !g15_stamp_reached(g15_buf_r32(&be->g.fw_stamp, 0), f->target, be->target) ?
+			     0x1c : f->renders ? 0x24 : 0x1c);
 		again = true;
 	} else if (ret < 0 || READ_ONCE(gpu->error) ||
 		   atomic_read(&gpu->event_errors) != be->errors_seen ||
-		   (f && time_after(jiffies, be->deadline))) {
+		   ((f || be->preempt_global) && time_after(jiffies, be->deadline))) {
 		bool recovered = false, render = false;
 		u32 ctx = f ? f->job->vm->asid : 0;
 		int err;
@@ -4110,12 +4226,15 @@ static void g15_poll_work(struct work_struct *work)
 		 * transport: recovery waits for the firmware's own halt. Every
 		 * published prefix fails with it. A hang in the render-only
 		 * allocator rebuild prefix recovers like any render hang and
-		 * re-primes; only its first member stays strict.
+		 * re-primes; only its first member stays strict. An armed hang
+		 * request is restored after the resume, before anything is
+		 * published; if it cannot be, the GPU stops.
 		 */
 		if (READ_ONCE(gpu_recovery) && !READ_ONCE(gpu->error) &&
 		    (atomic_read(&gpu->event_errors) != be->errors_seen || ret == -EIO)) {
 			err = g15_recover(be, &recovered);
-			g15_preempt_disarm(be);
+			if (recovered && g15_preempt_disarm(be))
+				recovered = false;
 			if (recovered) {
 				be->errors_seen = atomic_read(&gpu->event_errors);
 				be->st_recoveries++;
@@ -4146,7 +4265,7 @@ next:
 		be->starve_from_ns = be->idle_from_ns;
 		be->idle_from_ns = 0;
 	}
-	again |= !!be->fl_count;
+	again |= be->fl_count || be->preempt_global;
 out:
 	if (again)
 		g15_rearm(be);
@@ -4707,7 +4826,7 @@ static int g15_dependency_error(void *owner, void *cookie, int error)
 static enum drm_gpu_sched_stat g15_timedout(void *owner, void *cookie,
 					    struct drm_sched_job *sched_job)
 {
-	/* The engine's own 2 s deadline owns failure; late delivery is not a hang. */
+	/* The engine's own deadlines own failure; late delivery is not a hang. */
 	return DRM_GPU_SCHED_STAT_NO_HANG;
 }
 
@@ -5133,6 +5252,16 @@ int g15_backend_start(struct g15_gpu *gpu)
 	params.max_frequency_khz = gpu->max_khz;
 	if (early_tiling)
 		params.features |= DRM_ASAHI_FEATURE_FRAGMENT_DEPENDENCY;
+	/*
+	 * Class-2 compute profile (round-7 contract C): the unchanged-work
+	 * compute monitor off before the queue's first exposure (the periodic
+	 * request, Globals +0x1c, is 0 in the image).
+	 */
+	if (compute_queue_class == 2) {
+		ret = g15_preempt_set(be, 0x9b0, 0);
+		if (ret)
+			return ret;
+	}
 	drm = gpu_m4_drm_create_private(gpu->dev, be, &params, &g15_drm_ops, 0);
 	if (IS_ERR(drm))
 		return PTR_ERR(drm);

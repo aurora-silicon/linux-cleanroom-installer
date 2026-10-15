@@ -141,6 +141,7 @@ void g15_drain_rings(struct g15_gpu *gpu);
 void g15_dump_events(struct g15_gpu *gpu, u32 count);
 void g15_fail(struct g15_gpu *gpu, int error);
 int g15_devctl_record(struct g15_gpu *gpu, const u8 *record);
+int g15_devctl_post(struct g15_gpu *gpu, const u8 *record);
 
 /* Stage-2 backend (gpu-g15-backend.c). */
 int g15_backend_start(struct g15_gpu *gpu);

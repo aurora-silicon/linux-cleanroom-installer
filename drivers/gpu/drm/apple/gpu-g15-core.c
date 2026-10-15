@@ -1271,6 +1271,16 @@ int g15_devctl_record(struct g15_gpu *gpu, const u8 *record)
 	return g15_devctl_submit(gpu, record, true);
 }
 
+/*
+ * Post one device-control record without waiting: the firmware may halt
+ * before it consumes it, and the caller must stay free to answer the halt.
+ * The next record waits for its consumption.
+ */
+int g15_devctl_post(struct g15_gpu *gpu, const u8 *record)
+{
+	return g15_devctl_submit(gpu, record, false);
+}
+
 static int g15_devctl(struct g15_gpu *gpu, u32 opcode)
 {
 	u8 record[0x38] = {};
