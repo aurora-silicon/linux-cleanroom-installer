@@ -315,7 +315,7 @@ MODULE_PARM_DESC(compute_queue_class, "Compute queue-info scheduling row: 2 (def
  * the firmware to end it, class 0 fail-stops. Finite computes longer than
  * this without a completed compute in between are ended as hangs.
  */
-static unsigned int compute_deadline_ms = 5000;
+static unsigned int compute_deadline_ms = 1000;
 module_param(compute_deadline_ms, uint, 0644);
 MODULE_PARM_DESC(compute_deadline_ms, "No-progress budget of a started compute before it is ended as a hang (class 2) or the GPU fail-stops (class 0); legitimate single computes must finish within it");
 
